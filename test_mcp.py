@@ -2,17 +2,12 @@ import asyncio
 import sys
 from pathlib import Path
 
-# ==================== 关键修复部分 ====================
-# 把 src 目录加入 Python 模块搜索路径
-ROOT_DIR = Path(__file__).parent
-SRC_DIR = ROOT_DIR / "src"
-sys.path.insert(0, str(SRC_DIR))
-# ====================================================
-
 from fastmcp import Client
-from mcp_server_template.server import mcp   # 现在可以正常导入了
+from src.mcp_server_template.server import mcp   # 现在可以正常导入了
+
 
 async def test_mcp_server():
+  
     print("🚀 开始程序内测试 MCP Server...")
 
     async with Client(mcp) as client:        # in-memory 方式，最适合测试
