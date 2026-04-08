@@ -1,0 +1,10 @@
+services:
+  mcp-server:
+    build: .
+    ports:
+      - "8000:8000"   # 如果用 SSE
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: uv run python -m mcp_server_template.server

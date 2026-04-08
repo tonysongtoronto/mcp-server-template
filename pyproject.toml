@@ -1,0 +1,34 @@
+[project]
+name = "mcp-server-template"
+version = "0.1.0"
+description = "企业级 MCP Server 模板 (uv + Docker)"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]",
+    "fastmcp",           # 简化 Tool 定义
+    "python-dotenv",
+    "pydantic-settings",
+]
+
+# 这是 uv 目前推荐的新标准写法
+[dependency-groups]
+dev = [
+    "ruff",
+    "pytest",
+    "pre-commit",
+    "pytest-asyncio>=1.3.0",
+]
+
+[tool.uv]
+managed = true
+# 💡 删除了这里的 dev-dependencies = ["ruff", "pytest"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "C4"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
