@@ -43,4 +43,11 @@ def server_info() -> str:
 if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    mcp.run(transport="stdio")
+
+    # 单独运行时用 --dev 启动 SSE 模式，可以在浏览器测试
+    if "--dev" in sys.argv:
+        print("🚀 开发模式启动，访问 http://127.0.0.1:6274", file=sys.stderr)
+        mcp.run(transport="sse")
+    else:
+        # 默认 stdio 模式，给 MCP 客户端（Claude Desktop 等）用
+        mcp.run(transport="stdio")
