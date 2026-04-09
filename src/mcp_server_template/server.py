@@ -1,35 +1,46 @@
-from fastmcp import FastMCP
-import os
-from dotenv import load_dotenv
+import sys
+import asyncio
+import logging
+from mcp.server.fastmcp import FastMCP
 
-load_dotenv()
+logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
 
-mcp = FastMCP("mcp-server-template")
+mcp = FastMCP("MCP Server Template")
+
 
 @mcp.tool()
-async def add_numbers(a: int, b: int) -> int:
+def add_numbers(a: int, b: int) -> int:
     """两个数字相加"""
     return a + b
 
+
 @mcp.tool()
-async def get_server_info() -> dict:
-    """返回服务器基本信息"""
-    return {
-        "name": "MCP Server Template",
-        "version": "0.1.0",
-        "python_version": os.getenv("PYTHON_VERSION", "3.12"),
-    }
+def multiply_numbers(a: int, b: int) -> int:
+    """两个数字相乘"""
+    return a * b
+
+
+@mcp.tool()
+def get_server_info() -> str:
+    """返回服务器信息"""
+    return "MCP Server Template 运行中，平台: {}, Python: {}".format(
+        sys.platform, sys.version.split()[0]
+    )
+
 
 @mcp.resource("welcome://message")
-async def get_welcome_message() -> str:
+def welcome_message() -> str:
     """欢迎资源"""
-    return "欢迎使用企业级 MCP Server 模板！（uv + pyproject.toml + Docker）"
+    return "欢迎使用企业级 MCP Server 模板"
 
-@mcp.resource("echo://{text}")
-async def echo(text: str) -> str:
-    """简单回显资源（演示带参数的 Resource）"""
-    return f"Echo: {text}"
+
+@mcp.resource("info://server")
+def server_info() -> str:
+    """服务器信息资源"""
+    return f"运行在 {sys.platform} 平台，Python {sys.version}"
+
 
 if __name__ == "__main__":
-    print("🚀 MCP Server 启动中... (按 Ctrl+C 停止)")
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     mcp.run(transport="stdio")
