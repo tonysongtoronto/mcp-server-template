@@ -9,6 +9,9 @@ dependencies = [
     "pydantic-settings",
     "httpx>=0.28.1",
     "pandas>=3.0.2",
+    "anthropic>=0.93.0",
+    "openai>=2.31.0",
+    "requests>=2.33.1",
 ]
 
 [dependency-groups]

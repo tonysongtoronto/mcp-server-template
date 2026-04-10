@@ -1,0 +1,90 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "1️⃣ 启动 Server",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/mcp_server_template/server.py",
+            "args": ["--dev"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "2️⃣ 调试 Agent",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/agent.py",
+            "args": ["测试问题"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+              {
+            "name": "3️⃣ 测试 OpenRouter",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_openrouter.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "4 测试 Test MCP",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_mcp.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+         {
+            "name": "5️⃣ 测试新工具 (uv pytest)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/test_new_tools.py",
+                "-v",
+                "--capture=no"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+              {
+            "name": "8 调试 test_sse_client",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/test_sse_client.py",
+            "args": ["测试问题"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+
+    ],
+    "compounds": [
+        {
+            "name": "🚀 Server + Agent 一起启动",
+            "configurations": ["1️⃣ 启动 Server", "2️⃣ 调试 Agent"],
+            "stopAll": true
+        },
+             {
+            "name": "🚀 Server + test_sse_client",
+            "configurations": ["1️⃣ 启动 Server", "8 调试 test_sse_client"],
+            "stopAll": true
+        }
+    ]
+}

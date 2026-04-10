@@ -1,10 +1,52 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+### --- 安全与环境 --- ###
+.env
+.env.*
+!.env.example
+# 忽略敏感的密钥文件
+*.pem
+*.key
 
-# Virtual environments
-.venv
+### --- Python 核心 --- ###
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.python-version
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+### --- 虚拟环境 --- ###
+.venv/
+venv/
+ENV/
+env/
+
+### --- 开发工具 (uv, pytest, mypy) --- ###
+.uv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+### --- 编辑器与系统 --- ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
