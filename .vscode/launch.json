@@ -20,7 +20,8 @@
             "cwd": "${workspaceFolder}",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"
-            }
+            },
+            "preLaunchTask": "sleep-before-agent"
         },
               {
             "name": "3️⃣ 测试 OpenRouter",
