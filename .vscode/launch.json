@@ -21,7 +21,7 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"
             },
-            "preLaunchTask": "sleep-before-agent"
+            "preLaunchTask": "wait-for-server"
         },
               {
             "name": "3️⃣ 测试 OpenRouter",

@@ -2,16 +2,12 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "sleep-before-agent",
+            "label": "wait-for-server",
             "type": "shell",
-            "command": "timeout",
-            "args": ["8"],                  // Windows 用 timeout（秒）
-            "windows": {
-                "command": "powershell",
-                "args": ["-Command", "Start-Sleep -Seconds 8"]
-            },
+            "command": "powershell",
+            "args": ["-Command", "Start-Sleep -Seconds 20"],
             "presentation": {
-                "reveal": "silent",         // 不弹出新终端窗口
+                "reveal": "silent",
                 "clear": true
             },
             "problemMatcher": []
