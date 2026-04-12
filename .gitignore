@@ -47,6 +47,8 @@ env/
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
+!.vscode/launch.local.json     
+!.vscode/launch.docker.json    
 !.vscode/extensions.json
 .idea/
 .DS_Store
