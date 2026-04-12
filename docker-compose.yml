@@ -2,9 +2,17 @@ services:
   mcp-server:
     build: .
     ports:
-      - "8000:8000"   # 如果用 SSE
+      - "8000:8000"
     env_file:
       - .env
-    volumes:
-      - .:/app
-    command: uv run python -m mcp_server_template.server
+    command: python src/mcp_server_template/server.py --dev
+
+  agent:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - MCP_SERVER_URL=http://mcp-server:8000/sse  # ← 直接用服务名，不用 host.docker.internal
+    command: python src/agent.py
+    depends_on:
+      - mcp-server  # ← 等 server 启动后再跑 agent
