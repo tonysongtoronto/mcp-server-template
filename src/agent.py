@@ -6,9 +6,10 @@ from mcp.client.sse import sse_client
 from openai import OpenAI
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
-MCP_SERVER_URL = "http://127.0.0.1:8000/sse"
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/sse")
 
 client = OpenAI(
     base_url="https://api.deepseek.com",

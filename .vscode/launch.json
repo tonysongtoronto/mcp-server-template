@@ -1,8 +1,13 @@
 {
     "version": "0.2.0",
     "configurations": [
+
+        // ══════════════════════════════════════════════════════════
+        // 本地调试（不用 Docker，直接跑 Python）
+        // ══════════════════════════════════════════════════════════
+
         {
-            "name": "1️⃣ 启动 Server",
+            "name": "1️⃣ 启动 Server（本地）",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/src/mcp_server_template/server.py",
@@ -11,7 +16,7 @@
             "cwd": "${workspaceFolder}"
         },
         {
-            "name": "2️⃣ 调试 Agent",
+            "name": "2️⃣ 调试 Agent（本地）",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/src/agent.py",
@@ -23,68 +28,122 @@
             },
             "preLaunchTask": "wait-for-server"
         },
-              {
-            "name": "3️⃣ 测试 OpenRouter",
+        {
+            "name": "3️⃣ 测试 OpenRouter（本地）",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/test_openrouter.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
         },
         {
-            "name": "4 测试 Test MCP",
+            "name": "4️⃣ 测试 Test MCP（本地）",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/test_mcp.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
         },
-         {
+        {
             "name": "5️⃣ 测试新工具 (uv pytest)",
             "type": "debugpy",
             "request": "launch",
             "module": "pytest",
-            "args": [
-                "tests/test_new_tools.py",
-                "-v",
-                "--capture=no"
-            ],
+            "args": ["tests/test_new_tools.py", "-v", "--capture=no"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "justMyCode": false,
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
         },
-              {
-            "name": "8 调试 test_sse_client",
+        {
+            "name": "8️⃣ 调试 test_sse_client（本地）",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/test_sse_client.py",
             "args": ["测试问题"],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
         },
 
+        // ══════════════════════════════════════════════════════════
+        // 🐳 Docker 操作
+        // 使用方法：左侧「运行和调试」面板，下拉选择任务名，点▶️
+        // ══════════════════════════════════════════════════════════
+
+        {
+            // 构建镜像，第一次较慢，之后因缓存会很快
+            "name": "🐳 1) Docker 构建镜像",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "docker build -t mcp-server .",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            // 后台启动 Server 容器，端口 8000
+            "name": "🐳 2) Docker 启动 Server 容器",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "docker run -d -p 8000:8000 --name mcp-server-container --env-file .env mcp-server",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            // 实时查看 Server 日志，Ctrl+C 退出
+            "name": "🐳 3) Docker 查看 Server 日志",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "docker logs -f mcp-server-container",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            // Windows 专用：Agent 连接宿主机上的 Server
+            "name": "🐳 4) Docker 运行 Agent 测试（Win/Mac）",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "docker run --rm --add-host=host.docker.internal:host-gateway --env-file .env -e MCP_SERVER_URL=http://host.docker.internal:8000/sse mcp-server python src/agent.py",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            // 进入容器内部排查问题，输入 exit 退出
+            "name": "🐳 5) Docker 进入容器 Shell",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "docker exec -it mcp-server-container /bin/bash",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            // 重新构建前先运行这个，否则会报容器名冲突
+            "name": "🐳 6) Docker 停止并删除容器",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "docker stop mcp-server-container; docker rm mcp-server-container",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            // 改完代码后用这个一键更新：停旧容器→重建镜像→启动新容器→看日志
+            "name": "🐳 7) Docker 一键重建并启动",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "docker stop mcp-server-container; docker rm mcp-server-container; docker build -t mcp-server .; docker run -d -p 8000:8000 --name mcp-server-container --env-file .env mcp-server; docker logs -f mcp-server-container",
+            "cwd": "${workspaceFolder}"
+        }
+
     ],
+
+    // ══════════════════════════════════════════════════════════════
+    // 组合启动：一次点击同时启动多个配置
+    // ══════════════════════════════════════════════════════════════
     "compounds": [
         {
-            "name": "🚀 Server + Agent 一起启动",
-            "configurations": ["1️⃣ 启动 Server", "2️⃣ 调试 Agent"],
+            "name": "🚀 本地：Server + Agent 一起启动",
+            "configurations": ["1️⃣ 启动 Server（本地）", "2️⃣ 调试 Agent（本地）"],
             "stopAll": true
         },
-             {
-            "name": "🚀 Server + test_sse_client",
-            "configurations": ["1️⃣ 启动 Server", "8 调试 test_sse_client"],
+        {
+            "name": "🚀 本地：Server + test_sse_client",
+            "configurations": ["1️⃣ 启动 Server（本地）", "8️⃣ 调试 test_sse_client（本地）"],
             "stopAll": true
         }
     ]

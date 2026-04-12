@@ -7,9 +7,13 @@ import httpx
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
 
+import os
+os.environ.setdefault("HOST", "0.0.0.0")
+os.environ.setdefault("PORT", "8000")
+
 logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
 
-mcp = FastMCP("MCP Server Template")
+mcp = FastMCP("MCP Server Template", host="0.0.0.0")
 
 # ──────────────────────────────────────────
 # 🌐 HTTP 工具（依赖 httpx）
@@ -160,6 +164,8 @@ if __name__ == "__main__":
 
     # 单独运行时用 --dev 启动 SSE 模式，可以在浏览器测试
     if "--dev" in sys.argv:
+        os.environ.setdefault("HOST", "0.0.0.0")
+        os.environ.setdefault("PORT", "8000")
         print("🚀 开发模式启动，访问 http://127.0.0.1:6274", file=sys.stderr)
         mcp.run(transport="sse")
     else:
