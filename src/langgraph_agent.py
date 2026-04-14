@@ -22,9 +22,10 @@ class AgentState(TypedDict):
 
 # ── 2. 创建 LLM（Claude 作为大脑）────────────────────────────
 llm = ChatOpenAI(
-    model="deepseek-chat",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://api.deepseek.com",
+    model="deepseek-chat",                    # DeepSeek 的主流模型
+    api_key=os.getenv("DEEPSEEK_API_KEY"),    # ← 必须使用 DEEPSEEK_API_KEY
+    base_url="https://api.deepseek.com",      # 推荐不加 /v1（官方文档支持两种）
+    temperature=0.0,
 )
 
 # ── 3. 把 MCP 工具转成 LangChain 格式 ───────────────────────
