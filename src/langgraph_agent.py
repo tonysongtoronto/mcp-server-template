@@ -18,7 +18,7 @@ load_dotenv()
 # ── 1. 定义 State ──────────────────────────────────────────
 class AgentState(TypedDict):
     messages: list      # 完整对话历史
-    mcp_session: object # MCP 连接（传递给节点用）
+    mcp_session: object # MCP 连接
 
 # ── 2. 创建 LLM ────────────────────────────────────────────
 llm = ChatOpenAI(
@@ -30,24 +30,17 @@ llm = ChatOpenAI(
 
 # ── 3. 把 MCP 工具转成 LangChain 格式 ───────────────────────
 async def get_langchain_tools(session: ClientSession):
-    """从 MCP Session 获取所有工具，转成 LangChain 可用格式"""
     tools_result = await session.list_tools()
     lc_tools = []
 
     for t in tools_result.tools:
-        # ✅ 修复1：从 MCP inputSchema 动态构建 Pydantic 模型
         schema = t.inputSchema or {}
         properties = schema.get("properties", {})
         required_fields = schema.get("required", [])
 
-        # JSON Schema type → Python type 映射
         type_map = {
-            "string": str,
-            "integer": int,
-            "number": float,
-            "boolean": bool,
-            "object": dict,
-            "array": list,
+            "string": str, "integer": int, "number": float,
+            "boolean": bool, "object": dict, "array": list,
         }
 
         field_definitions = {}
@@ -58,17 +51,25 @@ async def get_langchain_tools(session: ClientSession):
                 py_type = Optional[py_type]
             field_definitions[field_name] = (py_type, ...)
 
-        DynamicSchema = (
-            create_model(f"{t.name}_schema", **field_definitions)
-            if field_definitions
-            else None
-        )
+        DynamicSchema = create_model(f"{t.name}_schema", **field_definitions) if field_definitions else None
 
-        # ✅ 修复2：用普通 def 做外层闭包，避免循环变量被覆盖
         def make_tool_fn(tool_name: str, tool_desc: str, s: ClientSession):
             async def tool_fn(**kwargs):
+                # ==================== 新增：工具调用前打印 ====================
+                print(f"\n🔧 【工具调用】 {tool_name}")
+                print(f"   参数: {kwargs}")
+                # ============================================================
+
                 result = await s.call_tool(tool_name, kwargs)
-                return result.content[0].text if result.content else "无结果"
+
+                # ==================== 新增：工具返回结果打印 ====================
+                result_text = result.content[0].text if result.content else "无结果"
+                print(f"   ✅ 返回: {result_text[:300]}{'...' if len(result_text) > 300 else ''}")
+                print("-" * 60)
+                # ============================================================
+
+                return result_text
+
             tool_fn.__name__ = tool_name
             tool_fn.__doc__ = tool_desc
             return tool_fn
@@ -79,29 +80,39 @@ async def get_langchain_tools(session: ClientSession):
             coroutine=fn,
             name=t.name,
             description=t.description or "",
-            args_schema=DynamicSchema,  # ✅ 传入完整参数 schema，LLM 才会触发 tool_calls
+            args_schema=DynamicSchema,
         )
         lc_tools.append(lc_tool)
 
     return lc_tools
 
+
 # ── 4. 定义节点 ──────────────────────────────────────────────
 async def agent_node(state: AgentState):
-    """Agent 思考节点：让 LLM 决定调用哪个工具"""
+    """Agent 思考节点"""
     session = state["mcp_session"]
     tools = await get_langchain_tools(session)
     llm_with_tools = llm.bind_tools(tools)
 
+    print(f"\n🤖 Agent 正在思考问题: {state['messages'][-1].content}")
     response = await llm_with_tools.ainvoke(state["messages"])
+    
+    if response.tool_calls:
+        print(f"   → 决定调用 {len(response.tool_calls)} 个工具")
+    else:
+        print("   → 决定直接回答，无需调用工具")
+    
     return {"messages": state["messages"] + [response]}
 
+
 async def tool_node(state: AgentState):
-    """工具执行节点：调用 MCP 工具，获取结果"""
+    """工具执行节点（这里其实已经由 tool_fn 内部打印，所以可以简化）"""
     session = state["mcp_session"]
     last_msg = state["messages"][-1]
     tool_messages = []
 
     for tool_call in last_msg.tool_calls:
+        # 注意：实际调用已经在 get_langchain_tools 中的 tool_fn 里打印过了
         result = await session.call_tool(tool_call["name"], tool_call["args"])
         result_text = result.content[0].text if result.content else "无结果"
         tool_messages.append(
@@ -110,12 +121,13 @@ async def tool_node(state: AgentState):
 
     return {"messages": state["messages"] + tool_messages}
 
+
 def should_continue(state: AgentState) -> str:
-    """路由函数：有 tool_calls 就继续，否则结束"""
     last = state["messages"][-1]
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
     return END
+
 
 # ── 5. 构建 LangGraph ────────────────────────────────────────
 def build_graph():
@@ -125,9 +137,10 @@ def build_graph():
 
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", should_continue)
-    graph.add_edge("tools", "agent")  # 工具完成 → 回到 agent 继续思考
+    graph.add_edge("tools", "agent")
 
     return graph.compile()
+
 
 # ── 6. 运行 ──────────────────────────────────────────────────
 async def main():
@@ -137,11 +150,11 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # 调试：打印已注册工具及其 schema，确认工具正确加载
+            print("🚀 MCP Agent 已启动，正在连接服务器...")
             tools = await get_langchain_tools(session)
-            print("已加载工具：")
+            print(f"✅ 已成功加载 {len(tools)} 个工具：")
             for t in tools:
-                print(f"  - {t.name}: args_schema={t.args_schema}")
+                print(f"   - {t.name}")
 
             agent = build_graph()
 
@@ -152,9 +165,9 @@ async def main():
             ]
 
             for q in questions:
-                print(f"\n{'='*50}")
-                print(f"问题：{q}")
-                print("="*50)
+                print(f"\n{'='*70}")
+                print(f"📝 问题：{q}")
+                print("="*70)
 
                 init_state = {
                     "messages": [HumanMessage(content=q)],
@@ -163,7 +176,9 @@ async def main():
 
                 result = await agent.ainvoke(init_state)
                 final = result["messages"][-1]
-                print(f"答案：{final.content}")
+                print(f"\n🎯 最终答案：{final.content}")
+                print("="*70)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
