@@ -5,20 +5,21 @@ import sys
 from typing import TypedDict, Any, Optional
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.stdio import stdio_client, StdioServerParameters
 from pydantic import create_model
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()
 
 # ── 1. 定义 State ──────────────────────────────────────────
 class AgentState(TypedDict):
-    messages: list      # 完整对话历史
-    mcp_session: object # MCP 连接
+    messages: list
+    mcp_session: object
 
 # ── 2. 创建 LLM ────────────────────────────────────────────
 llm = ChatOpenAI(
@@ -55,18 +56,14 @@ async def get_langchain_tools(session: ClientSession):
 
         def make_tool_fn(tool_name: str, tool_desc: str, s: ClientSession):
             async def tool_fn(**kwargs):
-                # ==================== 新增：工具调用前打印 ====================
                 print(f"\n🔧 【工具调用】 {tool_name}")
                 print(f"   参数: {kwargs}")
-                # ============================================================
 
                 result = await s.call_tool(tool_name, kwargs)
 
-                # ==================== 新增：工具返回结果打印 ====================
                 result_text = result.content[0].text if result.content else "无结果"
                 print(f"   ✅ 返回: {result_text[:300]}{'...' if len(result_text) > 300 else ''}")
                 print("-" * 60)
-                # ============================================================
 
                 return result_text
 
@@ -89,7 +86,6 @@ async def get_langchain_tools(session: ClientSession):
 
 # ── 4. 定义节点 ──────────────────────────────────────────────
 async def agent_node(state: AgentState):
-    """Agent 思考节点"""
     session = state["mcp_session"]
     tools = await get_langchain_tools(session)
     llm_with_tools = llm.bind_tools(tools)
@@ -106,13 +102,11 @@ async def agent_node(state: AgentState):
 
 
 async def tool_node(state: AgentState):
-    """工具执行节点（这里其实已经由 tool_fn 内部打印，所以可以简化）"""
     session = state["mcp_session"]
     last_msg = state["messages"][-1]
     tool_messages = []
 
     for tool_call in last_msg.tool_calls:
-        # 注意：实际调用已经在 get_langchain_tools 中的 tool_fn 里打印过了
         result = await session.call_tool(tool_call["name"], tool_call["args"])
         result_text = result.content[0].text if result.content else "无结果"
         tool_messages.append(
@@ -144,17 +138,42 @@ def build_graph():
 
 # ── 6. 运行 ──────────────────────────────────────────────────
 async def main():
-    MCP_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/sse")
+    SERVER_PATH = Path(__file__).parent / "mcp_server_template" / "server.py"
+    
+    print(f"🔍 正在查找 server.py: {SERVER_PATH}")
+    print(f"当前文件位置: {Path(__file__).resolve()}")
+    
+    if not SERVER_PATH.exists():
+        print(f"❌ 找不到 server.py：{SERVER_PATH}")
+        return
+    
+    print(f"✅ 找到 server.py: {SERVER_PATH}")
+    print("=" * 60)
 
-    async with sse_client(MCP_URL) as (read, write):
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-u", str(SERVER_PATH)],
+        env={
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+            **os.environ,
+        },
+    )
+
+    print("🚀 正在通过 stdio 启动 MCP Server 并连接...")
+
+    async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            print("✅ MCP Server 初始化成功！")
 
-            print("🚀 MCP Agent 已启动，正在连接服务器...")
             tools = await get_langchain_tools(session)
             print(f"✅ 已成功加载 {len(tools)} 个工具：")
             for t in tools:
                 print(f"   - {t.name}")
+
+            print("\n" + "=" * 60)
+            print("🚀 LangGraph Agent 已启动，开始处理问题...\n")
 
             agent = build_graph()
 
@@ -181,4 +200,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
