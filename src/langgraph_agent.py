@@ -37,53 +37,36 @@ async def get_langchain_tools(session: ClientSession):
     for t in tools_result.tools:
         schema = t.inputSchema or {}
         properties = schema.get("properties", {})
-        required_fields = schema.get("required", [])
+        required_fields = set(schema.get("required", []))
 
-        type_map = {
-            "string": str, "integer": int, "number": float,
-            "boolean": bool, "object": dict, "array": list,
+        field_definitions = {
+            name: (Any, ...) if name in required_fields else (Optional[Any], None)
+            for name in properties
         }
-
-        field_definitions = {}
-        for field_name, field_info in properties.items():
-            json_type = field_info.get("type", "string")
-            py_type = type_map.get(json_type, Any)
-            if field_name not in required_fields:
-                py_type = Optional[py_type]
-            field_definitions[field_name] = (py_type, ...)
-
         DynamicSchema = create_model(f"{t.name}_schema", **field_definitions) if field_definitions else None
 
         def make_tool_fn(tool_name: str, tool_desc: str, s: ClientSession):
             async def tool_fn(**kwargs):
                 print(f"\n🔧 【工具调用】 {tool_name}")
                 print(f"   参数: {kwargs}")
-
                 result = await s.call_tool(tool_name, kwargs)
-
                 result_text = result.content[0].text if result.content else "无结果"
                 print(f"   ✅ 返回: {result_text[:300]}{'...' if len(result_text) > 300 else ''}")
                 print("-" * 60)
-
                 return result_text
 
             tool_fn.__name__ = tool_name
             tool_fn.__doc__ = tool_desc
             return tool_fn
 
-        fn = make_tool_fn(t.name, t.description or t.name, session)
-
-        lc_tool = StructuredTool.from_function(
-            coroutine=fn,
+        lc_tools.append(StructuredTool.from_function(
+            coroutine=make_tool_fn(t.name, t.description or t.name, session),
             name=t.name,
             description=t.description or "",
             args_schema=DynamicSchema,
-        )
-        lc_tools.append(lc_tool)
+        ))
 
     return lc_tools
-
-
 # ── 4. 定义节点 ──────────────────────────────────────────────
 async def agent_node(state: AgentState):
     session = state["mcp_session"]
