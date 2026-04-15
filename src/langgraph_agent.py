@@ -1,12 +1,12 @@
 """
-langgraph_agent.py — 优化版
+langgraph_agent.py — 优化版 v2
 
-主要改动：
-1. 移除 make_tool_fn 死代码（tool_node 从不调用它，只是冗余）
-2. 工具 Schema 只在启动时获取一次，缓存进 AgentState.tools
-3. agent_node 直接从 state 读取 tools，不再每轮重复 list_tools()
-4. get_tool_schemas 职责单一：仅构建供 bind_tools 用的 Schema 对象
-5. 日志格式统一，逻辑注释更清晰
+主要改动（相对于 v1）：
+1. llm_with_tools 提升为全局变量，整个生命周期只 bind_tools() 一次
+2. init_tools() 负责拉取 Schema 并完成全局绑定，替换原 get_tool_schemas()
+3. agent_node 直接使用全局 llm_with_tools，无需每轮重复 bind_tools()
+4. AgentState 移除 tools 字段（已无需通过 state 传递）
+5. 其余逻辑保持不变
 """
 
 import asyncio
@@ -24,7 +24,6 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from pydantic import create_model
 from dotenv import load_dotenv
 from pathlib import Path
-from langchain_core.utils.function_calling import convert_to_openai_tool
 
 load_dotenv()
 
@@ -33,10 +32,10 @@ load_dotenv()
 class AgentState(TypedDict):
     messages: list       # 对话历史（HumanMessage / AIMessage / ToolMessage）
     mcp_session: object  # MCP ClientSession，tool_node 用它直接调用工具
-    tools: list          # StructuredTool 列表，只在启动时构建一次，缓存于此
+    # ↑ 移除了 tools 字段：Schema 已缓存在全局 llm_with_tools，无需再经 state 传递
 
 
-# ── 2. 创建 LLM ────────────────────────────────────────────────────────────────
+# ── 2. 创建 LLM + 全局工具绑定占位 ────────────────────────────────────────────
 llm = ChatOpenAI(
     model="deepseek-chat",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -44,18 +43,23 @@ llm = ChatOpenAI(
     temperature=0.0,
 )
 
+# 全局缓存：启动时由 init_tools() 赋值，之后所有节点直接引用
+llm_with_tools = None
 
-# ── 3. 构建工具 Schema（仅供 bind_tools 使用，不包含实际执行逻辑）────────────────
-async def get_tool_schemas(session: ClientSession) -> list[StructuredTool]:
+
+# ── 3. 初始化全局工具（启动时调用一次）────────────────────────────────────────
+async def init_tools(session: ClientSession) -> list[StructuredTool]:
     """
-    从 MCP Server 拉取工具列表，转换为 LangChain StructuredTool。
+    从 MCP Server 拉取工具列表，构建 StructuredTool Schema，
+    并将 llm.bind_tools() 结果写入全局 llm_with_tools。
 
-    目的：让 bind_tools 能把工具的名称、描述、参数 Schema 注入到
-    每次 LLM 请求的 tools 字段，供 LLM 决策使用。
+    整个程序生命周期只执行一次，后续所有 agent_node 调用均复用。
 
-    注意：这里的 StructuredTool 不包含真正的执行函数——
-    实际工具调用由 tool_node 通过 session.call_tool 完成。
+    注意：StructuredTool 此处不含真正执行函数——
+    实际工具调用由 tool_node 通过 session.call_tool() 完成。
     """
+    global llm_with_tools
+
     tools_result = await session.list_tools()
     lc_tools = []
 
@@ -64,7 +68,7 @@ async def get_tool_schemas(session: ClientSession) -> list[StructuredTool]:
         properties = schema.get("properties", {})
         required_fields = set(schema.get("required", []))
 
-        # 根据 inputSchema 动态生成 Pydantic 模型，用于参数校验和 Schema 导出
+        # 根据 inputSchema 动态生成 Pydantic 模型，供 bind_tools 导出 Schema
         field_definitions = {
             name: (Any, ...) if name in required_fields else (Optional[Any], None)
             for name in properties
@@ -75,7 +79,7 @@ async def get_tool_schemas(session: ClientSession) -> list[StructuredTool]:
             else None
         )
 
-        # placeholder：bind_tools 只需要 Schema，coroutine 本身不会被此 graph 调用
+        # placeholder coroutine：bind_tools 只需要 Schema，此函数体不会被 graph 调用
         async def _placeholder(**kwargs):
             pass
 
@@ -88,6 +92,8 @@ async def get_tool_schemas(session: ClientSession) -> list[StructuredTool]:
             )
         )
 
+    # 核心：bind 一次，全局复用，避免每轮 agent_node 重复绑定
+    llm_with_tools = llm.bind_tools(lc_tools)
     return lc_tools
 
 
@@ -96,13 +102,9 @@ async def get_tool_schemas(session: ClientSession) -> list[StructuredTool]:
 async def agent_node(state: AgentState) -> dict:
     """
     LLM 推理节点。
-    - 从 state 读取已缓存的 tools，无需每轮重新 list_tools()
-    - bind_tools 把工具 Schema 附加到请求，让 LLM 决定是否调用工具
+    - 直接使用全局 llm_with_tools，无需从 state 读取或重新 bind_tools()
     - 返回 LLM 响应（可能包含 tool_calls，也可能是最终文本）
     """
-    tools = state["tools"]
-    llm_with_tools = llm.bind_tools(tools)
-            
     last_human_msg = state["messages"][-1]
     print(f"\n🤖 Agent 正在思考: {last_human_msg.content!r}")
 
@@ -196,9 +198,9 @@ async def main():
             await session.initialize()
             print("✅ MCP Server 初始化成功！")
 
-            # 工具 Schema 只获取一次，后续所有轮次复用
-            tools = await get_tool_schemas(session)
-            print(f"✅ 已加载 {len(tools)} 个工具：")
+            # 工具 Schema 获取 + llm_with_tools 全局绑定，只执行一次
+            tools = await init_tools(session)
+            print(f"✅ 已加载 {len(tools)} 个工具，llm_with_tools 全局绑定完成：")
             for t in tools:
                 print(f"   - {t.name}: {t.description[:60]}...")
 
@@ -218,10 +220,10 @@ async def main():
                 print(f"📝 问题：{q}")
                 print("=" * 70)
 
+                # ↓ 移除了 tools 字段，state 更简洁
                 init_state: AgentState = {
                     "messages": [HumanMessage(content=q)],
                     "mcp_session": session,
-                    "tools": tools,          # ← 缓存的 Schema，每轮复用
                 }
 
                 result = await agent.ainvoke(init_state)
