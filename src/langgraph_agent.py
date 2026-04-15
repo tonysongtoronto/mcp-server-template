@@ -1,12 +1,11 @@
 """
-langgraph_agent.py — 优化版 v2
+langgraph_agent.py — 优化版 v3
 
-主要改动（相对于 v1）：
-1. llm_with_tools 提升为全局变量，整个生命周期只 bind_tools() 一次
-2. init_tools() 负责拉取 Schema 并完成全局绑定，替换原 get_tool_schemas()
-3. agent_node 直接使用全局 llm_with_tools，无需每轮重复 bind_tools()
-4. AgentState 移除 tools 字段（已无需通过 state 传递）
-5. 其余逻辑保持不变
+相对 v2 的核心改动：
+1. StructuredTool 的执行函数改为真正调用 session.call_tool() 的闭包
+2. tool_node 改用 LangChain ToolNode，通过工具名查找并执行，不再手动解析 tool_calls
+3. AgentState 移除 mcp_session 字段（session 已闭包进每个工具的执行函数）
+4. 新增全局 tools_by_name 字典，供 tool_node 按名查找工具
 """
 
 import asyncio
@@ -19,6 +18,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode          # ← 新增：使用预置 ToolNode
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from pydantic import create_model
@@ -30,12 +30,11 @@ load_dotenv()
 
 # ── 1. 定义 State ──────────────────────────────────────────────────────────────
 class AgentState(TypedDict):
-    messages: list       # 对话历史（HumanMessage / AIMessage / ToolMessage）
-    mcp_session: object  # MCP ClientSession，tool_node 用它直接调用工具
-    # ↑ 移除了 tools 字段：Schema 已缓存在全局 llm_with_tools，无需再经 state 传递
+    messages: list   # 对话历史（HumanMessage / AIMessage / ToolMessage）
+    # ↑ 移除了 mcp_session：session 已闭包进各工具执行函数，无需经 state 传递
 
 
-# ── 2. 创建 LLM + 全局工具绑定占位 ────────────────────────────────────────────
+# ── 2. 创建 LLM + 全局缓存 ────────────────────────────────────────────────────
 llm = ChatOpenAI(
     model="deepseek-chat",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -43,32 +42,30 @@ llm = ChatOpenAI(
     temperature=0.0,
 )
 
-# 全局缓存：启动时由 init_tools() 赋值，之后所有节点直接引用
-llm_with_tools = None
+llm_with_tools: Any = None          # 启动时由 init_tools() 赋值
+tools_by_name: dict = {}            # 工具名 → StructuredTool，供 tool_node 查找
 
 
 # ── 3. 初始化全局工具（启动时调用一次）────────────────────────────────────────
 async def init_tools(session: ClientSession) -> list[StructuredTool]:
     """
-    从 MCP Server 拉取工具列表，构建 StructuredTool Schema，
-    并将 llm.bind_tools() 结果写入全局 llm_with_tools。
+    从 MCP Server 拉取工具列表，为每个工具构建一个真正可执行的 StructuredTool：
+    - args_schema  : 由 inputSchema 动态生成的 Pydantic 模型
+    - coroutine    : 闭包，内部调用 session.call_tool()，LangChain 可直接 invoke
 
-    整个程序生命周期只执行一次，后续所有 agent_node 调用均复用。
-
-    注意：StructuredTool 此处不含真正执行函数——
-    实际工具调用由 tool_node 通过 session.call_tool() 完成。
+    同时完成 llm.bind_tools() 全局绑定，整个生命周期只执行一次。
     """
-    global llm_with_tools
+    global llm_with_tools, tools_by_name
 
     tools_result = await session.list_tools()
-    lc_tools = []
+    lc_tools: list[StructuredTool] = []
 
     for t in tools_result.tools:
         schema = t.inputSchema or {}
         properties = schema.get("properties", {})
         required_fields = set(schema.get("required", []))
 
-        # 根据 inputSchema 动态生成 Pydantic 模型，供 bind_tools 导出 Schema
+        # 动态 Pydantic Schema，bind_tools 需要它导出参数结构给大模型
         field_definitions = {
             name: (Any, ...) if name in required_fields else (Optional[Any], None)
             for name in properties
@@ -79,21 +76,33 @@ async def init_tools(session: ClientSession) -> list[StructuredTool]:
             else None
         )
 
-        # placeholder coroutine：bind_tools 只需要 Schema，此函数体不会被 graph 调用
-        async def _placeholder(**kwargs):
-            pass
+        # ── 关键改动：用闭包捕获 tool_name，真正调用 session.call_tool() ──────
+        tool_name = t.name  # 闭包变量，避免循环变量陷阱
 
-        lc_tools.append(
-            StructuredTool.from_function(
-                coroutine=_placeholder,
-                name=t.name,
-                description=t.description or "",
-                args_schema=DynamicSchema,
-            )
+        async def _call_tool(_tool_name=tool_name, **kwargs) -> str:
+            """LangChain 调用此函数 → 转发给 MCP session 执行真实工具"""
+            print(f"\n🔧 [LangChain] 调用工具: {_tool_name}")
+            print(f"   参数: {kwargs}")
+            result = await session.call_tool(_tool_name, kwargs)
+            result_text = result.content[0].text if result.content else "（无结果）"
+            print(f"   ✅ 返回: {result_text[:300]}{'...' if len(result_text) > 300 else ''}")
+            print("-" * 60)
+            return result_text
+
+        tool = StructuredTool.from_function(
+            coroutine=_call_tool,
+            name=t.name,
+            description=t.description or "",
+            args_schema=DynamicSchema,
         )
+        lc_tools.append(tool)
 
-    # 核心：bind 一次，全局复用，避免每轮 agent_node 重复绑定
+    # 全局绑定：LLM 知道有哪些工具及其 Schema
     llm_with_tools = llm.bind_tools(lc_tools)
+
+    # 按名称索引，tool_node 按名查找工具对象
+    tools_by_name = {t.name: t for t in lc_tools}
+
     return lc_tools
 
 
@@ -101,9 +110,7 @@ async def init_tools(session: ClientSession) -> list[StructuredTool]:
 
 async def agent_node(state: AgentState) -> dict:
     """
-    LLM 推理节点。
-    - 直接使用全局 llm_with_tools，无需从 state 读取或重新 bind_tools()
-    - 返回 LLM 响应（可能包含 tool_calls，也可能是最终文本）
+    LLM 推理节点。直接使用全局 llm_with_tools，无需重新 bind_tools()。
     """
     last_human_msg = state["messages"][-1]
     print(f"\n🤖 Agent 正在思考: {last_human_msg.content!r}")
@@ -121,11 +128,12 @@ async def agent_node(state: AgentState) -> dict:
 
 async def tool_node(state: AgentState) -> dict:
     """
-    工具执行节点。
-    - 直接通过 MCP session 调用工具，不经过 StructuredTool 的函数体
-    - 将每个工具结果包装成 ToolMessage，追加到消息历史
+    工具执行节点（LangChain 原生方式）。
+
+    通过 tools_by_name 按名查找 StructuredTool，
+    调用 tool.ainvoke()，LangChain 内部会执行闭包中的 session.call_tool()。
+    不再需要手动从 state 取 session，也不需要解析 result.content。
     """
-    session = state["mcp_session"]
     last_msg = state["messages"][-1]
     tool_messages = []
 
@@ -133,14 +141,12 @@ async def tool_node(state: AgentState) -> dict:
         name = tool_call["name"]
         args = tool_call["args"]
 
-        print(f"\n🔧 调用工具: {name}")
-        print(f"   参数: {args}")
-
-        result = await session.call_tool(name, args)
-        result_text = result.content[0].text if result.content else "（无结果）"
-
-        print(f"   ✅ 返回: {result_text[:300]}{'...' if len(result_text) > 300 else ''}")
-        print("-" * 60)
+        tool = tools_by_name.get(name)
+        if tool is None:
+            result_text = f"❌ 未找到工具：{name}"
+        else:
+            # ← 核心：通过 LangChain 工具接口调用，不再直接操作 session
+            result_text = await tool.ainvoke(args)
 
         tool_messages.append(
             ToolMessage(content=result_text, tool_call_id=tool_call["id"])
@@ -150,7 +156,7 @@ async def tool_node(state: AgentState) -> dict:
 
 
 def should_continue(state: AgentState) -> str:
-    """路由函数：LLM 有 tool_calls → 去 tool_node；否则结束。"""
+    """路由函数：LLM 有 tool_calls → tool_node；否则结束。"""
     last = state["messages"][-1]
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
@@ -158,7 +164,7 @@ def should_continue(state: AgentState) -> str:
 
 
 # ── 5. 构建 LangGraph ──────────────────────────────────────────────────────────
-def build_graph() -> any:
+def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tool_node)
@@ -198,9 +204,9 @@ async def main():
             await session.initialize()
             print("✅ MCP Server 初始化成功！")
 
-            # 工具 Schema 获取 + llm_with_tools 全局绑定，只执行一次
+            # 工具初始化：Schema 拉取 + 闭包绑定 + llm_with_tools 全局绑定
             tools = await init_tools(session)
-            print(f"✅ 已加载 {len(tools)} 个工具，llm_with_tools 全局绑定完成：")
+            print(f"✅ 已加载 {len(tools)} 个工具，LangChain 闭包绑定完成：")
             for t in tools:
                 print(f"   - {t.name}: {t.description[:60]}...")
 
@@ -220,10 +226,9 @@ async def main():
                 print(f"📝 问题：{q}")
                 print("=" * 70)
 
-                # ↓ 移除了 tools 字段，state 更简洁
+                # ↓ 移除了 mcp_session，state 更简洁
                 init_state: AgentState = {
                     "messages": [HumanMessage(content=q)],
-                    "mcp_session": session,
                 }
 
                 result = await agent.ainvoke(init_state)
