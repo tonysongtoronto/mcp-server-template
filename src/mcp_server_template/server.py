@@ -166,9 +166,20 @@ if __name__ == "__main__":
     if "--dev" in sys.argv:
         os.environ.setdefault("HOST", "0.0.0.0")
         os.environ.setdefault("PORT", "8000")
-        print("🚀 开发模式启动，访问 http://127.0.0.1:6274", file=sys.stderr)
+        
+        port = os.environ['PORT']
+        print(f"🚀 开发模式启动，访问 http://127.0.0.1:{port}", file=sys.stderr)
+        print(f"📡 实际配置 - HOST: {os.environ['HOST']}, PORT: {port}", file=sys.stderr)
+        
         mcp.run(transport="sse")
     else:
         # 默认 stdio 模式，给 MCP 客户端（Claude Desktop 等）用
-        print("🚀 后台模式启动", file=sys.stderr)
+          # stdio 模式也可以读取环境变量（如果有的话）
+        host = os.environ.get("HOST", "N/A")
+        port = os.environ.get("PORT", "N/A")
+        
+        print(f"🚀 后台模式启动 (STDIO)", file=sys.stderr)
+        print(f"📡 配置: HOST={host}, PORT={port}", file=sys.stderr)
+        print(f"💡 传输协议: 标准输入输出", file=sys.stderr)
+        
         mcp.run(transport="stdio")
