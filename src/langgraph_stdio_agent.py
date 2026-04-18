@@ -50,23 +50,33 @@ def mcp_params() -> StdioServerParameters:
 
 # ══════════════════════════════════════════════════════
 # 3. State
-#    task_plan：任务清单（由 planner 一次性生成）
-#    current_task_index：当前执行到哪个任务
-#    next_agent：路由用
+#
+# Task.inputs 声明运行时入参来源，格式：
+#   {
+#     "参数语义名": {"from_task": <task_id>, "field": "result"}
+#   }
+# Supervisor 在派发前把依赖任务的结果按参数名注入到 _resolved_description，
+# Agent 收到"意图 + 【运行时参数】"后，自己推理如何调工具。
 # ══════════════════════════════════════════════════════
-class Task(TypedDict):
-    task_id: int          # 任务编号，从 0 开始
-    description: str      # 任务描述，例如 "计算 3+5"
-    agent: str            # 负责的 Agent，例如 "math_agent"
-    status: str           # "pending" | "done"
-    result: str           # 执行结果
+class TaskInput(TypedDict):
+    from_task: int   # 依赖哪个任务的结果
+    field: str       # 取哪个字段（目前固定为 "result"）
 
+class Task(TypedDict):
+    task_id: int
+    description: str                  # 意图描述，不含具体数值
+    agent: str                        # math_agent / data_agent / http_agent
+    inputs: dict[str, TaskInput]      # 参数名 → 来源，无依赖时为 {}
+    depends_on: list[int]             # 依赖的 task_id 列表
+    status: str                       # "pending" | "done"
+    result: str                       # 执行结果
+    _resolved_description: str        # Supervisor 注入参数后的描述（运行时填充）
 
 class AgentState(TypedDict):
     messages: list
-    task_plan: list[Task]         # 任务清单（由 planner 一次性生成）
-    current_task_index: int       # 当前执行到哪个任务
-    next_agent: str               # 路由用
+    task_plan: list[Task]
+    current_task_index: int
+    next_agent: str
 
 
 # ══════════════════════════════════════════════════════
@@ -110,38 +120,57 @@ async def load_tools(session: ClientSession) -> list[StructuredTool]:
 
 # ══════════════════════════════════════════════════════
 # 6. Planner
-#    作用：把用户问题一次性拆解为有序任务清单
-#    只在图的最开始执行一次，之后 Supervisor 只负责派发
+#    把用户问题拆解为 DAG 任务列表。
+#    每个任务只描述意图，通过 inputs 声明依赖参数来源，
+#    不提前计算任何数值，也不感知具体工具名称。
 # ══════════════════════════════════════════════════════
-PLANNER_SYSTEM = """你是任务规划器。把用户的问题拆解为若干有序的子任务，每个子任务分配给最合适的 Agent。
+PLANNER_SYSTEM = """你是任务规划器。把用户问题拆解为有序子任务，像函数调用一样声明每个任务的入参来源。
 
 可用 Agent：
-- math_agent  ：数学计算，加法、乘法等数字运算
-- data_agent  ：数据分析，统计摘要、分组聚合
-- http_agent  ：网络请求，GET/POST URL
+- math_agent  ：数学计算
+- data_agent  ：数据分析、统计聚合
+- http_agent  ：网络请求
 
-任务描述规则（非常重要）：
-- 描述必须完整、具体，Agent 不需要做任何额外推断
-- math_agent：写明具体数字和运算符，例如"计算 88 + 12"，不要写"计算加法"
-- data_agent：必须明确写出 records_json（完整 JSON 字符串）、group_by 列名、agg_col 列名、agg_func（只写用户要求的，若用户未指定则只写 sum）
-  ✅ 正确示例："对以下数据按 dept 分组，对 salary 列做 sum 聚合。数据：[{...}]"
-  ❌ 错误示例："对数据做统计分析（如总和、平均值等）" ← 绝对禁止写"如…等"模糊描述
-- http_agent：写明完整 URL 和请求方法
-- 同一个 Agent 可以出现多次（例如有两个独立的计算任务）
-- 任务按执行顺序排列
+规则（严格遵守）：
+1. description 只写意图，绝对不要提前计算任何数值或结果
+2. inputs 声明运行时需要从哪些前置任务获取参数：
+   - key   = 参数的语义名称（如"加数A"、"被乘数"、"数据集"），供 Agent 理解用途
+   - value = {"from_task": <被依赖的task_id>, "field": "result"}
+3. depends_on 从 inputs 的 from_task 自动推导，列出所有依赖的 task_id
+4. 没有依赖的任务：inputs 为 {}，depends_on 为 []
+5. 同一个 Agent 可出现多次
+6. 任务按拓扑顺序排列（被依赖的任务排在前面）
 
-严格只输出如下 JSON 数组，不要有任何其他内容：
+严格只输出 JSON 数组，不要有任何其他内容，示例：
 [
-  {"task_id": 0, "description": "计算 3+5", "agent": "math_agent", "status": "pending", "result": ""},
-  {"task_id": 1, "description": "用 GET 方法访问 https://api.github.com/zen，返回响应文本", "agent": "http_agent", "status": "pending", "result": ""},
-  {"task_id": 2, "description": "计算 10×20", "agent": "math_agent", "status": "pending", "result": ""}
+  {
+    "task_id": 0,
+    "description": "计算 88 加 12",
+    "agent": "math_agent",
+    "inputs": {},
+    "depends_on": [],
+    "status": "pending",
+    "result": "",
+    "_resolved_description": ""
+  },
+  {
+    "task_id": 1,
+    "description": "把前一步的结果乘以 5",
+    "agent": "math_agent",
+    "inputs": {
+      "被乘数": {"from_task": 0, "field": "result"}
+    },
+    "depends_on": [0],
+    "status": "pending",
+    "result": "",
+    "_resolved_description": ""
+  }
 ]"""
 
 
 async def planner_node(state: AgentState) -> AgentState:
-    """一次性把用户问题拆解为任务清单，只执行一次。"""
+    """一次性把用户问题拆解为 DAG 任务清单，只执行一次。"""
 
-    # 如果已经有任务清单，跳过（避免重入）
     if state.get("task_plan"):
         return state
 
@@ -153,7 +182,6 @@ async def planner_node(state: AgentState) -> AgentState:
     ])
 
     raw = response.content.strip()
-    # 清理 markdown 代码块
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -163,38 +191,82 @@ async def planner_node(state: AgentState) -> AgentState:
         task_plan: list[Task] = json.loads(raw.strip())
         print(f"  ✅ 拆解出 {len(task_plan)} 个任务：")
         for t in task_plan:
-            print(f"     [{t['task_id']}] {t['agent']} ← {t['description']}")
+            deps    = t.get("depends_on", [])
+            inputs  = t.get("inputs", {})
+            dep_str = f"  依赖→{deps} 参数→{list(inputs.keys())}" if deps else ""
+            print(f"     [{t['task_id']}] {t['agent']} ← {t['description']}{dep_str}")
     except json.JSONDecodeError:
         print(f"  ⚠️ JSON 解析失败：{raw[:200]}")
-        # 兜底：把整个问题作为一个任务
-        task_plan = [{"task_id": 0, "description": state["messages"][0].content,
-                      "agent": "math_agent", "status": "pending", "result": ""}]
+        task_plan = [{
+            "task_id": 0,
+            "description": state["messages"][0].content,
+            "agent": "math_agent",
+            "inputs": {},
+            "depends_on": [],
+            "status": "pending",
+            "result": "",
+            "_resolved_description": "",
+        }]
 
     return {**state, "task_plan": task_plan, "current_task_index": 0}
 
 
 # ══════════════════════════════════════════════════════
 # 7. Supervisor
-#    不做 AI 决策，只做简单的任务指针推进
-#    找到下一个 pending 任务 → 派发给对应 Agent
+#    检查依赖是否就绪 → 解析 inputs → 注入参数到 _resolved_description → 派发
+#    像函数调用传参：参数名=来源任务结果，注入后 Agent 自己推理工具调用
 # ══════════════════════════════════════════════════════
 async def supervisor_node(state: AgentState) -> AgentState:
     task_plan: list[Task] = state.get("task_plan", [])
+    done_map = {t["task_id"]: t for t in task_plan if t["status"] == "done"}
 
-    # 找下一个 pending 任务
     for task in task_plan:
-        if task["status"] == "pending":
-            print(f"\n  🧭 Supervisor → {task['agent']}（任务[{task['task_id']}]: {task['description']}）")
-            return {**state, "next_agent": task["agent"], "current_task_index": task["task_id"]}
+        if task["status"] != "pending":
+            continue
 
-    # 所有任务都完成了
+        # 检查依赖是否全部完成
+        unmet = [dep for dep in task.get("depends_on", []) if dep not in done_map]
+        if unmet:
+            print(f"\n  ⏳ 任务[{task['task_id']}] 等待依赖 {unmet}，跳过寻找其他可执行任务")
+            continue
+
+        # ★ 像函数传参：把 inputs 解析为具名参数，注入到任务描述
+        resolved_inputs: dict[str, str] = {}
+        for param_name, source in task.get("inputs", {}).items():
+            from_id  = source["from_task"]
+            field    = source.get("field", "result")
+            src_task = done_map.get(from_id, {})
+            resolved_inputs[param_name] = src_task.get(field, "")
+
+        if resolved_inputs:
+            params_text = "\n".join(f"  {k} = {v}" for k, v in resolved_inputs.items())
+            task["_resolved_description"] = (
+                f"{task['description']}\n\n"
+                f"【运行时参数】\n{params_text}"
+            )
+        else:
+            task["_resolved_description"] = task["description"]
+
+        print(f"\n  🧭 Supervisor → {task['agent']}（任务[{task['task_id']}]）")
+        print(f"     {task['_resolved_description'].replace(chr(10), ' | ')}")
+        return {**state, "next_agent": task["agent"], "current_task_index": task["task_id"]}
+
+    # 还有 pending 但所有剩余任务依赖都无法满足 → 死锁，强制结束
+    pending = [t for t in task_plan if t["status"] == "pending"]
+    if pending:
+        print(f"\n  ⚠️ 任务 {[t['task_id'] for t in pending]} 依赖无法满足，强制跳过")
+        for t in pending:
+            t["status"] = "done"
+            t["result"] = "⚠️ 依赖未满足，跳过"
+
     print("\n  🧭 Supervisor → FINISH（所有任务已完成）")
     return {**state, "next_agent": "FINISH"}
 
 
 # ══════════════════════════════════════════════════════
 # 8. 通用 Agent 执行器
-#    执行当前任务（而非整个用户问题），结果写回 task_plan
+#    读取 _resolved_description（已注入参数的描述）执行任务
+#    Agent 通过 LLM 推理决定调哪个工具、传什么参数
 # ══════════════════════════════════════════════════════
 async def run_agent(
     state: AgentState,
@@ -204,37 +276,34 @@ async def run_agent(
     tools_ref: list[StructuredTool],
 ) -> AgentState:
 
-    by_name   = {t.name: t for t in tools_ref}
-    lc_tools  = [by_name[t] for t in allowed_tools if t in by_name]
+    by_name  = {t.name: t for t in tools_ref}
+    lc_tools = [by_name[t] for t in allowed_tools if t in by_name]
     task_plan: list[Task] = state.get("task_plan", [])
     task_index: int = state.get("current_task_index", 0)
 
-    # 取出当前任务
     current_task = next((t for t in task_plan if t["task_id"] == task_index), None)
     if not current_task:
         print(f"  ⚠️ [{name}] 找不到任务 {task_index}")
         return state
 
-    task_description = current_task["description"]
+    # ★ 优先用 Supervisor 注入参数后的描述，无则回退到原始描述
+    task_description = current_task.get("_resolved_description") or current_task["description"]
 
     if not lc_tools:
-        result_text = f"⚠️ 没有可用工具：{allowed_tools}"
         current_task["status"] = "done"
-        current_task["result"] = result_text
+        current_task["result"] = f"⚠️ 没有可用工具：{allowed_tools}"
         return {**state, "task_plan": task_plan}
 
     agent_llm = llm.bind_tools(lc_tools)
 
-    # 只把当前任务描述发给 Agent，而不是整个用户消息历史
     msgs = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=task_description),
     ]
 
-    print(f"\n  ▶ {name} 执行任务[{task_index}]：{task_description}（工具：{allowed_tools}）")
+    print(f"\n  ▶ {name} 执行任务[{task_index}]（工具：{allowed_tools}）")
 
-    # ReAct 循环
-    max_steps    = 10
+    max_steps     = 10
     last_response = None
 
     for step in range(max_steps):
@@ -250,8 +319,7 @@ async def run_agent(
         for tc in response.tool_calls:
             tool = by_name.get(tc["name"])
             if tool:
-                # 过滤 None 后直接调底层协程，跳过 StructuredTool 的 schema 重新验证
-                args   = {k: v for k, v in tc["args"].items() if v is not None}
+                args        = {k: v for k, v in tc["args"].items() if v is not None}
                 result_text = await tool.coroutine(**args)
             else:
                 result_text = f"❌ 未找到工具：{tc['name']}"
@@ -259,27 +327,27 @@ async def run_agent(
     else:
         print(f"  ⚠️ {name} 达到最大步数 {max_steps}，强制终止")
 
-    # 把结果写回任务清单，标记为 done
-    result_summary = last_response.content if last_response else "（无结果）"
     current_task["status"] = "done"
-    current_task["result"] = result_summary
+    current_task["result"] = last_response.content if last_response else "（无结果）"
 
     return {**state, "task_plan": task_plan}
 
 
 # ══════════════════════════════════════════════════════
 # 9. 图构建
-#    闭包捕获 tools_ref，三个专业 Agent 节点通过它获取工具
+#    Agent 的 system_prompt 只描述角色和行为准则，
+#    不感知具体工具名，工具由 allowed_tools 白名单控制。
+#    将来新增工具只需：① 在 load_tools 里加载，② 在对应 Agent 的 allowed_tools 里注册。
 # ══════════════════════════════════════════════════════
 def build_graph(tools_ref: list[StructuredTool]):
 
-    # ── 三个专业 Agent 节点 ──────────────────────────
     async def math_agent(state: AgentState) -> AgentState:
         return await run_agent(
             state, "Math Agent",
             system_prompt=(
-                "你是数学专家。任务描述中已给出所有必要参数，直接调用对应工具完成计算，"
-                "得到结果后立即返回，不要做多余的步骤。"
+                "你是数学计算专家。根据任务描述和【运行时参数】（如果有），"
+                "推断需要做什么运算，调用合适的工具完成计算，得到结果后立即返回。"
+                "只输出最终数值结果，不要解释过程。"
             ),
             allowed_tools=["add_numbers", "multiply_numbers"],
             tools_ref=tools_ref,
@@ -289,10 +357,9 @@ def build_graph(tools_ref: list[StructuredTool]):
         return await run_agent(
             state, "Data Agent",
             system_prompt=(
-                "你是数据分析专家。严格按照任务描述执行，任务要求几个工具调用就调用几次，"
-                "不要自行扩展（禁止额外调用任务未要求的聚合函数）。"
-                "任务描述中已给出 records_json、group_by、agg_col、agg_func，直接使用，不要猜测或补充。"
-                "工具调用完成后，给出简洁结论即可。"
+                "你是数据分析专家。根据任务描述和【运行时参数】（如果有），"
+                "提取数据集、分组列、聚合列、聚合函数等信息，调用合适的工具完成分析。"
+                "任务要求几种聚合就做几种，不要自行扩展。完成后给出简洁结论。"
             ),
             allowed_tools=["dataframe_summary", "group_and_aggregate"],
             tools_ref=tools_ref,
@@ -302,36 +369,37 @@ def build_graph(tools_ref: list[StructuredTool]):
         return await run_agent(
             state, "HTTP Agent",
             system_prompt=(
-                "你是网络请求专家。按任务描述发送请求，成功拿到响应后立即返回结果，"
-                "不要重试或发送额外请求。若工具参数有默认值问题，timeout 请使用 10。"
+                "你是网络请求专家。根据任务描述和【运行时参数】（如果有），"
+                "发送对应的 HTTP 请求，成功拿到响应后立即返回结果，不要重试。"
+                "timeout 默认使用 10。"
             ),
             allowed_tools=["fetch_url", "post_json"],
             tools_ref=tools_ref,
         )
 
-    # ── Final Answer 节点 ────────────────────────────
     async def final_answer_node(state: AgentState) -> AgentState:
         task_plan: list[Task] = state.get("task_plan", [])
 
         results_text = "\n".join(
-            f"任务[{t['task_id']}] {t['description']}：{t['result']}"
+            f"任务[{t['task_id']}]（{t['description']}）：{t['result']}"
             for t in task_plan
         )
         print(f"\n  📝 汇总结果：\n{results_text}")
 
         response = await llm.ainvoke([
-            SystemMessage(content=f"根据以下各子任务的执行结果，用中文给用户一个清晰完整的最终答案：\n\n{results_text}"),
+            SystemMessage(content=(
+                "根据以下各子任务的执行结果，用中文给用户一个清晰完整的最终答案。\n\n"
+                f"{results_text}"
+            )),
             state["messages"][0],
         ])
 
         return {**state, "messages": state["messages"] + [AIMessage(content=response.content)]}
 
-    # ── 路由函数 ─────────────────────────────────────
     def route(state: AgentState) -> str:
         next_node = state.get("next_agent", "FINISH")
         return "final_answer" if next_node == "FINISH" else next_node
 
-    # ── 构建图 ───────────────────────────────────────
     g = StateGraph(AgentState)
 
     g.add_node("planner",      planner_node)
@@ -389,16 +457,19 @@ if __name__ == "__main__":
         sys.exit(1)
 
     QUESTIONS = [
-        # 测试核心场景：同一个 Agent（math_agent）需要被调用两次
-        "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
-
+        # 依赖链测试：task1 依赖 task0，math_agent 连续被调用两次
         "把 88 和 12 相加，再把结果乘以 5",
 
+        # 多 Agent + 无依赖并列任务
+        "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+
+        # 纯数据分析
         """分析这批数据：[{"name":"Alice","dept":"Eng","salary":9000},
          {"name":"Bob","dept":"Mkt","salary":7500},
          {"name":"Charlie","dept":"Eng","salary":11000}]
          按 dept 分组，对 salary 求平均""",
 
+        # 无依赖单任务
         "访问 https://api.github.com/zen 返回了什么？",
     ]
 
@@ -406,13 +477,13 @@ if __name__ == "__main__":
         async with stdio_client(mcp_params()) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                _tools.extend(await load_tools(session))  # 填充同一个 _tools
+                _tools.extend(await load_tools(session))
 
                 for q in QUESTIONS:
                     print(f"\n{'━'*60}\n❓ {q}\n{'━'*60}")
                     result = await graph.ainvoke({
                         "messages":           [HumanMessage(content=q)],
-                        "task_plan":          [],   # 由 planner 填充
+                        "task_plan":          [],
                         "current_task_index": 0,
                         "next_agent":         "",
                     })
@@ -420,4 +491,4 @@ if __name__ == "__main__":
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    asyncio.run(main())   # stdio_client 在这个循环里开和关，不会跨循环 ✅
+    asyncio.run(main())
