@@ -52,3 +52,9 @@ env/
 !.vscode/extensions.json
 .idea/
 .DS_Store
+
+### --- LangGraph 状态与持久化 --- ###
+# 忽略所有 pickle 格式的检查点和存储文件
+*.pckl
+# 如果你有特定的 langgraph 运行目录，也可以直接忽略整个目录
+.langgraph_api/

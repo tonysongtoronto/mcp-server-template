@@ -1,0 +1,12 @@
+
+
+{
+  "graphs": {
+    "supervisorpalner": "src.langgraph_stdio_agent:graph",
+    "agent":"src.langgraph_agent:graph"
+  },
+  "env": ".env",
+  "dependencies": [
+    "."
+  ]
+}

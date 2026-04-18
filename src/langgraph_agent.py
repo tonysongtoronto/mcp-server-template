@@ -174,7 +174,8 @@ def build_graph():
     graph.add_edge("tools", "agent")
 
     return graph.compile()
-
+# LangGraph Studio 需要一个名为 graph 的变量
+graph = build_graph()
 
 # ── 6. 主入口 ──────────────────────────────────────────────────────────────────
 async def main():

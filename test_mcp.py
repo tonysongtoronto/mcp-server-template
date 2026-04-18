@@ -6,11 +6,19 @@ from pathlib import Path
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
+# --- 新增：导入追踪工具和环境加载 ---
+from langsmith import traceable
+from dotenv import load_dotenv
+
+# 自动从项目根目录的 .env 文件加载变量
+load_dotenv() 
 
 # server.py 的正确路径
 SERVER_PATH = Path(__file__).parent / "src" / "mcp_server_template" / "server.py"
 
-
+# --- 关键修改：使用 @traceable 装饰器 ---
+# name 将决定在 LangSmith 里显示的名称
+@traceable(name="MCP_Server_Test_Session")
 async def test_mcp_server():
     print("=" * 60)
     print("🚀 开始测试 MCP Server（stdio）")
@@ -47,8 +55,10 @@ async def test_mcp_server():
                 tools = await client.list_tools()
                 print(f"✅ Tools: {[t.name for t in tools.tools]}")
 
-                # 3. 调用工具
+                # 3. 调用工具 (这些内部调用也可以单独加 trace，这里演示手动标记)
                 print("\n步骤 3: 调用 add_numbers(10, 25)...")
+                # 即使不单独给 call_tool 加装饰器，由于它在 test_mcp_server 内部，
+                # 它的报错和耗时也会被整体记录。
                 result = await client.call_tool("add_numbers", {"a": 10, "b": 25})
                 print(f"✅ 结果: {result.content[0].text}")
 
@@ -74,8 +84,15 @@ async def test_mcp_server():
         print(f"\n❌ 测试失败: {type(e).__name__}: {e}")
         traceback.print_exc()
 
-
 if __name__ == "__main__":
+    # 确保在 Windows 上异步 IO 正常工作
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    asyncio.run(test_mcp_server())
+    
+    try:
+        asyncio.run(test_mcp_server())
+    finally:
+        # 这是一个小技巧：给一点点时间让异步的 LangSmith 日志发送完毕
+        # 否则脚本执行太快，后台上报线程可能还没来得及发请求就被强制关闭了
+        import time
+        time.sleep(1)
