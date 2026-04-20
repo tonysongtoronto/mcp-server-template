@@ -874,16 +874,16 @@ if __name__ == "__main__":
 
     QUESTIONS = [
         # 纯闲聊 → direct 任务（LLM 真实回答）
-        "你好，我叫 tony",
+        # "你好，我叫 tony",
         # 纯工具任务
         "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
         # 混合任务：闲聊 + 工具（原来会被短路，现在能正确执行全部子任务）
-        "先介绍一下你自己，然后帮我计算 99 乘以 9",
+        # "先介绍一下你自己，然后帮我计算 99 乘以 9",
         # 数据分析
-        """分析这批数据：[{"name":"Alice","dept":"Eng","salary":9000},
-         {"name":"Bob","dept":"Mkt","salary":7500},
-         {"name":"Charlie","dept":"Eng","salary":11000}]
-         按 dept 分组，对 salary 求平均""",
+        # """分析这批数据：[{"name":"Alice","dept":"Eng","salary":9000},
+        #  {"name":"Bob","dept":"Mkt","salary":7500},
+        #  {"name":"Charlie","dept":"Eng","salary":11000}]
+        #  按 dept 分组，对 salary 求平均""",
         # # 网络请求
         # "访问 https://api.github.com/zen 返回了什么？",
 #         "先介绍一下什么是加权平均数，然后计算 (85×3 + 90×2 + 78×5) 除以 (3+2+5) 得到加权平均分，"
@@ -915,3 +915,6 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
+    
+    
+    # uv run python src/langgraph_stdio_agent.py
