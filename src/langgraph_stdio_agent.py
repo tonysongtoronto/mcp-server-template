@@ -5,14 +5,22 @@ src/langgraph_stdio_agent.py
   1. uv run langgraph dev   → langgraph 调用 lifespan 钩子初始化工具
   2. python -m src.langgraph_stdio_agent  → __main__ 手动初始化工具
 
-★ 核心改动：动态工具注册表（ToolRegistry）
+★ 重构说明（相比上一版本）：
+   - 移除 router 节点，消除"混合任务被短路到 direct_answer"的问题
+   - Planner 承担意图判断：纯问答任务输出 agent="direct" 的特殊任务
+   - Supervisor 路由扩展：检测到 agent="direct" 时直接走 direct_answer，
+     不经过任何工具 agent 和 replanner
+   - LLM 调用次数减少一次（原 router + planner 各一次，现只有 planner）
+   - 混合任务（部分闲聊 + 部分工具）现在可以正确执行所有子任务
+
+★ 动态工具注册表（ToolRegistry）
    - 启动时从 MCP 加载工具，自动构建 agent → tools 映射
-   - Planner / Router 的 system prompt 动态注入工具描述
+   - Planner / Supervisor 的 system prompt 动态注入工具描述
    - 每个 Agent 的 allowed_tools 从注册表查找，代码零硬编码
    - 新增/删除工具只需修改 MCP server，LangGraph 代码无需改动
 
 ★ Re-Planner 节点
-   每个 Agent 执行完任务后，Re-Planner 检查结果，
+   每个工具 Agent 执行完任务后，Re-Planner 检查结果，
    决定是否需要调整剩余计划，再交还给 Supervisor 继续执行。
 """
 
@@ -61,22 +69,20 @@ def mcp_params() -> StdioServerParameters:
 
 
 # ══════════════════════════════════════════════════════
-# 3. ★ 动态工具注册表
+# 3. 动态工具注册表
 #
 #   设计思路：
 #   - MCP server 上的每个工具，通过 tags / prefix 约定归属到某个 agent
 #   - 归属规则写在 AGENT_TOOL_PATTERNS 中，支持前缀匹配和精确匹配
 #   - 未匹配到任何 agent 的工具会被放入 "default_agent"
 #   - 注册表构建完成后暴露：
-#       registry.agents          → list[str]  所有 agent 名
+#       registry.agents          → list[str]  所有工具 agent 名（不含 "direct"）
 #       registry.tools_for(name) → list[StructuredTool]
 #       registry.tool_desc_block → str  供 LLM prompt 使用的工具描述块
 #       registry.agent_desc_block→ str  供 LLM prompt 使用的 agent 描述块
 # ══════════════════════════════════════════════════════
 
 # Agent 工具归属规则：每个 agent 匹配哪些工具名（支持前缀 * 通配）
-# 格式：agent名 → [精确工具名 或 "前缀*"]
-# 规则按顺序匹配，第一个命中的 agent 获胜
 AGENT_TOOL_PATTERNS: dict[str, list[str]] = {
     "math_agent": ["add_numbers", "multiply_numbers", "subtract_numbers",
                    "divide_numbers", "power*", "sqrt*", "math_*"],
@@ -91,6 +97,7 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
     "math_agent": "数学计算（加减乘除、幂、开方等数值运算）",
     "data_agent": "数据分析（统计、聚合、分组、过滤等结构化数据处理）",
     "http_agent": "网络请求（GET/POST、访问 URL、调用外部 API）",
+    # ★ "direct" 是特殊虚拟 agent，不在此注册，由 planner prompt 单独说明
 }
 
 def _match_agent(tool_name: str) -> str:
@@ -111,11 +118,12 @@ class ToolRegistry:
     """
     启动时从 MCP 工具列表构建，之后只读。
     提供 prompt 片段和工具查找接口，供各节点直接使用。
+    注意："direct" 是虚拟 agent，不存储在注册表里。
     """
     _agent_tools: dict[str, list[StructuredTool]] = field(default_factory=dict)
     _all_tools: dict[str, StructuredTool] = field(default_factory=dict)
-    _tool_desc_block: str = ""    # 供 prompt 使用的工具描述段落
-    _agent_desc_block: str = ""   # 供 prompt 使用的 agent 描述段落
+    _tool_desc_block: str = ""
+    _agent_desc_block: str = ""
 
     @classmethod
     def build(cls, lc_tools: list[StructuredTool]) -> "ToolRegistry":
@@ -125,7 +133,6 @@ class ToolRegistry:
             agent = _match_agent(tool.name)
             reg._agent_tools.setdefault(agent, []).append(tool)
 
-        # 构建供 LLM 使用的描述块 ── 一次性生成，后续直接引用
         lines_tools: list[str] = ["【可用工具列表】"]
         for agent, tools in reg._agent_tools.items():
             desc = AGENT_DESCRIPTIONS.get(agent, "通用处理")
@@ -138,6 +145,8 @@ class ToolRegistry:
             desc = AGENT_DESCRIPTIONS.get(agent, "通用处理")
             tool_names = [t.name for t in reg._agent_tools.get(agent, [])]
             lines_agents.append(f"  - {agent}：{desc}（工具：{', '.join(tool_names)}）")
+        # 在 agent 列表里补充 direct 的说明
+        lines_agents.append("  - direct：直接用语言模型回答，不调用任何工具（闲聊/知识问答）")
 
         reg._tool_desc_block  = "\n".join(lines_tools)
         reg._agent_desc_block = "\n".join(lines_agents)
@@ -149,6 +158,7 @@ class ToolRegistry:
 
     @property
     def agents(self) -> list[str]:
+        """返回真实工具 agent 列表，不含虚拟的 'direct'"""
         return list(self._agent_tools.keys())
 
     @property
@@ -171,12 +181,6 @@ class ToolRegistry:
 
 # ══════════════════════════════════════════════════════
 # 4. State
-#
-#   ★ 字段说明（已整理）：
-#   - current_task_id        : 当前正在执行的 task_id（即将派发给 agent 的任务）
-#                              由 supervisor_node 写入，run_agent 读取
-#   - last_completed_task_id : 已删除，原先仅用于 replanner 的日志打印，
-#                              与 current_task_id 在 agent 执行完成后值相同，完全冗余
 # ══════════════════════════════════════════════════════
 class TaskInput(TypedDict):
     from_task: int
@@ -185,7 +189,7 @@ class TaskInput(TypedDict):
 class Task(TypedDict):
     task_id: int
     description: str
-    agent: str
+    agent: str          # 工具 agent 名，或特殊值 "direct"
     inputs: dict[str, TaskInput]
     depends_on: list[int]
     status: str
@@ -195,16 +199,15 @@ class Task(TypedDict):
 class AgentState(TypedDict):
     messages: list
     task_plan: list[Task]
-    current_task_id: int       # ★ 原 current_task_index，重命名以准确反映语义
-    next_agent: str
-    direct_answer: str
+    current_task_id: int
+    next_agent: str     # supervisor 写入，供图的条件路由使用；"FINISH" 表示全部完成
 
 
 # ══════════════════════════════════════════════════════
 # 5. 共享容器（lifespan / __main__ 初始化后填充）
 # ══════════════════════════════════════════════════════
 _tools: list[StructuredTool] = []
-_registry: ToolRegistry = ToolRegistry()   # 空注册表，初始化后替换
+_registry: ToolRegistry = ToolRegistry()
 
 
 # ══════════════════════════════════════════════════════
@@ -239,87 +242,57 @@ async def load_tools(session: ClientSession) -> list[StructuredTool]:
 
 
 def _init_registry(tools: list[StructuredTool]) -> None:
-    """工具加载完成后构建全局注册表，同时更新 graph 使用的引用。"""
     global _registry
     _registry = ToolRegistry.build(tools)
 
 
 # ══════════════════════════════════════════════════════
-# 7. Router
-#    ★ system prompt 动态注入工具信息，让 LLM 自行判断
-# ══════════════════════════════════════════════════════
-def _router_system() -> str:
-    return f"""你是一个意图路由器，判断用户的消息是否需要调用工具来回答。
-
-    {_registry.tool_desc_block}
-
-    需要工具的情况（输出 {{"route": "agent"}}）：
-    - 需要使用上述任何工具才能完成的任务
-
-    不需要工具的情况（输出 {{"route": "direct", "answer": "<你的回答>"}}）：
-    - 闲聊、问候、自我介绍（"你好"、"我叫xxx"、"谢谢"）
-    - 询问概念、定义、知识性问题（不需要实时计算或请求）
-    - 任何仅凭语言模型知识就能直接回答的问题
-
-    严格只输出 JSON，不要有任何其他内容。"""
-
-
-async def router_node(state: AgentState) -> AgentState:
-    print("\n  🔀 Router 判断意图...")
-    response = await llm.ainvoke([
-        SystemMessage(content=_router_system()),
-        state["messages"][0],
-    ])
-
-    raw = response.content.strip()
-    if "```" in raw:
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-
-    try:
-        decision = json.loads(raw.strip())
-    except json.JSONDecodeError:
-        print(f"  ⚠️ Router JSON 解析失败，默认走 agent：{raw[:100]}")
-        return {**state, "direct_answer": ""}
-
-    if decision.get("route") == "direct":
-        answer = decision.get("answer", "")
-        print("  💬 Router → 直接回答（无需工具）")
-        return {**state, "direct_answer": answer}
-
-    print("  🛠️  Router → 需要工具，走 Planner")
-    return {**state, "direct_answer": ""}
-
-
-# ══════════════════════════════════════════════════════
-# 8. Planner
-#    ★ system prompt 动态注入 agent + 工具列表，不再硬编码
+# 7. Planner
+#
+#   ★ 重构核心：Planner 现在同时承担意图判断职责
+#   - 需要工具的任务 → 正常输出工具 agent 任务
+#   - 纯问答/闲聊   → 输出 agent="direct" 的特殊任务，
+#                      description 字段直接写好回答内容
+#   - 混合任务       → direct 任务和工具任务可在同一个 task_plan 中共存
 # ══════════════════════════════════════════════════════
 def _planner_system() -> str:
-    valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用 Agent）"
-    return f"""你是任务规划器。把用户问题拆解为有序子任务，像函数调用一样声明每个任务的入参来源。
+    valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用工具 Agent）"
+    return f"""你是任务规划器。把用户问题拆解为有序子任务列表。
 
 {_registry.agent_desc_block}
 
-规则（严格遵守）：
-1. agent 字段只能填：{valid_agents}
-2. description 只写意图，绝对不要提前计算任何数值或结果
-3. inputs 声明运行时需要从哪些前置任务获取参数：
-   - key   = 参数的语义名称（如"加数A"、"被乘数"、"数据集"），供 Agent 理解用途
+━━ agent 选择规则 ━━
+1. 需要调用工具才能完成的任务 → 选择对应的工具 agent（{valid_agents}）
+2. 不需要工具、仅凭语言模型即可回答的任务 → agent 填 "direct"，
+   并在 description 里直接写好完整回答内容（这将作为该任务的最终输出）
+   适用场景：闲聊、问候、概念解释、知识性问答等
+
+━━ 其他规则（严格遵守）━━
+3. description 只写意图（工具任务）或完整回答（direct 任务），绝不提前计算数值
+4. inputs 声明运行时需要从哪些前置任务获取参数：
+   - key   = 参数的语义名称（如"加数A"、"被乘数"），供 Agent 理解用途
    - value = {{"from_task": <被依赖的task_id>, "field": "result"}}
-4. depends_on 从 inputs 的 from_task 自动推导，列出所有依赖的 task_id
-5. 没有依赖的任务：inputs 为 {{}}，depends_on 为 []
-6. 同一个 Agent 可出现多次
-7. 任务按拓扑顺序排列（被依赖的任务排在前面）
-8. 如果用户消息中已直接包含数据（如 JSON 数组、数字、文本等），
-   不要单独拆一个"获取数据"或"读取数据"任务，
-   直接在第一个处理任务的 description 里完整引用该数据内容
+5. depends_on 从 inputs 的 from_task 自动推导
+6. 没有依赖的任务：inputs 为 {{}}，depends_on 为 []
+7. 同一个 agent 可出现多次
+8. 任务按拓扑顺序排列（被依赖的任务排在前面）
+9. 如果用户消息中已直接包含数据（JSON 数组、数字、文本等），
+   不要单独拆"获取数据"任务，直接在处理任务的 description 里完整引用
 
 严格只输出 JSON 数组，不要有任何其他内容，示例：
 [
   {{
     "task_id": 0,
+    "description": "你好！我是 AI 助手，有什么可以帮你的吗？",
+    "agent": "direct",
+    "inputs": {{}},
+    "depends_on": [],
+    "status": "pending",
+    "result": "",
+    "_resolved_description": ""
+  }},
+  {{
+    "task_id": 1,
     "description": "计算 88 加 12",
     "agent": "math_agent",
     "inputs": {{}},
@@ -329,13 +302,13 @@ def _planner_system() -> str:
     "_resolved_description": ""
   }},
   {{
-    "task_id": 1,
+    "task_id": 2,
     "description": "把前一步的结果乘以 5",
     "agent": "math_agent",
     "inputs": {{
-      "被乘数": {{"from_task": 0, "field": "result"}}
+      "被乘数": {{"from_task": 1, "field": "result"}}
     }},
-    "depends_on": [0],
+    "depends_on": [1],
     "status": "pending",
     "result": "",
     "_resolved_description": ""
@@ -366,13 +339,16 @@ async def planner_node(state: AgentState) -> AgentState:
             deps    = t.get("depends_on", [])
             inputs  = t.get("inputs", {})
             dep_str = f"  依赖→{deps} 参数→{list(inputs.keys())}" if deps else ""
-            print(f"     [{t['task_id']}] {t['agent']} ← {t['description']}{dep_str}")
+            # direct 任务截断描述显示
+            desc_preview = t['description'][:60] + "…" if len(t['description']) > 60 else t['description']
+            print(f"     [{t['task_id']}] {t['agent']} ← {desc_preview}{dep_str}")
     except json.JSONDecodeError:
         print(f"  ⚠️ JSON 解析失败：{raw[:200]}")
+        # 兜底：当作一个 direct 任务，让 LLM 直接回答
         task_plan = [{
             "task_id": 0,
             "description": state["messages"][0].content,
-            "agent": _registry.agents[0] if _registry.agents else "math_agent",
+            "agent": "direct",
             "inputs": {},
             "depends_on": [],
             "status": "pending",
@@ -384,7 +360,14 @@ async def planner_node(state: AgentState) -> AgentState:
 
 
 # ══════════════════════════════════════════════════════
-# 9. Supervisor
+# 8. Supervisor
+#
+#   ★ 重构：新增对 agent="direct" 的识别
+#   - 找到第一个 pending 任务
+#   - 若 agent == "direct" → 直接标记为 done，result 取 description，
+#     next_agent 设为 "direct_answer"，跳过 replanner
+#   - 若 agent 为工具 agent   → 正常派发，走 replanner
+#   - 若无 pending 任务       → next_agent = "FINISH"
 # ══════════════════════════════════════════════════════
 async def supervisor_node(state: AgentState) -> AgentState:
     task_plan: list[Task] = state.get("task_plan", [])
@@ -399,7 +382,20 @@ async def supervisor_node(state: AgentState) -> AgentState:
             print(f"\n  ⏳ 任务[{task['task_id']}] 等待依赖 {unmet}，跳过")
             continue
 
-        # 把已完成的前置任务结果注入到当前任务描述中
+        # ★ direct 任务：无需工具，直接完成
+        if task.get("agent") == "direct":
+            print(f"\n  🧭 Supervisor → direct_answer（任务[{task['task_id']}]）")
+            task["status"] = "done"
+            task["result"] = task["description"]   # description 就是回答内容
+            task["_resolved_description"] = task["description"]
+            return {
+                **state,
+                "next_agent": "direct_answer",
+                "current_task_id": task["task_id"],
+                "task_plan": task_plan,
+            }
+
+        # 正常工具任务：解析运行时参数
         resolved_inputs: dict[str, str] = {}
         for param_name, source in task.get("inputs", {}).items():
             from_id  = source["from_task"]
@@ -418,9 +414,14 @@ async def supervisor_node(state: AgentState) -> AgentState:
 
         print(f"\n  🧭 Supervisor → {task['agent']}（任务[{task['task_id']}]）")
         print(f"     {task['_resolved_description'].replace(chr(10), ' | ')}")
-        # ★ 写入 current_task_id，供 run_agent 定位当前任务
-        return {**state, "next_agent": task["agent"], "current_task_id": task["task_id"]}
+        return {
+            **state,
+            "next_agent": task["agent"],
+            "current_task_id": task["task_id"],
+            "task_plan": task_plan,
+        }
 
+    # 所有任务完成（或依赖无法满足）
     pending = [t for t in task_plan if t["status"] == "pending"]
     if pending:
         print(f"\n  ⚠️ 任务 {[t['task_id'] for t in pending]} 依赖无法满足，强制跳过")
@@ -429,17 +430,15 @@ async def supervisor_node(state: AgentState) -> AgentState:
             t["result"] = "⚠️ 依赖未满足，跳过"
 
     print("\n  🧭 Supervisor → FINISH")
-    return {**state, "next_agent": "FINISH"}
+    return {**state, "next_agent": "FINISH", "task_plan": task_plan}
 
 
 # ══════════════════════════════════════════════════════
-# 10. Re-Planner
-#    ★ valid_agents 从注册表动态获取
-#    ★ 不再依赖 last_completed_task_id，改用 current_task_id 打印日志
+# 9. Re-Planner（仅在工具 agent 执行后触发，direct 任务不经过此节点）
 # ══════════════════════════════════════════════════════
 def _replanner_system() -> str:
     valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用 Agent）"
-    return f"""你是任务再规划器。在每个子任务完成后，你需要判断是否需要调整剩余计划。
+    return f"""你是任务再规划器。在每个工具子任务完成后，你需要判断是否需要调整剩余计划。
 
 {_registry.agent_desc_block}
 
@@ -451,32 +450,30 @@ def _replanner_system() -> str:
 你的决策：
 
 【情况A】计划不需要调整（绝大多数情况）
-  直接输出：{{"action": "continue"}}
+直接输出：{{"action": "continue"}}
 
 【情况B】需要调整剩余计划（仅当出现以下情况时）
-  - 某个任务的结果表明后续任务的方向需要改变
-  - 发现原计划遗漏了必要步骤
-  - 某个任务失败，需要用替代方案
-  输出修改后的完整 pending 任务列表：
-  {{"action": "replan", "new_pending_tasks": [...]}}
+- 某个任务的结果表明后续任务的方向需要改变
+- 发现原计划遗漏了必要步骤
+- 某个任务失败，需要用替代方案
+输出修改后的完整 pending 任务列表：
+{{"action": "replan", "new_pending_tasks": [...]}}
 
-  注意事项：
-  - new_pending_tasks 是完整的新 pending 列表，会替换掉所有旧的 pending 任务
-  - task_id 从当前已完成任务的最大 id + 1 开始重新编号
-  - inputs 里的 from_task 如果引用已完成任务，task_id 保持原来的值不变
-  - status 统一写 "pending"，result 和 _resolved_description 写空字符串
-  - agent 只能是：{valid_agents}
-  - 不要新增任何"等待用户输入"、"获取数据"、"读取数据"类的占位任务
-  - 如果不确定要不要 replan，选择 continue
+注意事项：
+- new_pending_tasks 是完整的新 pending 列表，会替换掉所有旧的 pending 任务
+- task_id 从当前已完成任务的最大 id + 1 开始重新编号
+- inputs 里的 from_task 如果引用已完成任务，task_id 保持原来的值不变
+- status 统一写 "pending"，result 和 _resolved_description 写空字符串
+- agent 只能是：{valid_agents}（replan 时不应产生 direct 任务）
+- 不要新增任何"等待用户输入"、"获取数据"、"读取数据"类的占位任务
+- 如果不确定要不要 replan，选择 continue
 
 严格只输出 JSON，不要有任何其他内容。"""
 
 
 async def replanner_node(state: AgentState) -> AgentState:
-    task_plan: list[Task] = state.get("task_plan", [])
-
-    # ★ 用 current_task_id 即可，它就是刚刚完成的任务 id
-    current_task_id: int = state.get("current_task_id", -1)
+    task_plan: list[Task]  = state.get("task_plan", [])
+    current_task_id: int   = state.get("current_task_id", -1)
 
     done_tasks    = [t for t in task_plan if t["status"] == "done"]
     pending_tasks = [t for t in task_plan if t["status"] == "pending"]
@@ -524,7 +521,6 @@ async def replanner_node(state: AgentState) -> AgentState:
             print("  ✅ Re-Planner：replan 但 new_pending_tasks 为空，继续执行")
             return state
 
-        # ★ 过滤非法 agent（从注册表动态获取合法列表）
         valid_agents = set(_registry.agents)
         new_pending = [t for t in new_pending if t.get("agent") in valid_agents]
         if not new_pending:
@@ -542,28 +538,19 @@ async def replanner_node(state: AgentState) -> AgentState:
 
 
 # ══════════════════════════════════════════════════════
-# 11. 通用 Agent 执行器
-#     ★ allowed_tools 从注册表动态查找，不再硬编码
-#     ★ 读取 current_task_id 定位当前任务，执行完后无需再写入其他字段
+# 10. 通用工具 Agent 执行器
 # ══════════════════════════════════════════════════════
 async def run_agent(
     state: AgentState,
     agent_name: str,
     system_prompt: str,
 ) -> AgentState:
-    """
-    通用 Agent 执行器。
-    工具列表从 _registry 动态查找，无需调用方硬编码 allowed_tools。
-    执行完成后仅更新 task_plan（任务状态/结果），current_task_id 保持不变，
-    供 replanner_node 读取用于日志，再由下一轮 supervisor_node 更新。
-    """
     lc_tools   = _registry.tools_for(agent_name)
     tool_names = _registry.tool_names_for(agent_name)
     by_name    = {t.name: t for t in lc_tools}
 
     task_plan: list[Task] = state.get("task_plan", [])
-    # ★ 用 current_task_id 精确定位本次要执行的任务
-    task_id: int = state.get("current_task_id", 0)
+    task_id: int          = state.get("current_task_id", 0)
 
     current_task = next((t for t in task_plan if t["task_id"] == task_id), None)
     if not current_task:
@@ -577,7 +564,6 @@ async def run_agent(
         current_task["result"] = f"⚠️ 没有可用工具（{agent_name} 未注册任何工具）"
         return {**state, "task_plan": task_plan}
 
-    # ★ system_prompt 注入当前 agent 可用工具列表，让 LLM 知道有哪些工具
     tool_hint = "可用工具：" + "、".join(
         f"{t.name}（{t.description or '无描述'}）" for t in lc_tools
     )
@@ -618,16 +604,26 @@ async def run_agent(
     current_task["status"] = "done"
     current_task["result"] = last_response.content if last_response else "（无结果）"
 
-    # ★ 只更新 task_plan，current_task_id 由下一轮 supervisor_node 负责更新
     return {**state, "task_plan": task_plan}
 
 
 # ══════════════════════════════════════════════════════
-# 12. 图构建
-#     ★ agent 节点从注册表动态生成，新增 agent 无需改此函数
+# 11. 图构建
+#
+#   ★ 重构：移除 router 节点，入口直接为 planner
+#   ★ supervisor 路由扩展：新增 "direct_answer" 分支
+#   ★ direct_answer 节点不经过 replanner，直接回到 supervisor
+#     （处理可能存在的后续工具任务）
+#
+#   图结构（文字版）：
+#
+#   planner → supervisor ─┬─→ direct_answer ──────────────────┐
+#                         ├─→ math_agent → replanner → supervisor
+#                         ├─→ data_agent → replanner → supervisor
+#                         ├─→ http_agent → replanner → supervisor
+#                         └─→ final_answer → END
 # ══════════════════════════════════════════════════════
 
-# Agent system prompts：只描述专业角色，工具列表由 run_agent 动态注入
 AGENT_SYSTEM_PROMPTS: dict[str, str] = {
     "math_agent": (
         "你是数学计算专家。根据任务描述和【运行时参数】（如果有），"
@@ -644,8 +640,6 @@ AGENT_SYSTEM_PROMPTS: dict[str, str] = {
         "发送对应的 HTTP 请求，成功拿到响应后立即返回结果，不要重试。"
         "timeout 默认使用 10。"
     ),
-    # ★ 新增 agent 只需在这里加一条 + 在 AGENT_TOOL_PATTERNS 注册工具归属
-    # 例如："file_agent": "你是文件操作专家..."
 }
 
 DEFAULT_AGENT_SYSTEM_PROMPT = (
@@ -654,25 +648,39 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
 
 
 def build_graph() -> Any:
-    """
-    构建 LangGraph 图。
-    ★ agent 节点从 ToolRegistry 动态生成，新增 agent 无需修改此函数。
-    """
 
-    # ── 直接回答节点 ──────────────────────────────────
+    # ── direct_answer 节点 ────────────────────────────
+    # ★ 重构：direct_answer 现在从 task_plan 里取当前任务的 result（即 description）
+    #          输出后回到 supervisor，继续处理后续可能存在的工具任务
     async def direct_answer_node(state: AgentState) -> AgentState:
-        answer = state.get("direct_answer", "")
-        print(f"\n  💬 直接回答：{answer[:80]}")
-        return {**state, "messages": state["messages"] + [AIMessage(content=answer)]}
+        task_plan: list[Task] = state.get("task_plan", [])
+        task_id: int          = state.get("current_task_id", 0)
+        current_task = next((t for t in task_plan if t["task_id"] == task_id), None)
+        answer = current_task["result"] if current_task else "（无回答）"
+        print(f"\n  💬 direct_answer：{answer[:80]}")
+        # 把回答追加到消息流，然后回到 supervisor 处理后续任务
+        return {
+            **state,
+            "messages": state["messages"] + [AIMessage(content=answer)],
+        }
 
     # ── 最终汇总节点 ──────────────────────────────────
     async def final_answer_node(state: AgentState) -> AgentState:
         task_plan: list[Task] = state.get("task_plan", [])
+
+        # 工具任务的结果需要汇总；direct 任务的结果已经在消息流里，无需再次包含
+        tool_results = [t for t in task_plan if t.get("agent") != "direct"]
+
+        if not tool_results:
+            # 全部都是 direct 任务，消息流里已有完整回答，无需再调 LLM
+            print("\n  📝 所有任务均为 direct，最终回答已在消息流中")
+            return state
+
         results_text = "\n".join(
             f"任务[{t['task_id']}]（{t['description']}）：{t['result']}"
-            for t in task_plan
+            for t in tool_results
         )
-        print(f"\n  📝 汇总结果：\n{results_text}")
+        print(f"\n  📝 汇总工具任务结果：\n{results_text}")
 
         response = await llm.ainvoke([
             SystemMessage(content=(
@@ -684,14 +692,13 @@ def build_graph() -> Any:
         return {**state, "messages": state["messages"] + [AIMessage(content=response.content)]}
 
     # ── 路由函数 ──────────────────────────────────────
-    def router_route(state: AgentState) -> str:
-        return "direct_answer" if state.get("direct_answer") else "planner"
-
     def supervisor_route(state: AgentState) -> str:
         next_node = state.get("next_agent", "FINISH")
-        return "final_answer" if next_node == "FINISH" else next_node
+        if next_node == "FINISH":
+            return "final_answer"
+        return next_node   # "direct_answer" 或工具 agent 名
 
-    # ── 动态创建 agent 节点 ───────────────────────────
+    # ── 动态创建工具 agent 节点 ───────────────────────
     def make_agent_node(name: str):
         system_prompt = AGENT_SYSTEM_PROMPTS.get(name, DEFAULT_AGENT_SYSTEM_PROMPT)
         async def _node(state: AgentState) -> AgentState:
@@ -699,65 +706,57 @@ def build_graph() -> Any:
         _node.__name__ = name
         return _node
 
-    # ── 图构建 ─────────────────────────────────────────
+    # ── 图构建 ────────────────────────────────────────
     g = StateGraph(AgentState)
 
-    g.add_node("router",        router_node)
-    g.add_node("direct_answer", direct_answer_node)
+    # ★ 不再有 router 节点，入口直接是 planner
     g.add_node("planner",       planner_node)
     g.add_node("supervisor",    supervisor_node)
     g.add_node("replanner",     replanner_node)
+    g.add_node("direct_answer", direct_answer_node)
     g.add_node("final_answer",  final_answer_node)
 
-    # ★ 动态注册 agent 节点（根据注册表中实际存在的 agent）
     known_agents = _registry.agents or list(AGENT_SYSTEM_PROMPTS.keys())
     for agent_name in known_agents:
         g.add_node(agent_name, make_agent_node(agent_name))
 
     # ── 边 ────────────────────────────────────────────
-    g.set_entry_point("router")
-    g.add_conditional_edges("router", router_route, {
-        "direct_answer": "direct_answer",
-        "planner":       "planner",
-    })
-    g.add_edge("direct_answer", END)
+    g.set_entry_point("planner")
     g.add_edge("planner", "supervisor")
 
-    # supervisor → agent 的动态路由表
+    # supervisor → direct_answer / 工具 agent / final_answer
     agent_routes = {name: name for name in known_agents}
-    agent_routes["final_answer"] = "final_answer"
+    agent_routes["direct_answer"] = "direct_answer"
+    agent_routes["final_answer"]  = "final_answer"
     g.add_conditional_edges("supervisor", supervisor_route, agent_routes)
 
+    # ★ direct_answer 完成后回到 supervisor，继续处理后续工具任务
+    g.add_edge("direct_answer", "supervisor")
+
+    # 工具 agent 完成后进 replanner，再回 supervisor
     for agent_name in known_agents:
         g.add_edge(agent_name, "replanner")
     g.add_edge("replanner", "supervisor")
+
     g.add_edge("final_answer", END)
 
     return g.compile()
 
 
 # ══════════════════════════════════════════════════════
-# 13. 图实例（延迟初始化）
-#
-#   问题：build_graph() 在模块加载时被 langgraph dev 调用，
-#         此时 _registry 还是空的（工具尚未加载），
-#         所以 known_agents 会用 AGENT_SYSTEM_PROMPTS 的 key 作为后备。
-#
-#   解决：lifespan / __main__ 在工具加载后调用 _rebuild_graph()，
-#         用真实注册表重建图，确保节点与工具完全对齐。
+# 12. 图实例（延迟初始化）
 # ══════════════════════════════════════════════════════
 graph = build_graph()
 
 
 def _rebuild_graph() -> None:
-    """工具加载完成后，用真实注册表重建图并替换全局引用。"""
     global graph
     graph = build_graph()
     print("🔄 Graph 已用真实 ToolRegistry 重建")
 
 
 # ══════════════════════════════════════════════════════
-# 14. lifespan —— 仅 langgraph dev 调用
+# 13. lifespan —— 仅 langgraph dev 调用
 # ══════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app):
@@ -777,7 +776,7 @@ async def lifespan(app):
 
 
 # ══════════════════════════════════════════════════════
-# 15. __main__ —— 单独运行测试
+# 14. __main__ —— 单独运行测试
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
     if not SERVER_PATH.exists():
@@ -785,16 +784,20 @@ if __name__ == "__main__":
         sys.exit(1)
 
     QUESTIONS = [
-        # 闲聊 → 直接回答
+        # 纯闲聊 → direct 任务，不走工具
         "你好，我叫 tony",
         "什么是机器学习？",
-        # 工具任务 → 走 planner
+        # 纯工具任务
         "把 88 和 12 相加，再把结果乘以 5",
         "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        # 混合任务：闲聊 + 工具（原来会被短路，现在能正确执行）
+        "先介绍一下你自己，然后帮我计算 99 乘以 9",
+        # 数据分析
         """分析这批数据：[{"name":"Alice","dept":"Eng","salary":9000},
          {"name":"Bob","dept":"Mkt","salary":7500},
          {"name":"Charlie","dept":"Eng","salary":11000}]
          按 dept 分组，对 salary 求平均""",
+        # 网络请求
         "访问 https://api.github.com/zen 返回了什么？",
     ]
 
@@ -804,17 +807,16 @@ if __name__ == "__main__":
                 await session.initialize()
                 loaded = await load_tools(session)
                 _tools.extend(loaded)
-                _init_registry(loaded)   # ★ 构建注册表
-                _rebuild_graph()          # ★ 用真实注册表重建图
+                _init_registry(loaded)
+                _rebuild_graph()
 
                 for q in QUESTIONS:
                     print(f"\n{'━'*60}\n❓ {q}\n{'━'*60}")
                     result = await graph.ainvoke({
-                        "messages":       [HumanMessage(content=q)],
-                        "task_plan":      [],
-                        "current_task_id": 0,   # ★ 原 current_task_index
-                        "next_agent":     "",
-                        "direct_answer":  "",
+                        "messages":        [HumanMessage(content=q)],
+                        "task_plan":       [],
+                        "current_task_id": 0,
+                        "next_agent":      "",
                     })
                     print(f"\n✨ 最终答案：{result['messages'][-1].content}")
 
