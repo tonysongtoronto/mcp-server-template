@@ -5,23 +5,26 @@ src/langgraph_stdio_agent.py
   1. uv run langgraph dev   → langgraph 调用 lifespan 钩子初始化工具
   2. python -m src.langgraph_stdio_agent  → __main__ 手动初始化工具
 
-★ 重构说明（相比上一版本）：
-   - 移除 router 节点，消除"混合任务被短路到 direct_answer"的问题
-   - Planner 承担意图判断：纯问答任务输出 agent="direct" 的特殊任务
-   - Supervisor 路由扩展：检测到 agent="direct" 时直接走 direct_answer，
-     不经过任何工具 agent 和 replanner
-   - LLM 调用次数减少一次（原 router + planner 各一次，现只有 planner）
-   - 混合任务（部分闲聊 + 部分工具）现在可以正确执行所有子任务
+★ 本版本重构说明：
 
-★ 动态工具注册表（ToolRegistry）
-   - 启动时从 MCP 加载工具，自动构建 agent → tools 映射
-   - Planner / Supervisor 的 system prompt 动态注入工具描述
-   - 每个 Agent 的 allowed_tools 从注册表查找，代码零硬编码
-   - 新增/删除工具只需修改 MCP server，LangGraph 代码无需改动
+  【重构1】移除 router 节点
+   - 原问题：router 对整个用户问题做一次性"需不需要工具"判断，
+             混合任务（部分闲聊+部分工具）会被短路到 direct_answer 直接结束
+   - 方案：Planner 承担意图判断，纯问答输出 agent="direct" 特殊任务，
+           Supervisor 检测到 direct 时路由到 direct_answer，
+           direct_answer 完成后回到 supervisor 继续处理后续工具任务
 
-★ Re-Planner 节点
-   每个工具 Agent 执行完任务后，Re-Planner 检查结果，
-   决定是否需要调整剩余计划，再交还给 Supervisor 继续执行。
+  【重构2】direct_answer_node 交给 LLM 真实回答
+   - 原问题：直接把 planner 写的 description 当回答输出，质量不稳定
+   - 方案：用原始用户问题重新调用 LLM 生成回答，description 作为上下文提示
+
+  【重构3】planner_node JSON 解析失败重试策略
+   - 原问题：解析失败直接兜底为一个 direct 任务，掩盖错误
+   - 方案：最多重试 3 次（每次附上上次错误输出和更强的格式提示）
+           3 次全部失败 → 在 planner 内部闭环处理：
+             · 把带有详细失败信息的 AIMessage 写入 messages
+             · 设置 next_agent="FINISH"，通过条件路由直接走向 END
+             · 不进入 supervisor，不走任何 agent
 """
 
 import asyncio
@@ -70,19 +73,8 @@ def mcp_params() -> StdioServerParameters:
 
 # ══════════════════════════════════════════════════════
 # 3. 动态工具注册表
-#
-#   设计思路：
-#   - MCP server 上的每个工具，通过 tags / prefix 约定归属到某个 agent
-#   - 归属规则写在 AGENT_TOOL_PATTERNS 中，支持前缀匹配和精确匹配
-#   - 未匹配到任何 agent 的工具会被放入 "default_agent"
-#   - 注册表构建完成后暴露：
-#       registry.agents          → list[str]  所有工具 agent 名（不含 "direct"）
-#       registry.tools_for(name) → list[StructuredTool]
-#       registry.tool_desc_block → str  供 LLM prompt 使用的工具描述块
-#       registry.agent_desc_block→ str  供 LLM prompt 使用的 agent 描述块
 # ══════════════════════════════════════════════════════
 
-# Agent 工具归属规则：每个 agent 匹配哪些工具名（支持前缀 * 通配）
 AGENT_TOOL_PATTERNS: dict[str, list[str]] = {
     "math_agent": ["add_numbers", "multiply_numbers", "subtract_numbers",
                    "divide_numbers", "power*", "sqrt*", "math_*"],
@@ -92,16 +84,13 @@ AGENT_TOOL_PATTERNS: dict[str, list[str]] = {
                    "http_*", "fetch_*", "request_*"],
 }
 
-# Agent 的语义描述（供 Planner prompt 使用）
 AGENT_DESCRIPTIONS: dict[str, str] = {
     "math_agent": "数学计算（加减乘除、幂、开方等数值运算）",
     "data_agent": "数据分析（统计、聚合、分组、过滤等结构化数据处理）",
     "http_agent": "网络请求（GET/POST、访问 URL、调用外部 API）",
-    # ★ "direct" 是特殊虚拟 agent，不在此注册，由 planner prompt 单独说明
 }
 
 def _match_agent(tool_name: str) -> str:
-    """根据 AGENT_TOOL_PATTERNS 把工具名映射到 agent 名，未匹配返回 'default_agent'"""
     for agent, patterns in AGENT_TOOL_PATTERNS.items():
         for pat in patterns:
             if pat.endswith("*"):
@@ -115,15 +104,11 @@ def _match_agent(tool_name: str) -> str:
 
 @dataclass
 class ToolRegistry:
-    """
-    启动时从 MCP 工具列表构建，之后只读。
-    提供 prompt 片段和工具查找接口，供各节点直接使用。
-    注意："direct" 是虚拟 agent，不存储在注册表里。
-    """
     _agent_tools: dict[str, list[StructuredTool]] = field(default_factory=dict)
     _all_tools: dict[str, StructuredTool] = field(default_factory=dict)
     _tool_desc_block: str = ""
     _agent_desc_block: str = ""
+    _agent_desc_brief: str = ""   # 给失败提示用的简短版本
 
     @classmethod
     def build(cls, lc_tools: list[StructuredTool]) -> "ToolRegistry":
@@ -141,24 +126,26 @@ class ToolRegistry:
                 lines_tools.append(f"    - {t.name}：{t.description or '（无描述）'}")
 
         lines_agents: list[str] = ["【可用 Agent 列表】"]
+        brief_lines: list[str]  = []
         for agent in reg.agents:
             desc = AGENT_DESCRIPTIONS.get(agent, "通用处理")
             tool_names = [t.name for t in reg._agent_tools.get(agent, [])]
             lines_agents.append(f"  - {agent}：{desc}（工具：{', '.join(tool_names)}）")
-        # 在 agent 列表里补充 direct 的说明
+            brief_lines.append(f"  · {agent}：{desc}")
         lines_agents.append("  - direct：直接用语言模型回答，不调用任何工具（闲聊/知识问答）")
 
         reg._tool_desc_block  = "\n".join(lines_tools)
         reg._agent_desc_block = "\n".join(lines_agents)
+        reg._agent_desc_brief = "\n".join(brief_lines) if brief_lines else "  （暂无已注册的工具 Agent）"
 
-        print(f"✅ ToolRegistry 构建完成：")
+        print("✅ ToolRegistry 构建完成：")
         for agent, tools in reg._agent_tools.items():
             print(f"   {agent}: {[t.name for t in tools]}")
         return reg
 
     @property
     def agents(self) -> list[str]:
-        """返回真实工具 agent 列表，不含虚拟的 'direct'"""
+        """真实工具 agent 列表，不含虚拟的 'direct'"""
         return list(self._agent_tools.keys())
 
     @property
@@ -168,6 +155,10 @@ class ToolRegistry:
     @property
     def agent_desc_block(self) -> str:
         return self._agent_desc_block
+
+    @property
+    def agent_desc_brief(self) -> str:
+        return self._agent_desc_brief
 
     def tools_for(self, agent: str) -> list[StructuredTool]:
         return self._agent_tools.get(agent, [])
@@ -189,7 +180,7 @@ class TaskInput(TypedDict):
 class Task(TypedDict):
     task_id: int
     description: str
-    agent: str          # 工具 agent 名，或特殊值 "direct"
+    agent: str
     inputs: dict[str, TaskInput]
     depends_on: list[int]
     status: str
@@ -200,11 +191,11 @@ class AgentState(TypedDict):
     messages: list
     task_plan: list[Task]
     current_task_id: int
-    next_agent: str     # supervisor 写入，供图的条件路由使用；"FINISH" 表示全部完成
+    next_agent: str
 
 
 # ══════════════════════════════════════════════════════
-# 5. 共享容器（lifespan / __main__ 初始化后填充）
+# 5. 共享容器
 # ══════════════════════════════════════════════════════
 _tools: list[StructuredTool] = []
 _registry: ToolRegistry = ToolRegistry()
@@ -249,12 +240,10 @@ def _init_registry(tools: list[StructuredTool]) -> None:
 # ══════════════════════════════════════════════════════
 # 7. Planner
 #
-#   ★ 重构核心：Planner 现在同时承担意图判断职责
-#   - 需要工具的任务 → 正常输出工具 agent 任务
-#   - 纯问答/闲聊   → 输出 agent="direct" 的特殊任务，
-#                      description 字段直接写好回答内容
-#   - 混合任务       → direct 任务和工具任务可在同一个 task_plan 中共存
+#   ★ 重构1：承担意图判断，支持 agent="direct" 特殊任务
+#   ★ 重构3：JSON 解析失败最多重试 3 次，全部失败则在内部闭环处理
 # ══════════════════════════════════════════════════════
+
 def _planner_system() -> str:
     valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用工具 Agent）"
     return f"""你是任务规划器。把用户问题拆解为有序子任务列表。
@@ -264,11 +253,11 @@ def _planner_system() -> str:
 ━━ agent 选择规则 ━━
 1. 需要调用工具才能完成的任务 → 选择对应的工具 agent（{valid_agents}）
 2. 不需要工具、仅凭语言模型即可回答的任务 → agent 填 "direct"，
-   并在 description 里直接写好完整回答内容（这将作为该任务的最终输出）
+   description 里简要描述用户意图即可（后续节点会重新生成完整回答）
    适用场景：闲聊、问候、概念解释、知识性问答等
 
 ━━ 其他规则（严格遵守）━━
-3. description 只写意图（工具任务）或完整回答（direct 任务），绝不提前计算数值
+3. description 只写任务意图，绝不提前计算数值或给出最终答案
 4. inputs 声明运行时需要从哪些前置任务获取参数：
    - key   = 参数的语义名称（如"加数A"、"被乘数"），供 Agent 理解用途
    - value = {{"from_task": <被依赖的task_id>, "field": "result"}}
@@ -279,11 +268,11 @@ def _planner_system() -> str:
 9. 如果用户消息中已直接包含数据（JSON 数组、数字、文本等），
    不要单独拆"获取数据"任务，直接在处理任务的 description 里完整引用
 
-严格只输出 JSON 数组，不要有任何其他内容，示例：
+严格只输出 JSON 数组，不要有任何其他内容、代码块标记或说明文字。示例：
 [
   {{
     "task_id": 0,
-    "description": "你好！我是 AI 助手，有什么可以帮你的吗？",
+    "description": "用户打招呼，介绍自己叫 tony",
     "agent": "direct",
     "inputs": {{}},
     "depends_on": [],
@@ -316,58 +305,124 @@ def _planner_system() -> str:
 ]"""
 
 
+def _planner_retry_system(attempt: int, last_raw: str) -> str:
+    """重试时使用更严格的提示，附上上次的错误输出片段"""
+    if attempt == 1:
+        return (
+            f"{_planner_system()}\n\n"
+            f"⚠️ 注意：你上一次的输出 JSON 解析失败，无法被程序解析。\n"
+            f"上次输出片段（前200字符）：\n{last_raw[:200]}\n\n"
+            f"请检查并修正，确保只输出合法的 JSON 数组，"
+            f"不要包含任何代码块标记（如 ```json）、说明文字或多余字符。"
+        )
+    else:
+        # 第二次重试：极简提示，降低 LLM 发挥空间
+        valid_agents = ", ".join(_registry.agents) if _registry.agents else "direct"
+        return (
+            "你是任务规划器。严格按照以下要求输出，不得有任何偏差：\n\n"
+            "1. 只输出一个 JSON 数组，数组里是任务对象\n"
+            "2. 不要输出任何其他文字、代码块标记、注释\n"
+            f"3. agent 只能是以下值之一：{valid_agents}, direct\n"
+            "4. 每个任务对象必须包含这些字段：\n"
+            '   task_id(int), description(str), agent(str), inputs(dict),\n'
+            '   depends_on(list), status("pending"), result(""), _resolved_description("")\n\n'
+            f"⚠️ 上次输出仍然解析失败，片段：{last_raw[:200]}\n\n"
+            f"用户问题：请重新规划。"
+        )
+
+
 async def planner_node(state: AgentState) -> AgentState:
     if state.get("task_plan"):
         return state
 
     print("\n  📋 Planner 开始拆解任务...")
-    response = await llm.ainvoke([
-        SystemMessage(content=_planner_system()),
-        state["messages"][0],
-    ])
 
-    raw = response.content.strip()
-    if "```" in raw:
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+    user_message = state["messages"][0]
+    last_raw     = ""
+    task_plan: list[Task] | None = None
+    max_attempts = 3
 
-    try:
-        task_plan: list[Task] = json.loads(raw.strip())
-        print(f"  ✅ 拆解出 {len(task_plan)} 个任务：")
-        for t in task_plan:
-            deps    = t.get("depends_on", [])
-            inputs  = t.get("inputs", {})
-            dep_str = f"  依赖→{deps} 参数→{list(inputs.keys())}" if deps else ""
-            # direct 任务截断描述显示
-            desc_preview = t['description'][:60] + "…" if len(t['description']) > 60 else t['description']
-            print(f"     [{t['task_id']}] {t['agent']} ← {desc_preview}{dep_str}")
-    except json.JSONDecodeError:
-        print(f"  ⚠️ JSON 解析失败：{raw[:200]}")
-        # 兜底：当作一个 direct 任务，让 LLM 直接回答
-        task_plan = [{
-            "task_id": 0,
-            "description": state["messages"][0].content,
-            "agent": "direct",
-            "inputs": {},
-            "depends_on": [],
-            "status": "pending",
-            "result": "",
-            "_resolved_description": "",
-        }]
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            sys_msg = SystemMessage(content=_planner_system())
+        else:
+            print(f"  🔁 Planner 第 {attempt + 1} 次重试（JSON 解析失败）...")
+            sys_msg = SystemMessage(content=_planner_retry_system(attempt, last_raw))
 
-    return {**state, "task_plan": task_plan, "current_task_id": 0}
+        response = await llm.ainvoke([sys_msg, user_message])
+        raw      = response.content.strip()
+
+        # 清理常见的代码块标记
+        if "```" in raw:
+            parts = raw.split("```")
+            # 取第一个代码块内容（索引1），或直接取最长片段
+            raw = parts[1] if len(parts) > 1 else parts[0]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        last_raw = raw
+
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                raise json.JSONDecodeError("期望 JSON 数组", raw, 0)
+            task_plan = parsed
+            print(f"  ✅ 拆解出 {len(task_plan)} 个任务（第 {attempt + 1} 次尝试成功）：")
+            for t in task_plan:
+                deps        = t.get("depends_on", [])
+                inputs      = t.get("inputs", {})
+                dep_str     = f"  依赖→{deps} 参数→{list(inputs.keys())}" if deps else ""
+                desc_preview = (
+                    t["description"][:60] + "…"
+                    if len(t["description"]) > 60
+                    else t["description"]
+                )
+                print(f"     [{t['task_id']}] {t['agent']} ← {desc_preview}{dep_str}")
+            break  # 解析成功，跳出重试循环
+
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  ⚠️ 第 {attempt + 1} 次解析失败：{e}  输出片段：{raw[:100]}")
+            # 继续下一次重试
+
+    # ★ 三次全部失败：在 planner 内部闭环，直接告知用户
+    if task_plan is None:
+        print("  ❌ Planner 连续 3 次解析失败，终止流程")
+
+        # 构造详细的失败信息
+        agent_scope = _registry.agent_desc_brief
+        failure_msg = (
+            "⚠️ 任务规划失败，无法处理您的请求。\n\n"
+            "━━ 失败详情 ━━\n"
+            f"原因：Planner 连续 {max_attempts} 次均无法生成合法的任务计划（JSON 格式错误）\n"
+            f"最后一次输出片段：\n  {last_raw[:200]}{'…' if len(last_raw) > 200 else ''}\n\n"
+            "━━ 可能的原因 ━━\n"
+            "  · 问题描述过于复杂或存在歧义，导致模型输出不稳定\n"
+            "  · 问题中包含特殊字符或格式干扰了 JSON 输出\n"
+            "  · 请求超出了当前可用工具的处理范围\n\n"
+            "━━ 当前可用能力 ━━\n"
+            f"{agent_scope}\n\n"
+            "建议：请尝试换一种更简洁清晰的方式重新描述您的问题。"
+        )
+
+        return {
+            **state,
+            "messages":        state["messages"] + [AIMessage(content=failure_msg)],
+            "task_plan":       [],
+            "current_task_id": 0,
+            "next_agent":      "FINISH",   # ★ 触发 planner → END 的条件路由
+        }
+
+    return {
+        **state,
+        "task_plan":       task_plan,
+        "current_task_id": 0,
+        "next_agent":      "",
+    }
 
 
 # ══════════════════════════════════════════════════════
 # 8. Supervisor
-#
-#   ★ 重构：新增对 agent="direct" 的识别
-#   - 找到第一个 pending 任务
-#   - 若 agent == "direct" → 直接标记为 done，result 取 description，
-#     next_agent 设为 "direct_answer"，跳过 replanner
-#   - 若 agent 为工具 agent   → 正常派发，走 replanner
-#   - 若无 pending 任务       → next_agent = "FINISH"
 # ══════════════════════════════════════════════════════
 async def supervisor_node(state: AgentState) -> AgentState:
     task_plan: list[Task] = state.get("task_plan", [])
@@ -382,26 +437,26 @@ async def supervisor_node(state: AgentState) -> AgentState:
             print(f"\n  ⏳ 任务[{task['task_id']}] 等待依赖 {unmet}，跳过")
             continue
 
-        # ★ direct 任务：无需工具，直接完成
+        # ★ direct 任务：supervisor 直接标记完成，next_agent → direct_answer
+        #   result 此处留空，由 direct_answer_node 调用 LLM 生成真实回答后填入
         if task.get("agent") == "direct":
             print(f"\n  🧭 Supervisor → direct_answer（任务[{task['task_id']}]）")
-            task["status"] = "done"
-            task["result"] = task["description"]   # description 就是回答内容
-            task["_resolved_description"] = task["description"]
+            print(f"     意图：{task['description'][:80]}")
+            task["status"] = "in_progress"   # 标为进行中，由 direct_answer_node 完成
             return {
                 **state,
-                "next_agent": "direct_answer",
+                "next_agent":      "direct_answer",
                 "current_task_id": task["task_id"],
-                "task_plan": task_plan,
+                "task_plan":       task_plan,
             }
 
-        # 正常工具任务：解析运行时参数
+        # 工具任务：解析运行时参数
         resolved_inputs: dict[str, str] = {}
         for param_name, source in task.get("inputs", {}).items():
             from_id  = source["from_task"]
-            field    = source.get("field", "result")
+            src_field = source.get("field", "result")
             src_task = done_map.get(from_id, {})
-            resolved_inputs[param_name] = src_task.get(field, "")
+            resolved_inputs[param_name] = src_task.get(src_field, "")
 
         if resolved_inputs:
             params_text = "\n".join(f"  {k} = {v}" for k, v in resolved_inputs.items())
@@ -416,9 +471,9 @@ async def supervisor_node(state: AgentState) -> AgentState:
         print(f"     {task['_resolved_description'].replace(chr(10), ' | ')}")
         return {
             **state,
-            "next_agent": task["agent"],
+            "next_agent":      task["agent"],
             "current_task_id": task["task_id"],
-            "task_plan": task_plan,
+            "task_plan":       task_plan,
         }
 
     # 所有任务完成（或依赖无法满足）
@@ -434,7 +489,7 @@ async def supervisor_node(state: AgentState) -> AgentState:
 
 
 # ══════════════════════════════════════════════════════
-# 9. Re-Planner（仅在工具 agent 执行后触发，direct 任务不经过此节点）
+# 9. Re-Planner（仅工具 agent 执行后触发）
 # ══════════════════════════════════════════════════════
 def _replanner_system() -> str:
     valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用 Agent）"
@@ -472,8 +527,8 @@ def _replanner_system() -> str:
 
 
 async def replanner_node(state: AgentState) -> AgentState:
-    task_plan: list[Task]  = state.get("task_plan", [])
-    current_task_id: int   = state.get("current_task_id", -1)
+    task_plan: list[Task] = state.get("task_plan", [])
+    current_task_id: int  = state.get("current_task_id", -1)
 
     done_tasks    = [t for t in task_plan if t["status"] == "done"]
     pending_tasks = [t for t in task_plan if t["status"] == "pending"]
@@ -522,7 +577,7 @@ async def replanner_node(state: AgentState) -> AgentState:
             return state
 
         valid_agents = set(_registry.agents)
-        new_pending = [t for t in new_pending if t.get("agent") in valid_agents]
+        new_pending  = [t for t in new_pending if t.get("agent") in valid_agents]
         if not new_pending:
             print("  ⚠️ Re-Planner：所有新任务 agent 非法，保持原计划")
             return state
@@ -564,12 +619,11 @@ async def run_agent(
         current_task["result"] = f"⚠️ 没有可用工具（{agent_name} 未注册任何工具）"
         return {**state, "task_plan": task_plan}
 
-    tool_hint = "可用工具：" + "、".join(
+    tool_hint   = "可用工具：" + "、".join(
         f"{t.name}（{t.description or '无描述'}）" for t in lc_tools
     )
     full_system = f"{system_prompt}\n\n{tool_hint}"
-
-    agent_llm = llm.bind_tools(lc_tools)
+    agent_llm   = llm.bind_tools(lc_tools)
     msgs = [
         SystemMessage(content=full_system),
         HumanMessage(content=task_description),
@@ -610,18 +664,16 @@ async def run_agent(
 # ══════════════════════════════════════════════════════
 # 11. 图构建
 #
-#   ★ 重构：移除 router 节点，入口直接为 planner
-#   ★ supervisor 路由扩展：新增 "direct_answer" 分支
-#   ★ direct_answer 节点不经过 replanner，直接回到 supervisor
-#     （处理可能存在的后续工具任务）
+#   图结构：
 #
-#   图结构（文字版）：
+#   planner ──(next_agent=FINISH)──→ END          ← ★ 新增：规划失败短路
+#           ──(otherwise)──────────→ supervisor
 #
-#   planner → supervisor ─┬─→ direct_answer ──────────────────┐
-#                         ├─→ math_agent → replanner → supervisor
-#                         ├─→ data_agent → replanner → supervisor
-#                         ├─→ http_agent → replanner → supervisor
-#                         └─→ final_answer → END
+#   supervisor ──→ direct_answer ──→ supervisor   ← ★ direct 任务回环
+#              ──→ math_agent   ──→ replanner ──→ supervisor
+#              ──→ data_agent   ──→ replanner ──→ supervisor
+#              ──→ http_agent   ──→ replanner ──→ supervisor
+#              ──→ final_answer ──→ END
 # ══════════════════════════════════════════════════════
 
 AGENT_SYSTEM_PROMPTS: dict[str, str] = {
@@ -649,36 +701,58 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
 
 def build_graph() -> Any:
 
-    # ── direct_answer 节点 ────────────────────────────
-    # ★ 重构：direct_answer 现在从 task_plan 里取当前任务的 result（即 description）
-    #          输出后回到 supervisor，继续处理后续可能存在的工具任务
+    # ── ★ direct_answer 节点 ─────────────────────────
+    # 重构2：用 LLM 重新生成真实回答，不再直接取 description
     async def direct_answer_node(state: AgentState) -> AgentState:
         task_plan: list[Task] = state.get("task_plan", [])
         task_id: int          = state.get("current_task_id", 0)
         current_task = next((t for t in task_plan if t["task_id"] == task_id), None)
-        answer = current_task["result"] if current_task else "（无回答）"
-        print(f"\n  💬 direct_answer：{answer[:80]}")
+
+        if not current_task:
+            print("  ⚠️ direct_answer：找不到当前任务")
+            return state
+
+        intent = current_task.get("description", "")
+        print(f"\n  💬 direct_answer 调用 LLM（意图：{intent[:60]}）")
+
+        # 以原始用户消息为主输入，description 作为意图提示辅助
+        response = await llm.ainvoke([
+            SystemMessage(content=(
+                "你是一个友善的 AI 助手。请根据用户的消息给出自然、完整的回答。"
+                f"\n\n（本次任务意图提示：{intent}）"
+            )),
+            state["messages"][0],   # 原始用户消息
+        ])
+
+        answer = response.content
+        print(f"  ✅ direct_answer 完成：{answer[:80]}")
+
+        # 标记任务完成，result 存储 LLM 真实回答
+        current_task["status"] = "done"
+        current_task["result"] = answer
+
         # 把回答追加到消息流，然后回到 supervisor 处理后续任务
         return {
             **state,
             "messages": state["messages"] + [AIMessage(content=answer)],
+            "task_plan": task_plan,
         }
 
     # ── 最终汇总节点 ──────────────────────────────────
     async def final_answer_node(state: AgentState) -> AgentState:
         task_plan: list[Task] = state.get("task_plan", [])
 
-        # 工具任务的结果需要汇总；direct 任务的结果已经在消息流里，无需再次包含
-        tool_results = [t for t in task_plan if t.get("agent") != "direct"]
+        # 只汇总工具任务结果；direct 任务的回答已在消息流中
+        tool_tasks = [t for t in task_plan if t.get("agent") != "direct"]
 
-        if not tool_results:
-            # 全部都是 direct 任务，消息流里已有完整回答，无需再调 LLM
+        if not tool_tasks:
+            # 全是 direct 任务，消息流里已有完整回答，无需再调 LLM
             print("\n  📝 所有任务均为 direct，最终回答已在消息流中")
             return state
 
         results_text = "\n".join(
             f"任务[{t['task_id']}]（{t['description']}）：{t['result']}"
-            for t in tool_results
+            for t in tool_tasks
         )
         print(f"\n  📝 汇总工具任务结果：\n{results_text}")
 
@@ -689,14 +763,25 @@ def build_graph() -> Any:
             )),
             state["messages"][0],
         ])
-        return {**state, "messages": state["messages"] + [AIMessage(content=response.content)]}
+        return {
+            **state,
+            "messages": state["messages"] + [AIMessage(content=response.content)],
+        }
 
     # ── 路由函数 ──────────────────────────────────────
+
+    # ★ planner 后的条件路由：规划失败（next_agent=FINISH）直接到 END
+    def planner_route(state: AgentState) -> str:
+        if state.get("next_agent") == "FINISH":
+            print("  ⛔ Planner 规划失败，直接终止，不进入 Supervisor")
+            return "END"
+        return "supervisor"
+
     def supervisor_route(state: AgentState) -> str:
         next_node = state.get("next_agent", "FINISH")
         if next_node == "FINISH":
             return "final_answer"
-        return next_node   # "direct_answer" 或工具 agent 名
+        return next_node  # "direct_answer" 或工具 agent 名
 
     # ── 动态创建工具 agent 节点 ───────────────────────
     def make_agent_node(name: str):
@@ -706,10 +791,9 @@ def build_graph() -> Any:
         _node.__name__ = name
         return _node
 
-    # ── 图构建 ────────────────────────────────────────
+    # ── 图构建 ─────────────────────────────────────────
     g = StateGraph(AgentState)
 
-    # ★ 不再有 router 节点，入口直接是 planner
     g.add_node("planner",       planner_node)
     g.add_node("supervisor",    supervisor_node)
     g.add_node("replanner",     replanner_node)
@@ -722,7 +806,12 @@ def build_graph() -> Any:
 
     # ── 边 ────────────────────────────────────────────
     g.set_entry_point("planner")
-    g.add_edge("planner", "supervisor")
+
+    # ★ planner → END（规划失败）或 supervisor（正常）
+    g.add_conditional_edges("planner", planner_route, {
+        "END":        END,
+        "supervisor": "supervisor",
+    })
 
     # supervisor → direct_answer / 工具 agent / final_answer
     agent_routes = {name: name for name in known_agents}
@@ -733,7 +822,7 @@ def build_graph() -> Any:
     # ★ direct_answer 完成后回到 supervisor，继续处理后续工具任务
     g.add_edge("direct_answer", "supervisor")
 
-    # 工具 agent 完成后进 replanner，再回 supervisor
+    # 工具 agent → replanner → supervisor
     for agent_name in known_agents:
         g.add_edge(agent_name, "replanner")
     g.add_edge("replanner", "supervisor")
@@ -784,21 +873,24 @@ if __name__ == "__main__":
         sys.exit(1)
 
     QUESTIONS = [
-        # 纯闲聊 → direct 任务，不走工具
+        # 纯闲聊 → direct 任务（LLM 真实回答）
         "你好，我叫 tony",
-        "什么是机器学习？",
         # 纯工具任务
-        "把 88 和 12 相加，再把结果乘以 5",
         "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
-        # 混合任务：闲聊 + 工具（原来会被短路，现在能正确执行）
+        # 混合任务：闲聊 + 工具（原来会被短路，现在能正确执行全部子任务）
         "先介绍一下你自己，然后帮我计算 99 乘以 9",
         # 数据分析
         """分析这批数据：[{"name":"Alice","dept":"Eng","salary":9000},
          {"name":"Bob","dept":"Mkt","salary":7500},
          {"name":"Charlie","dept":"Eng","salary":11000}]
          按 dept 分组，对 salary 求平均""",
-        # 网络请求
-        "访问 https://api.github.com/zen 返回了什么？",
+        # # 网络请求
+        # "访问 https://api.github.com/zen 返回了什么？",
+#         "先介绍一下什么是加权平均数，然后计算 (85×3 + 90×2 + 78×5) 除以 (3+2+5) 得到加权平均分，"
+# "同时访问 https://api.github.com/zen 获取一句话，"
+# """最后分析这批学生数据：[{"name":"Alice","score":85,"weight":3},
+# {"name":"Bob","score":90,"weight":2},{"name":"Charlie","score":78,"weight":5}]
+# 按 weight 分组对 score 求平均，把网络请求的结果也附在最终答案里""",
     ]
 
     async def main():

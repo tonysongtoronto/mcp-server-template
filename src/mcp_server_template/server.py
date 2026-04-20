@@ -136,7 +136,14 @@ def multiply_numbers(a: int, b: int) -> int:
     """两个数字相乘"""
     return a * b
 
-
+@mcp.tool()
+def divide_numbers(a: float, b: float) -> float:
+    """两个数字相除"""
+    if b == 0:
+        raise ValueError("除数不能为 0")
+    return a / b
+    
+    
 @mcp.tool()
 def get_server_info() -> str:
     """返回服务器信息"""
