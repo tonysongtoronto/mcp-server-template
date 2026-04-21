@@ -1,9 +1,10 @@
-
-
 {
   "graphs": {
     "supervisorpalner": "src.langgraph_stdio_agent:graph",
-    "agent":"src.langgraph_agent:graph"
+    "agent": "src.langgraph_agent:graph"
+  },
+  "http": {
+    "app": "./src/webapp.py:app"
   },
   "env": ".env",
   "dependencies": [

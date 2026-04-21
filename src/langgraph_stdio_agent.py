@@ -14,9 +14,10 @@ src/langgraph_stdio_agent.py
            Supervisor 检测到 direct 时路由到 direct_answer，
            direct_answer 完成后回到 supervisor 继续处理后续工具任务
 
-  【重构2】direct_answer_node 交给 LLM 真实回答
-   - 原问题：直接把 planner 写的 description 当回答输出，质量不稳定
-   - 方案：用原始用户问题重新调用 LLM 生成回答，description 作为上下文提示
+  【重构2】direct_answer_node 只回答当前子任务
+   - 原问题：传入完整原始消息，LLM 看到全部问题后把所有子任务都答了一遍，
+             导致重复 AI 回复
+   - 方案：只传 intent（当前子任务描述）给 LLM，不传原始用户消息
 
   【重构3】planner_node JSON 解析失败重试策略
    - 原问题：解析失败直接兜底为一个 direct 任务，掩盖错误
@@ -25,11 +26,59 @@ src/langgraph_stdio_agent.py
              · 把带有详细失败信息的 AIMessage 写入 messages
              · 设置 next_agent="FINISH"，通过条件路由直接走向 END
              · 不进入 supervisor，不走任何 agent
+
+  【修复4】supervisor_node in_progress 容错
+   - 原问题：direct 任务标为 in_progress 后若 direct_answer_node 异常，
+             任务永远卡住，流程死锁
+   - 方案：supervisor 遍历时同时处理 pending 和 in_progress 状态
+
+  【修复5】_extract_json 统一抽取，replanner 缺 .strip() 问题
+   - 原问题：replanner 的代码块清理逻辑不完整，缺少 strip()，
+             容易导致 JSON 解析失败
+   - 方案：抽取公共函数 _extract_json，planner/replanner 统一调用
+
+  【修复6】final_answer_node 混合任务时 direct 结果纳入汇总
+   - 原问题：只汇总工具任务结果，direct 任务的回答被丢弃，
+             最终答案缺失 direct 部分内容
+   - 方案：把 direct 任务结果也拼入 results_text 一起发给 LLM
+
+  【修复7】强化 Planner 工具感知 —— 杜绝"有工具却用 direct"
+   - 原问题：Planner 把"计算""访问URL"等明确需要工具的任务误判为 direct，
+             导致 LLM 编造结果
+   - 方案：
+       · Planner 系统提示新增"禁止使用 direct"的负面示例和强约束
+       · 在 Planner 提示中列出每个 agent 对应的具体工具名和场景
+       · Planner 规划后增加一次"合规校验"：
+           检查每个任务的 agent 选择是否合理，
+           发现 direct 任务包含数值计算/URL访问等关键词时自动修正
+       · 工具 Agent 系统提示强化"必须调用工具"的指令，
+           明确禁止凭记忆或推理直接回答，必须通过工具获取结果
+
+  【修复8】run_agent 工具调用强制兜底
+   - 原问题：LLM 有时第一轮直接给出文字答案而不调用工具
+   - 方案：若第一轮没有 tool_calls，追加一条强制提示再 invoke 一次
+  【修복10】兼容 LangGraph Studio 下 messages 反序列化为 dict 的问题
+   - 原问题：LangGraph Studio 通过 API 传入 state 时，messages 被反序列化为
+             原始 dict（{"role":"human","content":"..."}），而非 HumanMessage 对象，
+             访问 state["messages"][0].content 抛出 AttributeError
+   - 方案：新增 _get_message_content(msg) 和 _get_first_user_message(state) 两个函数，
+           统一兼容 HumanMessage 对象和 dict 两种格式，
+           所有访问 messages[N].content 的地方都通过这两个函数处理
+
+  【修复9】全局兼容 llm.ainvoke() 返回 dict 的问题
+   - 原问题：DeepSeek + langchain_openai 在部分版本下 ainvoke() 返回原始 dict
+             而非 AIMessage 对象，直接访问 .content 抛出
+             AttributeError: 'dict' object has no attribute 'content'
+             错误发生在 replanner 节点，导致流程中断
+   - 方案：抽取 _extract_llm_content(response) 公共函数，
+           兼容 AIMessage / dict / 其他类型三种情况，
+           所有 llm.ainvoke() 调用后统一通过此函数取内容
 """
 
 import asyncio
 import json
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -90,6 +139,16 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
     "http_agent": "网络请求（GET/POST、访问 URL、调用外部 API）",
 }
 
+# ★ 修复7：每个 agent 的"触发关键词"，用于 Planner 校验兜底
+AGENT_TRIGGER_KEYWORDS: dict[str, list[str]] = {
+    "math_agent": ["计算", "加", "减", "乘", "除", "求和", "平均", "幂", "开方",
+                   "+", "-", "×", "÷", "*", "/", "²", "√"],
+    "http_agent": ["访问", "请求", "获取", "http", "https", "url", "api",
+                   "fetch", "get ", "post "],
+    "data_agent": ["分析", "统计", "分组", "聚合", "过滤", "排序", "数据集",
+                   "dataframe", "pivot"],
+}
+
 def _match_agent(tool_name: str) -> str:
     for agent, patterns in AGENT_TOOL_PATTERNS.items():
         for pat in patterns:
@@ -132,7 +191,7 @@ class ToolRegistry:
             tool_names = [t.name for t in reg._agent_tools.get(agent, [])]
             lines_agents.append(f"  - {agent}：{desc}（工具：{', '.join(tool_names)}）")
             brief_lines.append(f"  · {agent}：{desc}")
-        lines_agents.append("  - direct：直接用语言模型回答，不调用任何工具（闲聊/知识问答）")
+        lines_agents.append("  - direct：直接用语言模型回答，不调用任何工具（仅限：闲聊/问候/概念解释/知识性问答）")
 
         reg._tool_desc_block  = "\n".join(lines_tools)
         reg._agent_desc_block = "\n".join(lines_agents)
@@ -238,10 +297,99 @@ def _init_registry(tools: list[StructuredTool]) -> None:
 
 
 # ══════════════════════════════════════════════════════
+# 公共工具函数
+# ══════════════════════════════════════════════════════
+
+def _extract_json(raw: str) -> str:
+    """
+    ★ 修复5：统一的 JSON 代码块清理函数。
+    去除 ```json ... ``` 或 ``` ... ``` 包裹，并 strip 空白。
+    planner / replanner 统一调用此函数，避免各处逻辑不一致。
+    """
+    raw = raw.strip()
+    if "```" in raw:
+        # 取第一对 ``` 之间的内容
+        parts = raw.split("```")
+        # parts[0]=前缀, parts[1]=代码块内容, parts[2]=后缀（如果有）
+        inner = parts[1] if len(parts) > 1 else parts[0]
+        # 去掉语言标识符（如 "json\n"）
+        inner = re.sub(r"^[a-zA-Z]+\n", "", inner)
+        return inner.strip()
+    return raw
+
+
+def _extract_llm_content(response: Any) -> str:
+    """
+    ★ 修复9：兼容 llm.ainvoke() 返回 AIMessage 对象或原始 dict 两种情况。
+    DeepSeek + langchain_openai 在部分版本/流式配置下会返回 dict 而非 AIMessage，
+    直接访问 .content 会抛出 AttributeError: 'dict' object has no attribute 'content'。
+    所有 llm.ainvoke() 调用后都应通过此函数取内容，不要直接用 response.content。
+    """
+    if hasattr(response, "content"):
+        return response.content or ""
+    if isinstance(response, dict):
+        return (
+            response.get("content")
+            or response.get("text")
+            or response.get("output")
+            or str(response)
+        )
+    return str(response)
+
+
+def _get_message_content(msg: Any) -> str:
+    """
+    ★ 修复10：兼容 LangGraph Studio 环境下 messages 反序列化为 dict 的情况。
+    终端直接运行时 messages 是 HumanMessage/AIMessage 对象（有 .content 属性），
+    但 LangGraph Studio 通过 API 传入时，messages 会被反序列化为原始 dict：
+      {"role": "human", "content": "..."}
+    直接访问 .content 会抛出 AttributeError。
+    所有访问 state["messages"][N] 内容的地方都应使用此函数。
+    """
+    if hasattr(msg, "content"):
+        return msg.content or ""
+    if isinstance(msg, dict):
+        return msg.get("content") or msg.get("text") or str(msg)
+    return str(msg)
+
+
+def _get_first_user_message(state: "AgentState") -> Any:
+    """
+    从 state["messages"] 中取第一条用户消息，
+    返回原始对象（可能是 HumanMessage 也可能是 dict），
+    供直接传入 llm.ainvoke() 使用（LangChain 两种格式都能处理）。
+    """
+    msgs = state.get("messages", [])
+    if not msgs:
+        return HumanMessage(content="")
+    msg = msgs[0]
+    # 如果是 dict，转成 HumanMessage，保证 LangChain 可以正确处理
+    if isinstance(msg, dict):
+        return HumanMessage(content=msg.get("content") or msg.get("text") or "")
+    return msg
+
+
+def _task_needs_tool_agent(description: str) -> str | None:
+    """
+    ★ 修复7：校验任务描述是否应当使用工具 agent 而非 direct。
+    返回推荐的 agent 名，或 None 表示无需修正。
+    仅在已注册该 agent 的情况下才修正。
+    """
+    desc_lower = description.lower()
+    for agent, keywords in AGENT_TRIGGER_KEYWORDS.items():
+        if agent not in _registry.agents:
+            continue
+        if any(kw.lower() in desc_lower for kw in keywords):
+            return agent
+    return None
+
+
+# ══════════════════════════════════════════════════════
 # 7. Planner
 #
 #   ★ 重构1：承担意图判断，支持 agent="direct" 特殊任务
 #   ★ 重构3：JSON 解析失败最多重试 3 次，全部失败则在内部闭环处理
+#   ★ 修复7：强化工具选择约束，增加负面示例和合规校验
 # ══════════════════════════════════════════════════════
 
 def _planner_system() -> str:
@@ -250,22 +398,39 @@ def _planner_system() -> str:
 
 {_registry.agent_desc_block}
 
-━━ agent 选择规则 ━━
-1. 需要调用工具才能完成的任务 → 选择对应的工具 agent（{valid_agents}）
-2. 不需要工具、仅凭语言模型即可回答的任务 → agent 填 "direct"，
-   description 里简要描述用户意图即可（后续节点会重新生成完整回答）
-   适用场景：闲聊、问候、概念解释、知识性问答等
+{_registry.tool_desc_block}
+
+━━ agent 选择规则（严格遵守，违反将导致系统错误）━━
+
+【重要】agent 的选择直接决定是否调用工具，请仔细判断：
+
+✅ 必须使用工具 agent 的情况：
+  - 任何数值计算（加、减、乘、除、幂、开方等）→ math_agent
+  - 任何网络请求（访问 URL、调用 HTTP API、fetch 等）→ http_agent
+  - 任何数据分析（统计、分组、聚合、过滤等）→ data_agent
+
+❌ 严禁使用 direct 的情况（以下场景必须用工具 agent）：
+  - "计算 3+5" → 必须用 math_agent（不能自己算，必须调工具）
+  - "访问 https://..." → 必须用 http_agent（不能模拟，必须真实请求）
+  - "分析这批数据" → 必须用 data_agent（不能自行统计，必须调工具）
+
+✅ 可以使用 direct 的情况（仅限以下场景）：
+  - 闲聊、问候（如"你好"、"介绍一下你自己"）
+  - 纯知识性问答（如"什么是加权平均数"）
+  - 不涉及任何计算、网络请求、数据处理的场景
+
+判断口诀：只要涉及"算数字"、"访问网络"、"处理数据"，一律用工具 agent，绝不用 direct。
 
 ━━ 其他规则（严格遵守）━━
-3. description 只写任务意图，绝不提前计算数值或给出最终答案
-4. inputs 声明运行时需要从哪些前置任务获取参数：
+1. description 只写任务意图，绝不提前计算数值或给出最终答案
+2. inputs 声明运行时需要从哪些前置任务获取参数：
    - key   = 参数的语义名称（如"加数A"、"被乘数"），供 Agent 理解用途
    - value = {{"from_task": <被依赖的task_id>, "field": "result"}}
-5. depends_on 从 inputs 的 from_task 自动推导
-6. 没有依赖的任务：inputs 为 {{}}，depends_on 为 []
-7. 同一个 agent 可出现多次
-8. 任务按拓扑顺序排列（被依赖的任务排在前面）
-9. 如果用户消息中已直接包含数据（JSON 数组、数字、文本等），
+3. depends_on 从 inputs 的 from_task 自动推导
+4. 没有依赖的任务：inputs 为 {{}}，depends_on 为 []
+5. 同一个 agent 可出现多次
+6. 任务按拓扑顺序排列（被依赖的任务排在前面）
+7. 如果用户消息中已直接包含数据（JSON 数组、数字、文本等），
    不要单独拆"获取数据"任务，直接在处理任务的 description 里完整引用
 
 严格只输出 JSON 数组，不要有任何其他内容、代码块标记或说明文字。示例：
@@ -301,8 +466,21 @@ def _planner_system() -> str:
     "status": "pending",
     "result": "",
     "_resolved_description": ""
+  }},
+  {{
+    "task_id": 3,
+    "description": "访问 https://api.github.com/zen 获取随机箴言",
+    "agent": "http_agent",
+    "inputs": {{}},
+    "depends_on": [],
+    "status": "pending",
+    "result": "",
+    "_resolved_description": ""
   }}
-]"""
+]
+
+注意：上面示例中"计算 88 加 12"用了 math_agent，"访问 URL"用了 http_agent，这是正确的。
+绝对不能把这类任务写成 agent="direct"。"""
 
 
 def _planner_retry_system(attempt: int, last_raw: str) -> str:
@@ -331,13 +509,36 @@ def _planner_retry_system(attempt: int, last_raw: str) -> str:
         )
 
 
+def _validate_and_fix_task_plan(task_plan: list[Task]) -> list[Task]:
+    """
+    ★ 修复7：Planner 合规校验 + 自动修正。
+    检查每个 direct 任务的描述，如果描述中包含工具关键词，
+    自动把 agent 修正为对应的工具 agent。
+    """
+    fixed_count = 0
+    for task in task_plan:
+        if task.get("agent") != "direct":
+            continue
+        description = task.get("description", "")
+        recommended = _task_needs_tool_agent(description)
+        if recommended:
+            print(f"  🔧 [合规校验] 任务[{task['task_id']}] agent: direct → {recommended}")
+            print(f"     原因：描述含工具关键词，描述={description[:60]}")
+            task["agent"] = recommended
+            fixed_count += 1
+    if fixed_count:
+        print(f"  ⚠️ 合规校验共修正 {fixed_count} 个任务的 agent 分配")
+    return task_plan
+
+
 async def planner_node(state: AgentState) -> AgentState:
     if state.get("task_plan"):
         return state
 
     print("\n  📋 Planner 开始拆解任务...")
 
-    user_message = state["messages"][0]
+    # ★ 修复10：兼容 Studio dict 格式和终端 HumanMessage 对象
+    user_message = _get_first_user_message(state)
     last_raw     = ""
     task_plan: list[Task] | None = None
     max_attempts = 3
@@ -350,17 +551,11 @@ async def planner_node(state: AgentState) -> AgentState:
             sys_msg = SystemMessage(content=_planner_retry_system(attempt, last_raw))
 
         response = await llm.ainvoke([sys_msg, user_message])
-        raw      = response.content.strip()
+        # ★ 修复9：兼容 dict / AIMessage 两种返回格式
+        raw = _extract_llm_content(response).strip()
 
-        # 清理常见的代码块标记
-        if "```" in raw:
-            parts = raw.split("```")
-            # 取第一个代码块内容（索引1），或直接取最长片段
-            raw = parts[1] if len(parts) > 1 else parts[0]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-
+        # ★ 修复5：使用统一的 _extract_json 清理代码块标记
+        raw = _extract_json(raw)
         last_raw = raw
 
         try:
@@ -413,6 +608,9 @@ async def planner_node(state: AgentState) -> AgentState:
             "next_agent":      "FINISH",   # ★ 触发 planner → END 的条件路由
         }
 
+    # ★ 修复7：对规划结果做合规校验，自动修正误判为 direct 的工具任务
+    task_plan = _validate_and_fix_task_plan(task_plan)
+
     return {
         **state,
         "task_plan":       task_plan,
@@ -429,7 +627,8 @@ async def supervisor_node(state: AgentState) -> AgentState:
     done_map = {t["task_id"]: t for t in task_plan if t["status"] == "done"}
 
     for task in task_plan:
-        if task["status"] != "pending":
+        # ★ 修复4：同时处理 pending 和 in_progress，防止异常后流程卡死
+        if task["status"] not in ("pending", "in_progress"):
             continue
 
         unmet = [dep for dep in task.get("depends_on", []) if dep not in done_map]
@@ -548,20 +747,18 @@ async def replanner_node(state: AgentState) -> AgentState:
     response = await llm.ainvoke([
         SystemMessage(content=_replanner_system()),
         HumanMessage(content=(
-            f"用户原始问题：{state['messages'][0].content}\n\n"
+            # ★ 修复10：兼容 Studio dict 格式
+            f"用户原始问题：{_get_message_content(state['messages'][0])}\n\n"
             f"已完成任务：\n{done_summary}\n\n"
             f"待执行任务（pending）：\n{pending_summary}"
         )),
     ])
 
-    raw = response.content.strip()
-    if "```" in raw:
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+    # ★ 修复5+9：使用统一的 _extract_json，并兼容 dict/AIMessage 返回格式
+    raw = _extract_json(_extract_llm_content(response))
 
     try:
-        decision = json.loads(raw.strip())
+        decision = json.loads(raw)
     except json.JSONDecodeError:
         print(f"  ⚠️ Re-Planner JSON 解析失败，保持原计划：{raw[:100]}")
         return state
@@ -619,10 +816,16 @@ async def run_agent(
         current_task["result"] = f"⚠️ 没有可用工具（{agent_name} 未注册任何工具）"
         return {**state, "task_plan": task_plan}
 
-    tool_hint   = "可用工具：" + "、".join(
+    tool_hint = "可用工具：" + "、".join(
         f"{t.name}（{t.description or '无描述'}）" for t in lc_tools
     )
-    full_system = f"{system_prompt}\n\n{tool_hint}"
+    # ★ 修复8：在 system prompt 中明确禁止不调工具直接回答
+    full_system = (
+        f"{system_prompt}\n\n"
+        f"{tool_hint}\n\n"
+        "【重要约束】你必须通过调用工具来完成任务，严禁凭记忆、推理或编造直接给出答案。"
+        "即使你认为自己知道答案，也必须先调用工具获取真实结果，再基于工具返回值回答。"
+    )
     agent_llm   = llm.bind_tools(lc_tools)
     msgs = [
         SystemMessage(content=full_system),
@@ -639,7 +842,21 @@ async def run_agent(
         last_response = response
         msgs.append(response)
 
-        if not (hasattr(response, "tool_calls") and response.tool_calls):
+        has_tool_calls = hasattr(response, "tool_calls") and response.tool_calls
+
+        # ★ 修复8：第一轮没有 tool_calls，追加强制提示再重试一次
+        if step == 0 and not has_tool_calls:
+            tool_list_str = "、".join(tool_names)
+            force_msg = (
+                f"你刚才没有调用任何工具就直接回答了，这是不允许的。\n"
+                f"你拥有以下工具：{tool_list_str}\n"
+                f"请立即调用对应工具来完成任务，不要直接给出文字答案。"
+            )
+            print(f"  ⚠️ {agent_name} 第1轮未调用工具，追加强制提示重试...")
+            msgs.append(HumanMessage(content=force_msg))
+            continue
+
+        if not has_tool_calls:
             print(f"  ✅ {agent_name} 任务[{task_id}] 完成（{step + 1} 轮推理）")
             break
 
@@ -656,7 +873,8 @@ async def run_agent(
         print(f"  ⚠️ {agent_name} 达到最大步数 {max_steps}，强制终止")
 
     current_task["status"] = "done"
-    current_task["result"] = last_response.content if last_response else "（无结果）"
+    # ★ 修复9：兼容 dict / AIMessage 两种返回格式
+    current_task["result"] = _extract_llm_content(last_response) if last_response else "（无结果）"
 
     return {**state, "task_plan": task_plan}
 
@@ -666,7 +884,7 @@ async def run_agent(
 #
 #   图结构：
 #
-#   planner ──(next_agent=FINISH)──→ END          ← ★ 新增：规划失败短路
+#   planner ──(next_agent=FINISH)──→ END          ← ★ 规划失败短路
 #           ──(otherwise)──────────→ supervisor
 #
 #   supervisor ──→ direct_answer ──→ supervisor   ← ★ direct 任务回环
@@ -702,7 +920,7 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
 def build_graph() -> Any:
 
     # ── ★ direct_answer 节点 ─────────────────────────
-    # 重构2：用 LLM 重新生成真实回答，不再直接取 description
+    # ★ 修复2：只传当前子任务的 intent 给 LLM，不传完整原始消息
     async def direct_answer_node(state: AgentState) -> AgentState:
         task_plan: list[Task] = state.get("task_plan", [])
         task_id: int          = state.get("current_task_id", 0)
@@ -715,16 +933,18 @@ def build_graph() -> Any:
         intent = current_task.get("description", "")
         print(f"\n  💬 direct_answer 调用 LLM（意图：{intent[:60]}）")
 
-        # 以原始用户消息为主输入，description 作为意图提示辅助
+        # ★ 修复2：只传 intent 作为用户消息，不传原始完整问题
+        #   原来传 state["messages"][0] 导致 LLM 看到全部问题，把所有子任务都答了
         response = await llm.ainvoke([
             SystemMessage(content=(
-                "你是一个友善的 AI 助手。请根据用户的消息给出自然、完整的回答。"
-                f"\n\n（本次任务意图提示：{intent}）"
+                "你是一个友善的 AI 助手。请只回答当前分配给你的这一个子任务，"
+                "不要回答用户原始消息中的其他问题。"
             )),
-            state["messages"][0],   # 原始用户消息
+            HumanMessage(content=intent),
         ])
 
-        answer = response.content
+        # ★ 修复9：兼容 dict / AIMessage 两种返回格式
+        answer = _extract_llm_content(response)
         print(f"  ✅ direct_answer 完成：{answer[:80]}")
 
         # 标记任务完成，result 存储 LLM 真实回答
@@ -742,30 +962,42 @@ def build_graph() -> Any:
     async def final_answer_node(state: AgentState) -> AgentState:
         task_plan: list[Task] = state.get("task_plan", [])
 
-        # 只汇总工具任务结果；direct 任务的回答已在消息流中
-        tool_tasks = [t for t in task_plan if t.get("agent") != "direct"]
+        tool_tasks   = [t for t in task_plan if t.get("agent") != "direct"]
+        direct_tasks = [t for t in task_plan if t.get("agent") == "direct"]
 
         if not tool_tasks:
             # 全是 direct 任务，消息流里已有完整回答，无需再调 LLM
             print("\n  📝 所有任务均为 direct，最终回答已在消息流中")
             return state
 
-        results_text = "\n".join(
-            f"任务[{t['task_id']}]（{t['description']}）：{t['result']}"
-            for t in tool_tasks
-        )
-        print(f"\n  📝 汇总工具任务结果：\n{results_text}")
+        # ★ 修复6：混合任务时把 direct 结果也纳入汇总上下文
+        all_results_lines: list[str] = []
+        if direct_tasks:
+            all_results_lines.append("【直接回答任务】")
+            for t in direct_tasks:
+                all_results_lines.append(
+                    f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
+                )
+        all_results_lines.append("【工具执行任务】")
+        for t in tool_tasks:
+            all_results_lines.append(
+                f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
+            )
+
+        results_text = "\n".join(all_results_lines)
+        print(f"\n  📝 汇总所有任务结果：\n{results_text}")
 
         response = await llm.ainvoke([
             SystemMessage(content=(
                 "根据以下各子任务的执行结果，用中文给用户一个清晰完整的最终答案。\n\n"
                 f"{results_text}"
             )),
-            state["messages"][0],
+            # ★ 修复10：兼容 Studio dict 格式，转为 HumanMessage 再传给 LLM
+            _get_first_user_message(state),
         ])
         return {
             **state,
-            "messages": state["messages"] + [AIMessage(content=response.content)],
+            "messages": state["messages"] + [AIMessage(content=_extract_llm_content(response))],
         }
 
     # ── 路由函数 ──────────────────────────────────────
@@ -836,6 +1068,7 @@ def build_graph() -> Any:
 # 12. 图实例（延迟初始化）
 # ══════════════════════════════════════════════════════
 graph = build_graph()
+
 
 
 def _rebuild_graph() -> None:
@@ -910,11 +1143,11 @@ if __name__ == "__main__":
                         "current_task_id": 0,
                         "next_agent":      "",
                     })
-                    print(f"\n✨ 最终答案：{result['messages'][-1].content}")
+                    print(f"\n✨ 最终答案：{_get_message_content(result['messages'][-1])}")
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
-    
-    
+
+
     # uv run python src/langgraph_stdio_agent.py

@@ -19,6 +19,7 @@ dependencies = [
     "langsmith>=0.7.30",
     "nest-asyncio>=1.6.0",
     "langgraph-api>=0.8.0",
+    "fastapi>=0.136.0",
 ]
 
 [dependency-groups]
