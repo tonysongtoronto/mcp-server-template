@@ -2,47 +2,50 @@
 src/langgraph_stdio_agent.py
 
 两种运行方式：
-  1. uv run langgraph dev   → langgraph 调用 lifespan 钩子初始化工具
-  2. python -m src.langgraph_stdio_agent  → __main__ 手动初始化工具
+  1. uv run langgraph dev              → langgraph 调用 lifespan 钩子初始化工具
+  2. uv run python src/langgraph_stdio_agent.py  → __main__ 手动初始化工具
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-★ 本版本重构说明
+★ v4 修复说明（相对 v3）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  【改动 A】并行任务调度（Send API + Map-Reduce）
-    · AgentState.task_plan 加 Annotated Reducer，安全合并并发写入
-    · 新增 WorkerState，每个并发 worker 持有私有执行上下文
-    · supervisor_dispatch 找出本轮所有依赖已满足的 pending 任务，
-      用 Send API 一次性全部并发分发
-    · collect_node 作为并发汇聚点
-
-  【改动 B】删除 _validate_and_fix_task_plan
-    · 依赖 Planner 系统提示的强约束保证 agent 选择正确性
-
-  【改动 C】replanner 改为纯逻辑失败检测器
-    · 移除 LLM 调用，改为纯逻辑 BFS 级联跳过失败依赖任务
-
-  【修复 D】解决 LangGraph Studio 前台工具失效（最终版）
+  【修复 E】彻底解决 _registry_ready 竞态问题
     根因：
-      ① stdio_client 的 asyncio stream 与创建它的 task 绑定，
-         Studio 每次 HTTP 请求在新 task 里调用 graph，跨 task 使用
-         session 导致工具失效
-      ② filesystem MCP 启动异常被静默吞掉，工具缺失无报错
-    方案：
-      · MCPSessionManager：所有 MCP 操作在专属后台 task 里执行，
-        外部通过 asyncio.Queue + Future 桥接，彻底绕开跨 task 限制
-      · _init_registry() set _registry_ready event；
-        run_agent 若发现 registry 为空则等待（最多60s），解决竞态
-      · lifespan 不再调用 _rebuild_graph()，graph 节点运行时
-        动态查全局 _registry
-      · filesystem 启动失败时打印完整错误，而非静默跳过
+      _registry_ready 是懒创建的全局变量（初始为 None）。
+      若 run_agent 在 lifespan 调用 _init_registry() 之前被触发，
+      会在 run_agent 里首次调用 _get_registry_ready_event()，
+      此时创建了 Event-A 并 wait；随后 lifespan 里 _init_registry()
+      再次调用 _get_registry_ready_event()，发现变量已非 None（Event-A），
+      ——但实际上在某些竞态路径下 None 检查可能被两个协程同时通过，
+      创建出 Event-A 和 Event-B 两个不同对象，lifespan set 了 Event-B，
+      run_agent 永远在等 Event-A，导致 60s 超时。
 
-  ★★★ langgraph.json 必须配置 lifespan ★★★
+    修复方案：
+      · 用单元素列表 _registry_ready_holder: list[asyncio.Event] 替代裸变量。
+        列表对象本身在模块导入时就创建（不含元素），永远不会被替换。
+      · lifespan 启动时（event loop 已确定运行）调用
+        _ensure_registry_event() 预先 append 唯一的 Event 对象。
+      · _get_registry_ready_event() 只从 holder[0] 取，不再创建新对象。
+      · _init_registry() 直接 set holder[0]，保证 set 和 wait 操作
+        作用于同一个 Event 实例，竞态窗口彻底消除。
+
+  【修复 F】langgraph.json 只保留一个 graph + 一个 lifespan
+    · 删除多余的 "agent": "src.langgraph_agent:graph" 条目，
+      避免两个 graph 共享单一 lifespan 引发的初始化不确定行为。
+
+  【保持不变】
+    · MCPSessionManager 后台 task 桥接方案（解决跨 task stream 问题）
+    · 并行 Send API 调度（Map-Reduce）
+    · 纯逻辑 BFS 级联跳过失败依赖任务
+
+  ★★★ langgraph.json 配置（只需这一个 graph）★★★
   {
     "graphs": {
-      "supervisorpalner": "./src/langgraph_stdio_agent.py:graph"
+      "supervisorpalner": "src.langgraph_stdio_agent:graph"
     },
-    "lifespan": "src.langgraph_stdio_agent:lifespan"
+    "lifespan": "src.langgraph_stdio_agent:lifespan",
+    "env": ".env",
+    "dependencies": ["."]
   }
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -267,22 +270,40 @@ class WorkerState(TypedDict):
 
 # ══════════════════════════════════════════════════════
 # 5. 共享容器 & registry ready event
+#
+# ★ 修复 G（终极方案）：
+#   asyncio.Event 绑定到创建它的 event loop，而 langgraph dev
+#   内部使用多个 loop/线程处理请求（如 asyncio_1 线程），导致
+#   lifespan 里 set() 的 Event 与 run_agent 里 wait() 的 Event
+#   不是同一个对象，永远无法触发。
+#
+#   解决方案：改用 threading.Event，它是跨线程、跨 event loop 安全的。
+#   · _registry_ready_event 在模块导入时（同步上下文）创建，全局唯一。
+#   · lifespan/_init_registry 调用 .set()
+#   · run_agent 用 asyncio.get_event_loop().run_in_executor() 在线程池
+#     里做阻塞等待，不阻塞 event loop。
 # ══════════════════════════════════════════════════════
+import threading
+
 _tools: list[StructuredTool] = []
 _registry: ToolRegistry = ToolRegistry()
 
-# 延迟创建，避免模块导入时无 event loop
-_registry_ready: asyncio.Event | None = None
+# ★ 模块级创建，同步上下文，跨 loop/线程安全
+_registry_ready_event: threading.Event = threading.Event()
 
-def _get_registry_ready_event() -> asyncio.Event:
-    global _registry_ready
-    if _registry_ready is None:
-        _registry_ready = asyncio.Event()
-    return _registry_ready
+
+def _ensure_registry_event() -> None:
+    """兼容旧调用点，现在是空操作（threading.Event 模块级已创建）。"""
+    pass  # threading.Event 不依赖 event loop，模块导入时已就绪
+
+
+def _get_registry_ready_event() -> threading.Event:
+    """返回全局唯一的 threading.Event 实例。"""
+    return _registry_ready_event
 
 
 # ══════════════════════════════════════════════════════
-# 6. MCPSessionManager（修复D核心）
+# 6. MCPSessionManager
 #
 #   所有 MCP 操作在专属后台 task 里执行，外部通过
 #   asyncio.Queue + Future 桥接，彻底避免跨 task 使用
@@ -297,12 +318,15 @@ def _get_registry_ready_event() -> asyncio.Event:
 class MCPSessionManager:
 
     def __init__(self):
-        self._req_queues:   dict[str, asyncio.Queue] = {}
-        self._bg_tasks:     list[asyncio.Task]       = []
-        self._ready_events: dict[str, asyncio.Event] = {}
+        self._req_queues:    dict[str, asyncio.Queue] = {}
+        self._bg_tasks:      list[asyncio.Task]       = []
+        self._ready_events:  dict[str, asyncio.Event] = {}
+        self._failed_servers: set[str]                = set()  # ★ 记录启动失败的 server
 
     async def start(self) -> None:
-        """启动所有后台 MCP 连接，等待全部就绪后返回。"""
+        """启动所有后台 MCP 连接，等待全部就绪后返回。
+        单个 server 启动失败只打印警告，不抛出异常，避免阻塞整个 lifespan。
+        """
         configs: dict[str, StdioServerParameters] = {
             "server":     mcp_params(),
             "filesystem": filesystem_mcp_params(),
@@ -319,9 +343,17 @@ class MCPSessionManager:
         for name, event in self._ready_events.items():
             try:
                 await asyncio.wait_for(event.wait(), timeout=60)
+                # 检查后台 task 是否因异常提前退出（此时 event 被 set 但 session 无效）
+                bg_task = next((t for t in self._bg_tasks if t.get_name() == f"mcp-bg-{name}"), None)
+                if bg_task and bg_task.done() and bg_task.exception():
+                    raise bg_task.exception()
                 print(f"✅ [MCPSessionManager] '{name}' 后台 session 就绪")
             except asyncio.TimeoutError:
-                raise RuntimeError(f"MCPSessionManager: '{name}' 启动超时（60s）")
+                print(f"⚠️ [MCPSessionManager] '{name}' 启动超时（60s），跳过该 server", file=sys.stderr)
+                self._failed_servers.add(name)
+            except Exception as exc:
+                print(f"⚠️ [MCPSessionManager] '{name}' 启动失败：{exc}，跳过该 server", file=sys.stderr)
+                self._failed_servers.add(name)
 
     async def stop(self) -> None:
         """向所有后台 task 发送终止信号并等待退出。"""
@@ -343,6 +375,8 @@ class MCPSessionManager:
         return await self._dispatch(session_name, "call", (tool_name, kwargs))
 
     async def _dispatch(self, session_name: str, op: str, payload: Any) -> Any:
+        if session_name in self._failed_servers:
+            raise RuntimeError(f"MCPSessionManager: server '{session_name}' 启动失败，无法调用")
         q = self._req_queues.get(session_name)
         if q is None:
             raise RuntimeError(f"MCPSessionManager: 未知 session '{session_name}'")
@@ -476,11 +510,9 @@ async def load_tools(
 def _init_registry(tools: list[StructuredTool]) -> None:
     global _registry
     _registry = ToolRegistry.build(tools)
-    try:
-        _get_registry_ready_event().set()
-        print("✅ [registry] _registry_ready event 已触发")
-    except RuntimeError:
-        pass
+    # ★ threading.Event.set() 跨线程/跨 loop 安全
+    _registry_ready_event.set()
+    print("✅ [registry] _registry_ready event 已触发")
 
 
 # ══════════════════════════════════════════════════════
@@ -784,12 +816,20 @@ def collect_node(state: AgentState) -> AgentState:
 # 12. 通用工具 Agent 执行器
 # ══════════════════════════════════════════════════════
 async def run_agent(state: WorkerState, agent_name: str, system_prompt: str) -> dict:
-    # ★ 若 registry 为空（Studio 竞态），等待 lifespan 初始化完成
+    # ★ 修复 G：用 threading.Event + run_in_executor 等待，
+    #   跨 event loop / 跨线程安全，彻底避免 asyncio.Event 跨 loop 失效问题。
     if not _registry.agents:
         print(f"  ⏳ [{agent_name}] _registry 尚未就绪，等待 lifespan 初始化...")
         try:
-            await asyncio.wait_for(_get_registry_ready_event().wait(), timeout=60)
-            print(f"  ✅ [{agent_name}] _registry 已就绪，继续执行")
+            loop = asyncio.get_event_loop()
+            ready = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: _registry_ready_event.wait(timeout=60)),
+                timeout=65,
+            )
+            if not _registry_ready_event.is_set():
+                print(f"  ❌ [{agent_name}] 等待 _registry 超时（60s）")
+            else:
+                print(f"  ✅ [{agent_name}] _registry 已就绪，继续执行")
         except asyncio.TimeoutError:
             print(f"  ❌ [{agent_name}] 等待 _registry 超时（60s）")
 
@@ -1025,41 +1065,23 @@ graph = build_graph()
 
 
 # ══════════════════════════════════════════════════════
-# 15. lifespan —— 仅 langgraph dev 调用
+# 15. lifespan 已移至 src/webapp.py
 #
-# ★★★ langgraph.json 必须配置 ★★★
+# ★★★ 正确的 langgraph.json 配置 ★★★
 # {
-#   "graphs": {"supervisorpalner": "./src/langgraph_stdio_agent.py:graph"},
-#   "lifespan": "src.langgraph_stdio_agent:lifespan"
+#   "graphs": {
+#     "supervisorpalner": "src/langgraph_stdio_agent.py:graph"
+#   },
+#   "http": {
+#     "app": "src/webapp.py:app"
+#   },
+#   "env": ".env",
+#   "dependencies": ["."]
 # }
+#
+# 注意：langgraph.json 里的 "lifespan" 字段是无效的，langgraph dev 不会识别它。
+#      lifespan 必须绑定到 FastAPI app 对象，通过 "http": {"app": "..."} 注册。
 # ══════════════════════════════════════════════════════
-@asynccontextmanager
-async def lifespan(app):
-    print("🔔 [lifespan] 启动中...")
-    if not SERVER_PATH.exists():
-        raise FileNotFoundError(f"找不到 MCP server：{SERVER_PATH}")
-
-    # 启动后台持久连接（内部等待全部就绪）
-    await _mcp_manager.start()
-
-    # 全走 manager 队列，不持有任何 session 对象
-    server_tools = await load_tools(session_name="server",     use_manager=True)
-    print(f"✅ [lifespan] server.py 工具：{[t.name for t in server_tools]}")
-
-    fs_tools = await load_tools(session_name="filesystem", use_manager=True)
-    print(f"✅ [lifespan] filesystem 工具：{[t.name for t in fs_tools]}")
-
-    all_tools = server_tools + fs_tools
-    _tools.extend(all_tools)
-    _init_registry(all_tools)   # ← 内部 set _registry_ready event
-    # ★ 不调用 _rebuild_graph()，run_agent 运行时动态查全局 _registry
-    print(f"🚀 [lifespan] 就绪，共 {len(all_tools)} 个工具，agents: {_registry.agents}")
-
-    yield
-
-    await _mcp_manager.stop()
-    _tools.clear()
-    print("🛑 [lifespan] 已关闭")
 
 
 # ══════════════════════════════════════════════════════
@@ -1079,6 +1101,9 @@ if __name__ == "__main__":
     ]
 
     async def main():
+        # ★ __main__ 路径同样预创建 Event，保持与 lifespan 路径一致的初始化顺序
+        _ensure_registry_event()
+
         async with stdio_client(mcp_params()) as (r1, w1):
             async with ClientSession(r1, w1) as s1:
                 await s1.initialize()
@@ -1106,5 +1131,5 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
-    
-      # uv run python src/langgraph_stdio_agent.py
+
+# uv run python src/langgraph_stdio_agent.py

@@ -1,9 +1,10 @@
 {
   "graphs": {
-    "supervisorpalner": "src.langgraph_stdio_agent:graph",
-    "agent": "src.langgraph_agent:graph"
+    "supervisorpalner": "./src/langgraph_stdio_agent.py:graph"
   },
-  "lifespan": "src.langgraph_stdio_agent:lifespan",
+  "http": {
+    "app": "./src/webapp.py:app"
+  },
   "env": ".env",
   "dependencies": ["."]
 }
