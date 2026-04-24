@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from mcp import StdioServerParameters
-from langgraph_stdio_agent import build_supervisor_graph, init_tools
+from langgraph_stdio_agent import build_graph
 
 SERVER_PATH = Path(__file__).parent.parent / "src" / "mcp_server_template" / "server.py"
 
@@ -31,10 +31,9 @@ async def run_evaluation():
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            await init_tools(session)
             print("✅ 工具初始化完成，开始评估...")
 
-            graph = build_supervisor_graph()
+            graph = build_graph()
 
             def target(inputs):
                 messages = inputs["messages"]
@@ -51,10 +50,12 @@ async def run_evaluation():
 
             results = evaluate(
                 target,
-                data="331",
+                data="tonyset",        # ✅ 修改为你的 dataset 名称
                 evaluators=[],
                 experiment_prefix="test-run"
             )
             print(results)
 
 asyncio.run(run_evaluation())
+
+# uv run tests/eval_agent.py
