@@ -7,7 +7,9 @@ from pathlib import Path
 
 # 引用主模块的初始化函数
 from src.langgraph_stdio_agent import (
-    load_tools, _init_registry, _rebuild_graph,
+    load_tools,
+    _init_registry,
+    _rebuild_graph,
     _tools, mcp_params
 )
 from mcp import ClientSession

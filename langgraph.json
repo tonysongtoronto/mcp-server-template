@@ -3,11 +3,7 @@
     "supervisorpalner": "src.langgraph_stdio_agent:graph",
     "agent": "src.langgraph_agent:graph"
   },
-  "http": {
-    "app": "./src/webapp.py:app"
-  },
+  "lifespan": "src.langgraph_stdio_agent:lifespan",
   "env": ".env",
-  "dependencies": [
-    "."
-  ]
+  "dependencies": ["."]
 }
