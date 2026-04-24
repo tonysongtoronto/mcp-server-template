@@ -2,70 +2,37 @@
 src/langgraph_stdio_agent.py
 
 两种运行方式：
-  1. uv run langgraph dev              → langgraph 调用 lifespan 钩子初始化工具
-  2. uv run python src/langgraph_stdio_agent.py  → __main__ 手动初始化工具
+  1. uv run langgraph dev   → langgraph 调用 webapp.py lifespan 拉起子进程 + 初始化 SSE sessions
+  2. python -m src.langgraph_stdio_agent  → __main__ 直接用 stdio_client 初始化工具
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-★ v4 修复说明（相对 v3）
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+★ SSE 版本改造说明（在原有修复基础上新增）：
 
-  【修复 E】彻底解决 _registry_ready 竞态问题
-    根因：
-      _registry_ready 是懒创建的全局变量（初始为 None）。
-      若 run_agent 在 lifespan 调用 _init_registry() 之前被触发，
-      会在 run_agent 里首次调用 _get_registry_ready_event()，
-      此时创建了 Event-A 并 wait；随后 lifespan 里 _init_registry()
-      再次调用 _get_registry_ready_event()，发现变量已非 None（Event-A），
-      ——但实际上在某些竞态路径下 None 检查可能被两个协程同时通过，
-      创建出 Event-A 和 Event-B 两个不同对象，lifespan set 了 Event-B，
-      run_agent 永远在等 Event-A，导致 60s 超时。
+  【改造SSE】前端（langgraph dev）改用 SSE 传输，彻底绕开 Windows ProactorLoop 限制
+   - 原问题：Windows + langgraph dev 使用 SelectorEventLoop，stdio_client 无法 spawn 子进程
+   - 方案：_start_mcp_sessions_sse() 用 sse_client 连接 localhost:8001/8002
+           子进程由 webapp.py lifespan 负责拉起，agent 只做 HTTP 连接，不 spawn 进程
+   - 后端测试路径完全保留：__main__ 仍用 stdio_client，一条命令照跑
 
-    修复方案：
-      · 用单元素列表 _registry_ready_holder: list[asyncio.Event] 替代裸变量。
-        列表对象本身在模块导入时就创建（不含元素），永远不会被替换。
-      · lifespan 启动时（event loop 已确定运行）调用
-        _ensure_registry_event() 预先 append 唯一的 Event 对象。
-      · _get_registry_ready_event() 只从 holder[0] 取，不再创建新对象。
-      · _init_registry() 直接 set holder[0]，保证 set 和 wait 操作
-        作用于同一个 Event 实例，竞态窗口彻底消除。
+  【修复Lock】_lazy_init_lock 改为惰性创建，彻底解决跨 event loop 问题
+   - 原问题：asyncio.Lock() 在模块加载时创建，绑定到主线程 loop
+             langgraph dev 的 uvicorn 启动新 loop 后，Lock.acquire() 永远挂起
+             导致 _ensure_registry() 看似"就绪"实则 registry 永远为空
+   - 方案：_lazy_init_lock 初始为 None，第一次 _ensure_registry() 调用时
+           在当前 loop 里惰性创建，确保 Lock 始终和调用方在同一个 loop
 
-  【修复 F】langgraph.json 只保留一个 graph + 一个 lifespan
-    · 删除多余的 "agent": "src.langgraph_agent:graph" 条目，
-      避免两个 graph 共享单一 lifespan 引发的初始化不确定行为。
-
-  【保持不变】
-    · MCPSessionManager 后台 task 桥接方案（解决跨 task stream 问题）
-    · 并行 Send API 调度（Map-Reduce）
-    · 纯逻辑 BFS 级联跳过失败依赖任务
-
-  ★★★ langgraph.json 配置（只需这一个 graph）★★★
-  {
-    "graphs": {
-      "supervisorpalner": "src.langgraph_stdio_agent:graph"
-    },
-    "lifespan": "src.langgraph_stdio_agent:lifespan",
-    "env": ".env",
-    "dependencies": ["."]
-  }
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  图结构：
-
-  planner ──(FINISH)──→ END
-          ──(ok)──────→ supervisor_dispatch_node
-                              │ list[Send]
-                    ┌─────────┼─────────┐
-                    ▼         ▼         ▼
-               math_agent  file_agent  direct_answer  ...
-                    │         │         │
-                    └────┬────┘─────────┘
-                         ▼
-                    collect_node
-                         │ list[Send]
-                    ┌────┴────┐
-                    ▼         ▼
-             (下一轮)   final_answer ──→ END
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+以下为原有修复（保持不变）：
+  【重构1】移除 router 节点
+  【重构2】direct_answer_node 只回答当前子任务
+  【重构3】planner_node JSON 解析失败重试策略
+  【修复4】supervisor_node in_progress 容错
+  【修复5】_extract_json 统一抽取
+  【修复6】final_answer_node 混合任务时 direct 结果纳入汇总
+  【修复7】强化 Planner 工具感知
+  【修复8】run_agent 工具调用强制兜底
+  【修复9】全局兼容 llm.ainvoke() 返回 dict
+  【修复10】兼容 LangGraph Studio 下 messages 反序列化为 dict
+  【修复11】彻底移除 asyncio.Event，改用 _registry.agents 判断就绪
+  【修复12】_ensure_registry() 调用时机提前到 task_plan 判断之前
 """
 
 import asyncio
@@ -73,23 +40,29 @@ import json
 import os
 import re
 import sys
-from contextlib import asynccontextmanager
+import traceback
+from contextlib import asynccontextmanager, AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Optional, TypedDict
+from typing import Any, Optional, TypedDict
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
-from langgraph.types import Send
 from mcp import ClientSession
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import stdio_client       # 后端测试（__main__）用
+from mcp.client.sse import sse_client           # 前端测试（langgraph dev）用  ← ★ 新增
 from mcp import StdioServerParameters
 from pathlib import Path
 from pydantic import create_model
 
 load_dotenv()
+
+# ★ Windows 下后端测试（__main__）需要 ProactorEventLoop 才能 spawn 子进程。
+#   前端（langgraph dev）走 SSE，不再 spawn 子进程，此设置对前端无害。
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # ══════════════════════════════════════════════════════
 # 1. LLM
@@ -102,20 +75,28 @@ llm = ChatOpenAI(
 )
 
 # ══════════════════════════════════════════════════════
-# 2. MCP server 路径 & 启动参数
+# 2. MCP server 路径 & 启动参数（后端测试用）
 # ══════════════════════════════════════════════════════
 SERVER_PATH = Path(__file__).parent / "mcp_server_template" / "server.py"
+_FS_BASE_DIR = Path(os.getenv("MCP_FS_BASE_DIR", "./File Agent")).resolve()
+
+# ★ SSE 端点配置（前端测试用，由 webapp.py lifespan 拉起对应进程）
+_SERVER_PORT   = int(os.getenv("MCP_SERVER_PORT",   "8001"))
+_FS_PROXY_PORT = int(os.getenv("MCP_FS_PROXY_PORT", "8002"))
+_SERVER_SSE_URL   = f"http://127.0.0.1:{_SERVER_PORT}/sse"
+_FS_PROXY_SSE_URL = f"http://127.0.0.1:{_FS_PROXY_PORT}/sse"
+
 
 def mcp_params() -> StdioServerParameters:
+    """后端测试：以 stdio 模式启动 server.py"""
     return StdioServerParameters(
         command=sys.executable,
         args=["-u", str(SERVER_PATH)],
         env={"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", **os.environ},
     )
 
-_FS_BASE_DIR = Path(os.getenv("MCP_FS_BASE_DIR", "./File Agent")).resolve()
-
 def filesystem_mcp_params() -> StdioServerParameters:
+    """后端测试：以 stdio 模式启动 filesystem MCP"""
     npx_cmd = "npx.cmd" if sys.platform == "win32" else "npx"
     print(f"📂 Filesystem MCP BASE_DIR: {_FS_BASE_DIR}", file=sys.stderr)
     return StdioServerParameters(
@@ -124,9 +105,11 @@ def filesystem_mcp_params() -> StdioServerParameters:
         env={**os.environ},
     )
 
+
 # ══════════════════════════════════════════════════════
 # 3. 动态工具注册表
 # ══════════════════════════════════════════════════════
+
 AGENT_TOOL_PATTERNS: dict[str, list[str]] = {
     "math_agent": ["add_numbers", "multiply_numbers", "subtract_numbers",
                    "divide_numbers", "power*", "sqrt*", "math_*"],
@@ -145,6 +128,17 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
     "data_agent": "数据分析（统计、聚合、分组、过滤等结构化数据处理）",
     "http_agent": "网络请求（GET/POST、访问 URL、调用外部 API）",
     "file_agent": "文件操作（读写文件、列出目录、创建目录、移动/搜索文件）",
+}
+
+AGENT_TRIGGER_KEYWORDS: dict[str, list[str]] = {
+    "math_agent": ["计算", "加", "减", "乘", "除", "求和", "平均", "幂", "开方",
+                   "+", "-", "×", "÷", "*", "/", "²", "√"],
+    "http_agent": ["访问", "请求", "获取", "http", "https", "url", "api",
+                   "fetch", "get ", "post "],
+    "data_agent": ["分析", "统计", "分组", "聚合", "过滤", "排序", "数据集",
+                   "dataframe", "pivot"],
+    "file_agent": ["文件", "目录", "列出", "读取", "写入", "创建", "移动",
+                   "搜索文件", "read_file", "write_file", "list_directory"],
 }
 
 def _match_agent(tool_name: str) -> str:
@@ -183,22 +177,17 @@ class ToolRegistry:
                 lines_tools.append(f"    - {t.name}：{t.description or '（无描述）'}")
 
         lines_agents: list[str] = ["【可用 Agent 列表】"]
-        brief_lines: list[str] = []
+        brief_lines: list[str]  = []
         for agent in reg.agents:
             desc = AGENT_DESCRIPTIONS.get(agent, "通用处理")
             tool_names = [t.name for t in reg._agent_tools.get(agent, [])]
             lines_agents.append(f"  - {agent}：{desc}（工具：{', '.join(tool_names)}）")
             brief_lines.append(f"  · {agent}：{desc}")
-        lines_agents.append(
-            "  - direct：直接用语言模型回答，不调用任何工具"
-            "（仅限：闲聊/问候/概念解释/知识性问答）"
-        )
+        lines_agents.append("  - direct：直接用语言模型回答，不调用任何工具（仅限：闲聊/问候/概念解释/知识性问答）")
 
         reg._tool_desc_block  = "\n".join(lines_tools)
         reg._agent_desc_block = "\n".join(lines_agents)
-        reg._agent_desc_brief = (
-            "\n".join(brief_lines) if brief_lines else "  （暂无已注册的工具 Agent）"
-        )
+        reg._agent_desc_brief = "\n".join(brief_lines) if brief_lines else "  （暂无已注册的工具 Agent）"
 
         print("✅ ToolRegistry 构建完成：")
         for agent, tools in reg._agent_tools.items():
@@ -248,222 +237,192 @@ class Task(TypedDict):
     result: str
     _resolved_description: str
 
-
-def _merge_task_plan(old: list[Task], new: list[Task]) -> list[Task]:
-    merged = {t["task_id"]: t for t in old}
-    for t in new:
-        merged[t["task_id"]] = t
-    return sorted(merged.values(), key=lambda t: t["task_id"])
-
-
 class AgentState(TypedDict):
-    messages:   list
-    task_plan:  Annotated[list[Task], _merge_task_plan]
+    messages: list
+    task_plan: list[Task]
+    current_task_id: int
     next_agent: str
 
 
-class WorkerState(TypedDict):
-    task_plan:       list[Task]
-    current_task_id: int
-    messages:        list
-
-
 # ══════════════════════════════════════════════════════
-# 5. 共享容器 & registry ready event
-#
-# ★ 修复 G（终极方案）：
-#   asyncio.Event 绑定到创建它的 event loop，而 langgraph dev
-#   内部使用多个 loop/线程处理请求（如 asyncio_1 线程），导致
-#   lifespan 里 set() 的 Event 与 run_agent 里 wait() 的 Event
-#   不是同一个对象，永远无法触发。
-#
-#   解决方案：改用 threading.Event，它是跨线程、跨 event loop 安全的。
-#   · _registry_ready_event 在模块导入时（同步上下文）创建，全局唯一。
-#   · lifespan/_init_registry 调用 .set()
-#   · run_agent 用 asyncio.get_event_loop().run_in_executor() 在线程池
-#     里做阻塞等待，不阻塞 event loop。
+# 5. 共享容器
 # ══════════════════════════════════════════════════════
-import threading
-
 _tools: list[StructuredTool] = []
 _registry: ToolRegistry = ToolRegistry()
 
-# ★ 模块级创建，同步上下文，跨 loop/线程安全
-_registry_ready_event: threading.Event = threading.Event()
+# ★ 【修复Lock】_lazy_init_lock 改为惰性创建（None → 首次调用时在当前 loop 创建）。
+#   原来模块加载时直接 asyncio.Lock() 会绑定到主线程 loop，
+#   langgraph dev 用 uvicorn 启动新 loop 后 Lock.acquire() 永远挂起。
+_lazy_init_lock: asyncio.Lock | None = None
+_mcp_exit_stack: AsyncExitStack | None = None
 
 
-def _ensure_registry_event() -> None:
-    """兼容旧调用点，现在是空操作（threading.Event 模块级已创建）。"""
-    pass  # threading.Event 不依赖 event loop，模块导入时已就绪
+async def _ensure_registry() -> None:
+    """
+    ★ 【修复11+12+Lock】三重保险初始化。
 
+    1. 快速路径：_registry.agents 非空则直接返回（纯 Python 属性，跨 loop 安全）
+    2. 惰性创建 Lock：在当前 loop 里创建，确保不跨 loop
+    3. double-check：防并发重复初始化
+    """
+    global _lazy_init_lock
 
-def _get_registry_ready_event() -> threading.Event:
-    """返回全局唯一的 threading.Event 实例。"""
-    return _registry_ready_event
+    # 快速路径
+    if _registry.agents:
+        return
+
+    # ★ 惰性创建 Lock，绑定到调用方当前 loop
+    if _lazy_init_lock is None:
+        _lazy_init_lock = asyncio.Lock()
+
+    async with _lazy_init_lock:
+        if _registry.agents:
+            return
+        print("⚡ [lazy-init] registry 为空，触发 MCP 初始化（SSE 模式）...")
+        await _start_mcp_sessions()
 
 
 # ══════════════════════════════════════════════════════
-# 6. MCPSessionManager
-#
-#   所有 MCP 操作在专属后台 task 里执行，外部通过
-#   asyncio.Queue + Future 桥接，彻底避免跨 task 使用
-#   asyncio stream 导致的工具失效问题。
-#
-#   队列消息格式：
-#     ("list", None,           future)  → session.list_tools()
-#     ("call", (name, kwargs), future)  → session.call_tool(name, kwargs)
-#     None                              → 终止信号
+# MCP Session 管理
 # ══════════════════════════════════════════════════════
 
-class MCPSessionManager:
+async def _start_mcp_sessions() -> None:
+    """
+    ★ 前端路径（langgraph dev）：通过 SSE 连接由 webapp.py lifespan 已拉起的进程。
+    也被 _ensure_registry() 的懒加载路径调用（lifespan 未触发时的兜底）。
 
-    def __init__(self):
-        self._req_queues:    dict[str, asyncio.Queue] = {}
-        self._bg_tasks:      list[asyncio.Task]       = []
-        self._ready_events:  dict[str, asyncio.Event] = {}
-        self._failed_servers: set[str]                = set()  # ★ 记录启动失败的 server
+    SSE 连接完全不 spawn 子进程，彻底绕开 Windows SelectorEventLoop 限制。
+    """
+    global _mcp_exit_stack
+    if _mcp_exit_stack is not None:
+        print("⚠️ [MCP] _start_mcp_sessions 重复调用，跳过")
+        return
 
-    async def start(self) -> None:
-        """启动所有后台 MCP 连接，等待全部就绪后返回。
-        单个 server 启动失败只打印警告，不抛出异常，避免阻塞整个 lifespan。
-        """
-        configs: dict[str, StdioServerParameters] = {
-            "server":     mcp_params(),
-            "filesystem": filesystem_mcp_params(),
-        }
-        for name, params in configs.items():
-            self._req_queues[name]   = asyncio.Queue()
-            self._ready_events[name] = asyncio.Event()
-            task = asyncio.create_task(
-                self._run_session(name, params),
-                name=f"mcp-bg-{name}",
-            )
-            self._bg_tasks.append(task)
+    print(f"🔍 [MCP] platform={sys.platform}  python={sys.executable}")
+    print(f"🔍 [MCP] server SSE URL:     {_SERVER_SSE_URL}")
+    print(f"🔍 [MCP] filesystem SSE URL: {_FS_PROXY_SSE_URL}")
 
-        for name, event in self._ready_events.items():
-            try:
-                await asyncio.wait_for(event.wait(), timeout=60)
-                # 检查后台 task 是否因异常提前退出（此时 event 被 set 但 session 无效）
-                bg_task = next((t for t in self._bg_tasks if t.get_name() == f"mcp-bg-{name}"), None)
-                if bg_task and bg_task.done() and bg_task.exception():
-                    raise bg_task.exception()
-                print(f"✅ [MCPSessionManager] '{name}' 后台 session 就绪")
-            except asyncio.TimeoutError:
-                print(f"⚠️ [MCPSessionManager] '{name}' 启动超时（60s），跳过该 server", file=sys.stderr)
-                self._failed_servers.add(name)
-            except Exception as exc:
-                print(f"⚠️ [MCPSessionManager] '{name}' 启动失败：{exc}，跳过该 server", file=sys.stderr)
-                self._failed_servers.add(name)
+    stack = AsyncExitStack()
+    all_tools: list[StructuredTool] = []
 
-    async def stop(self) -> None:
-        """向所有后台 task 发送终止信号并等待退出。"""
-        for q in self._req_queues.values():
-            await q.put(None)
-        for task in self._bg_tasks:
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=5)
-            except Exception:
-                task.cancel()
-        print("🛑 [MCPSessionManager] 所有后台 session 已关闭")
+    # ── server.py MCP（SSE）──────────────────────────────
+    try:
+        r1, w1 = await stack.enter_async_context(sse_client(_SERVER_SSE_URL))
+        s1     = await stack.enter_async_context(ClientSession(r1, w1))
+        await s1.initialize()
+        server_tools = await load_tools(s1)
+        print(f"✅ [MCP] server.py 工具：{[t.name for t in server_tools]}")
+        all_tools.extend(server_tools)
+    except Exception as exc:
+        print(f"❌ [MCP] server.py SSE 连接失败：{exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
-    async def list_tools_for(self, session_name: str) -> Any:
-        """跨 task 安全地获取工具列表。"""
-        return await self._dispatch(session_name, "list", None)
+    # ── filesystem MCP（SSE via mcp-proxy）───────────────
+    try:
+        r2, w2 = await stack.enter_async_context(sse_client(_FS_PROXY_SSE_URL))
+        s2     = await stack.enter_async_context(ClientSession(r2, w2))
+        await s2.initialize()
+        fs_tools = await load_tools(s2)
+        print(f"✅ [MCP] filesystem 工具：{[t.name for t in fs_tools]}")
+        all_tools.extend(fs_tools)
+    except Exception as exc:
+        print(f"⚠️ [MCP] filesystem SSE 连接失败（降级，无 file_agent）：{exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
-    async def call_tool(self, session_name: str, tool_name: str, kwargs: dict) -> Any:
-        """跨 task 安全的工具调用入口。"""
-        return await self._dispatch(session_name, "call", (tool_name, kwargs))
-
-    async def _dispatch(self, session_name: str, op: str, payload: Any) -> Any:
-        if session_name in self._failed_servers:
-            raise RuntimeError(f"MCPSessionManager: server '{session_name}' 启动失败，无法调用")
-        q = self._req_queues.get(session_name)
-        if q is None:
-            raise RuntimeError(f"MCPSessionManager: 未知 session '{session_name}'")
-        loop = asyncio.get_event_loop()
-        fut: asyncio.Future = loop.create_future()
-        q.put_nowait((op, payload, fut))
-        result = await fut
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    async def _run_session(self, name: str, params: StdioServerParameters) -> None:
-        """
-        后台专属 task：维持 stdio_client 生命周期，
-        串行处理所有 list / call 请求。
-        """
-        req_q = self._req_queues[name]
-        ready = self._ready_events[name]
+    # ── 提交结果 ─────────────────────────────────────────
+    if not all_tools:
+        print("❌ [MCP] 全部 MCP 连接失败，registry 未就绪，下次请求将重试", file=sys.stderr)
         try:
-            async with stdio_client(params) as (r, w):
-                async with ClientSession(r, w) as session:
-                    await session.initialize()
-                    ready.set()   # ★ session 完全就绪后才 set
+            await stack.aclose()
+        except Exception:
+            pass
+        return
 
-                    while True:
-                        item = await req_q.get()
-                        if item is None:
-                            break
-                        op, payload, fut = item
-                        if fut.cancelled():
-                            continue
-                        try:
-                            if op == "list":
-                                res = await session.list_tools()
-                            elif op == "call":
-                                tool_name, kwargs = payload
-                                res = await session.call_tool(tool_name, kwargs)
-                            else:
-                                res = RuntimeError(f"未知操作：{op}")
-                            fut.set_result(res)
-                        except Exception as exc:
-                            if not fut.done():
-                                fut.set_exception(exc)
-
-        except Exception as exc:
-            print(f"❌ [MCPSessionManager] '{name}' session 异常：{exc}", file=sys.stderr)
-            if not ready.is_set():
-                ready.set()   # 避免 start() 永久阻塞
-            # 排空队列，全部返回异常
-            while not req_q.empty():
-                item = req_q.get_nowait()
-                if item is None:
-                    break
-                _, _, fut = item
-                if not fut.done():
-                    fut.set_exception(exc)
+    _mcp_exit_stack = stack
+    _tools.clear()
+    _tools.extend(all_tools)
+    _init_registry(all_tools)
+    print(f"🚀 [MCP] 就绪，共 {len(all_tools)} 个工具，agents: {_registry.agents}")
 
 
-_mcp_manager = MCPSessionManager()
-
-
-# ══════════════════════════════════════════════════════
-# 7. 工具加载
-# ══════════════════════════════════════════════════════
-async def load_tools(
-    session: "ClientSession | None" = None,
-    session_name: str = "",
-    use_manager: bool = False,
-) -> list[StructuredTool]:
+async def _start_mcp_sessions_stdio() -> None:
     """
-    构建 StructuredTool 列表。
-
-    use_manager=True  （langgraph dev 前台）：
-      list_tools 和 call_tool 全部通过 MCPSessionManager 队列执行，
-      工具闭包不持有任何 session 对象，跨 task 完全安全。
-
-    use_manager=False （__main__ 直接运行）：
-      直接使用传入的 session 对象，保持原有行为。
+    ★ 后端路径（__main__ 直接运行）：用 stdio_client spawn 子进程。
+    仅在 __main__ 里调用，前端路径不使用此函数。
     """
-    if use_manager:
-        raw = (await _mcp_manager.list_tools_for(session_name)).tools
+    global _mcp_exit_stack
+    if _mcp_exit_stack is not None:
+        return
+
+    print(f"🔍 [MCP-stdio] SERVER_PATH = {SERVER_PATH}  (exists={SERVER_PATH.exists()})")
+    print(f"🔍 [MCP-stdio] FS_BASE_DIR = {_FS_BASE_DIR}  (exists={_FS_BASE_DIR.exists()})")
+    print(f"🔍 [MCP-stdio] platform={sys.platform}  python={sys.executable}")
+
+    stack = AsyncExitStack()
+    all_tools: list[StructuredTool] = []
+
+    # ── server.py MCP（stdio）────────────────────────────
+    if not SERVER_PATH.exists():
+        print(f"❌ [MCP-stdio] 找不到 MCP server：{SERVER_PATH}", file=sys.stderr)
     else:
-        assert session is not None
-        raw = (await session.list_tools()).tools
+        try:
+            r1, w1 = await stack.enter_async_context(stdio_client(mcp_params()))
+            s1     = await stack.enter_async_context(ClientSession(r1, w1))
+            await s1.initialize()
+            server_tools = await load_tools(s1)
+            print(f"✅ [MCP-stdio] server.py 工具：{[t.name for t in server_tools]}")
+            all_tools.extend(server_tools)
+        except Exception as exc:
+            print(f"❌ [MCP-stdio] server.py 启动失败：{exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
+    # ── filesystem MCP（stdio）────────────────────────────
+    try:
+        r2, w2 = await stack.enter_async_context(stdio_client(filesystem_mcp_params()))
+        s2     = await stack.enter_async_context(ClientSession(r2, w2))
+        await s2.initialize()
+        fs_tools = await load_tools(s2)
+        print(f"✅ [MCP-stdio] filesystem 工具：{[t.name for t in fs_tools]}")
+        all_tools.extend(fs_tools)
+    except Exception as exc:
+        print(f"⚠️ [MCP-stdio] filesystem MCP 启动失败：{exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print(f"    提示：请确认 npx 已安装且在 PATH 中，BASE_DIR={_FS_BASE_DIR} 存在",
+              file=sys.stderr)
+
+    if not all_tools:
+        print("❌ [MCP-stdio] 全部 MCP 连接失败", file=sys.stderr)
+        try:
+            await stack.aclose()
+        except Exception:
+            pass
+        return
+
+    _mcp_exit_stack = stack
+    _tools.clear()
+    _tools.extend(all_tools)
+    _init_registry(all_tools)
+    print(f"🚀 [MCP-stdio] 就绪，共 {len(all_tools)} 个工具，agents: {_registry.agents}")
+
+
+async def _stop_mcp_sessions() -> None:
+    global _mcp_exit_stack, _lazy_init_lock
+    if _mcp_exit_stack is not None:
+        await _mcp_exit_stack.aclose()
+        _mcp_exit_stack = None
+    _tools.clear()
+    _init_registry([])
+    # ★ 重置 Lock，下次启动时在新 loop 中重新创建
+    _lazy_init_lock = None
+    print("🛑 [MCP] 所有 session 已关闭")
+
+
+# ══════════════════════════════════════════════════════
+# 6. 工具加载
+# ══════════════════════════════════════════════════════
+async def load_tools(session: ClientSession) -> list[StructuredTool]:
     lc_tools: list[StructuredTool] = []
-    for t in raw:
+    for t in (await session.list_tools()).tools:
         schema   = t.inputSchema or {}
         required = set(schema.get("required", []))
         fields   = {
@@ -473,51 +432,31 @@ async def load_tools(
         DynSchema = create_model(f"{t.name}_schema", **fields) if fields else None
         tool_name = t.name
 
-        if use_manager:
-            _sname = session_name
+        async def _call(_name=tool_name, **kwargs) -> str:
+            print(f"    🔧 [MCP] {_name}({kwargs})")
+            res  = await session.call_tool(_name, kwargs)
+            text = res.content[0].text if res.content else "（无结果）"
+            print(f"    ✅ {text[:200]}")
+            return text
 
-            async def _call_via_manager(
-                _name: str = tool_name, _sn: str = _sname, **kwargs
-            ) -> str:
-                print(f"    🔧 [MCP/{_sn}] {_name}({kwargs})")
-                res  = await _mcp_manager.call_tool(_sn, _name, kwargs)
-                text = res.content[0].text if res.content else "（无结果）"
-                print(f"    ✅ {text[:200]}")
-                return text
+        lc_tools.append(StructuredTool.from_function(
+            coroutine=_call, name=t.name,
+            description=t.description or "", args_schema=DynSchema,
+        ))
 
-            lc_tools.append(StructuredTool.from_function(
-                coroutine=_call_via_manager, name=t.name,
-                description=t.description or "", args_schema=DynSchema,
-            ))
-        else:
-            async def _call(_name: str = tool_name, **kwargs) -> str:
-                print(f"    🔧 [MCP] {_name}({kwargs})")
-                res  = await session.call_tool(_name, kwargs)  # type: ignore[union-attr]
-                text = res.content[0].text if res.content else "（无结果）"
-                print(f"    ✅ {text[:200]}")
-                return text
-
-            lc_tools.append(StructuredTool.from_function(
-                coroutine=_call, name=t.name,
-                description=t.description or "", args_schema=DynSchema,
-            ))
-
-    print(f"✅ [{session_name or 'direct'}] 已加载 {len(lc_tools)} 个工具："
-          f"{[t.name for t in lc_tools]}")
+    print(f"✅ 已加载 {len(lc_tools)} 个工具：{[t.name for t in lc_tools]}")
     return lc_tools
 
 
 def _init_registry(tools: list[StructuredTool]) -> None:
     global _registry
-    _registry = ToolRegistry.build(tools)
-    # ★ threading.Event.set() 跨线程/跨 loop 安全
-    _registry_ready_event.set()
-    print("✅ [registry] _registry_ready event 已触发")
+    _registry = ToolRegistry.build(tools) if tools else ToolRegistry()
 
 
 # ══════════════════════════════════════════════════════
 # 公共工具函数
 # ══════════════════════════════════════════════════════
+
 def _extract_json(raw: str) -> str:
     raw = raw.strip()
     if "```" in raw:
@@ -549,7 +488,7 @@ def _get_message_content(msg: Any) -> str:
     return str(msg)
 
 
-def _get_first_user_message(state: AgentState) -> Any:
+def _get_first_user_message(state: "AgentState") -> Any:
     msgs = state.get("messages", [])
     if not msgs:
         return HumanMessage(content="")
@@ -559,9 +498,20 @@ def _get_first_user_message(state: AgentState) -> Any:
     return msg
 
 
+def _task_needs_tool_agent(description: str) -> str | None:
+    desc_lower = description.lower()
+    for agent, keywords in AGENT_TRIGGER_KEYWORDS.items():
+        if agent not in _registry.agents:
+            continue
+        if any(kw.lower() in desc_lower for kw in keywords):
+            return agent
+    return None
+
+
 # ══════════════════════════════════════════════════════
-# 8. Planner
+# 7. Planner
 # ══════════════════════════════════════════════════════
+
 def _planner_system() -> str:
     valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用工具 Agent）"
     return f"""你是任务规划器。把用户问题拆解为有序子任务列表。
@@ -572,40 +522,51 @@ def _planner_system() -> str:
 
 ━━ agent 选择规则（严格遵守，违反将导致系统错误）━━
 
+【重要】agent 的选择直接决定是否调用工具，请仔细判断：
+
 ✅ 必须使用工具 agent 的情况：
   - 任何数值计算（加、减、乘、除、幂、开方等）→ math_agent
   - 任何网络请求（访问 URL、调用 HTTP API、fetch 等）→ http_agent
   - 任何数据分析（统计、分组、聚合、过滤等）→ data_agent
-  - 任何文件操作（读文件、写文件、列目录、创建目录、移动文件、搜索文件）→ file_agent
 
-❌ 严禁使用 direct 的情况：
-  - "计算 3+5" → 必须用 math_agent
-  - "访问 https://..." → 必须用 http_agent
-  - "分析这批数据" → 必须用 data_agent
-  - "读取/写入/列出文件或目录" → 必须用 file_agent
+❌ 严禁使用 direct 的情况（以下场景必须用工具 agent）：
+  - "计算 3+5" → 必须用 math_agent（不能自己算，必须调工具）
+  - "访问 https://..." → 必须用 http_agent（不能模拟，必须真实请求）
+  - "分析这批数据" → 必须用 data_agent（不能自行统计，必须调工具）
 
 ✅ 可以使用 direct 的情况（仅限以下场景）：
   - 闲聊、问候（如"你好"、"介绍一下你自己"）
   - 纯知识性问答（如"什么是加权平均数"）
-  - 不涉及任何计算、网络请求、数据处理、文件操作的场景
+  - 不涉及任何计算、网络请求、数据处理的场景
 
-━━ 其他规则 ━━
+判断口诀：只要涉及"算数字"、"访问网络"、"处理数据"，一律用工具 agent，绝不用 direct。
+
+━━ 其他规则（严格遵守）━━
 1. description 只写任务意图，绝不提前计算数值或给出最终答案
 2. inputs 声明运行时需要从哪些前置任务获取参数：
-   - key   = 参数的语义名称
-   - value = {{"from_task": [被依赖的task_id], "field": "result"}}
+   - key   = 参数的语义名称（如"加数A"、"被乘数"），供 Agent 理解用途
+   - value = {{"from_task": <被依赖的task_id>, "field": "result"}}
 3. depends_on 从 inputs 的 from_task 自动推导
 4. 没有依赖的任务：inputs 为 {{}}，depends_on 为 []
 5. 同一个 agent 可出现多次
 6. 任务按拓扑顺序排列（被依赖的任务排在前面）
-7. 如果用户消息中已直接包含数据，不要单独拆"获取数据"任务
+7. 如果用户消息中已直接包含数据（JSON 数组、数字、文本等），
+   不要单独拆"获取数据"任务，直接在处理任务的 description 里完整引用
 
-严格只输出 JSON 数组，不要有任何其他内容、代码块标记或说明文字。
-
-<example>
+严格只输出 JSON 数组，不要有任何其他内容、代码块标记或说明文字。示例：
 [
   {{
     "task_id": 0,
+    "description": "用户打招呼，介绍自己叫 tony",
+    "agent": "direct",
+    "inputs": {{}},
+    "depends_on": [],
+    "status": "pending",
+    "result": "",
+    "_resolved_description": ""
+  }},
+  {{
+    "task_id": 1,
     "description": "计算 88 加 12",
     "agent": "math_agent",
     "inputs": {{}},
@@ -615,45 +576,78 @@ def _planner_system() -> str:
     "_resolved_description": ""
   }},
   {{
-    "task_id": 1,
+    "task_id": 2,
     "description": "把前一步的结果乘以 5",
     "agent": "math_agent",
     "inputs": {{
-      "被乘数": {{"from_task": 0, "field": "result"}}
+      "被乘数": {{"from_task": 1, "field": "result"}}
     }},
-    "depends_on": [0],
+    "depends_on": [1],
+    "status": "pending",
+    "result": "",
+    "_resolved_description": ""
+  }},
+  {{
+    "task_id": 3,
+    "description": "访问 https://api.github.com/zen 获取随机箴言",
+    "agent": "http_agent",
+    "inputs": {{}},
+    "depends_on": [],
     "status": "pending",
     "result": "",
     "_resolved_description": ""
   }}
 ]
-</example>"""
+
+注意：上面示例中"计算 88 加 12"用了 math_agent，"访问 URL"用了 http_agent，这是正确的。
+绝对不能把这类任务写成 agent="direct"。"""
 
 
 def _planner_retry_system(attempt: int, last_raw: str) -> str:
     if attempt == 1:
         return (
             f"{_planner_system()}\n\n"
-            f"⚠️ 你上一次的输出 JSON 解析失败。\n"
-            f"上次输出片段：\n{last_raw[:200]}\n\n"
-            "请只输出合法的 JSON 数组，不要包含任何代码块标记或说明文字。"
+            f"⚠️ 注意：你上一次的输出 JSON 解析失败，无法被程序解析。\n"
+            f"上次输出片段（前200字符）：\n{last_raw[:200]}\n\n"
+            f"请检查并修正，确保只输出合法的 JSON 数组，"
+            f"不要包含任何代码块标记（如 ```json）、说明文字或多余字符。"
         )
     else:
         valid_agents = ", ".join(_registry.agents) if _registry.agents else "direct"
         return (
-            "你是任务规划器。严格按以下要求输出：\n\n"
-            "1. 只输出一个 JSON 数组\n"
-            "2. 不要任何多余文字、代码块标记、注释\n"
-            f"3. agent 只能是：{valid_agents}, direct\n"
-            "4. 每个任务对象必须包含：\n"
+            "你是任务规划器。严格按照以下要求输出，不得有任何偏差：\n\n"
+            "1. 只输出一个 JSON 数组，数组里是任务对象\n"
+            "2. 不要输出任何其他文字、代码块标记、注释\n"
+            f"3. agent 只能是以下值之一：{valid_agents}, direct\n"
+            "4. 每个任务对象必须包含这些字段：\n"
             '   task_id(int), description(str), agent(str), inputs(dict),\n'
             '   depends_on(list), status("pending"), result(""), _resolved_description("")\n\n'
-            f"⚠️ 上次输出仍解析失败，片段：{last_raw[:200]}\n\n"
-            "用户问题：请重新规划。"
+            f"⚠️ 上次输出仍然解析失败，片段：{last_raw[:200]}\n\n"
+            f"用户问题：请重新规划。"
         )
 
 
+def _validate_and_fix_task_plan(task_plan: list[Task]) -> list[Task]:
+    fixed_count = 0
+    for task in task_plan:
+        if task.get("agent") != "direct":
+            continue
+        description = task.get("description", "")
+        recommended = _task_needs_tool_agent(description)
+        if recommended:
+            print(f"  🔧 [合规校验] 任务[{task['task_id']}] agent: direct → {recommended}")
+            print(f"     原因：描述含工具关键词，描述={description[:60]}")
+            task["agent"] = recommended
+            fixed_count += 1
+    if fixed_count:
+        print(f"  ⚠️ 合规校验共修正 {fixed_count} 个任务的 agent 分配")
+    return task_plan
+
+
 async def planner_node(state: AgentState) -> AgentState:
+    # ★ 【修复12】_ensure_registry() 必须在 task_plan 判断之前调用
+    await _ensure_registry()
+
     if state.get("task_plan"):
         return state
 
@@ -662,14 +656,14 @@ async def planner_node(state: AgentState) -> AgentState:
     user_message = _get_first_user_message(state)
     last_raw     = ""
     task_plan: list[Task] | None = None
+    max_attempts = 3
 
-    for attempt in range(3):
-        sys_msg = SystemMessage(
-            content=_planner_system() if attempt == 0
-            else _planner_retry_system(attempt, last_raw)
-        )
-        if attempt > 0:
-            print(f"  🔁 Planner 第 {attempt + 1} 次重试...")
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            sys_msg = SystemMessage(content=_planner_system())
+        else:
+            print(f"  🔁 Planner 第 {attempt + 1} 次重试（JSON 解析失败）...")
+            sys_msg = SystemMessage(content=_planner_retry_system(attempt, last_raw))
 
         response = await llm.ainvoke([sys_msg, user_message])
         raw = _extract_json(_extract_llm_content(response).strip())
@@ -680,193 +674,278 @@ async def planner_node(state: AgentState) -> AgentState:
             if not isinstance(parsed, list):
                 raise json.JSONDecodeError("期望 JSON 数组", raw, 0)
             task_plan = parsed
-            print(f"  ✅ 拆解出 {len(task_plan)} 个任务（第 {attempt + 1} 次成功）：")
+            print(f"  ✅ 拆解出 {len(task_plan)} 个任务（第 {attempt + 1} 次尝试成功）：")
             for t in task_plan:
-                deps    = t.get("depends_on", [])
-                inputs  = t.get("inputs", {})
-                dep_str = f"  依赖→{deps} 参数→{list(inputs.keys())}" if deps else ""
-                desc    = t["description"]
-                desc    = (desc[:60] + "…") if len(desc) > 60 else desc
-                print(f"     [{t['task_id']}] {t['agent']} ← {desc}{dep_str}")
+                deps         = t.get("depends_on", [])
+                inputs       = t.get("inputs", {})
+                dep_str      = f"  依赖→{deps} 参数→{list(inputs.keys())}" if deps else ""
+                desc_preview = (
+                    t["description"][:60] + "…"
+                    if len(t["description"]) > 60
+                    else t["description"]
+                )
+                print(f"     [{t['task_id']}] {t['agent']} ← {desc_preview}{dep_str}")
             break
+
         except (json.JSONDecodeError, KeyError) as e:
-            print(f"  ⚠️ 第 {attempt + 1} 次解析失败：{e}")
+            print(f"  ⚠️ 第 {attempt + 1} 次解析失败：{e}  输出片段：{raw[:100]}")
 
     if task_plan is None:
         print("  ❌ Planner 连续 3 次解析失败，终止流程")
+        agent_scope = _registry.agent_desc_brief
+        failure_msg = (
+            "⚠️ 任务规划失败，无法处理您的请求。\n\n"
+            "━━ 失败详情 ━━\n"
+            f"原因：Planner 连续 {max_attempts} 次均无法生成合法的任务计划（JSON 格式错误）\n"
+            f"最后一次输出片段：\n  {last_raw[:200]}{'…' if len(last_raw) > 200 else ''}\n\n"
+            "━━ 可能的原因 ━━\n"
+            "  · 问题描述过于复杂或存在歧义，导致模型输出不稳定\n"
+            "  · 问题中包含特殊字符或格式干扰了 JSON 输出\n"
+            "  · 请求超出了当前可用工具的处理范围\n\n"
+            "━━ 当前可用能力 ━━\n"
+            f"{agent_scope}\n\n"
+            "建议：请尝试换一种更简洁清晰的方式重新描述您的问题。"
+        )
         return {
             **state,
-            "messages":   state["messages"] + [AIMessage(content=(
-                "⚠️ 任务规划失败，Planner 连续 3 次无法生成合法计划。\n"
-                "建议换一种更简洁清晰的方式描述您的问题。"
-            ))],
-            "task_plan":  [],
-            "next_agent": "FINISH",
+            "messages":        state["messages"] + [AIMessage(content=failure_msg)],
+            "task_plan":       [],
+            "current_task_id": 0,
+            "next_agent":      "FINISH",
         }
 
-    return {**state, "task_plan": task_plan, "next_agent": ""}
+    task_plan = _validate_and_fix_task_plan(task_plan)
+
+    return {
+        **state,
+        "task_plan":       task_plan,
+        "current_task_id": 0,
+        "next_agent":      "",
+    }
 
 
 # ══════════════════════════════════════════════════════
-# 9. Supervisor（并行调度器）
+# 8. Supervisor
 # ══════════════════════════════════════════════════════
-def _resolve_task_inputs(task: Task, done_map: dict[int, Task]) -> None:
-    resolved: dict[str, str] = {}
-    for param_name, source in task.get("inputs", {}).items():
-        if not isinstance(source, dict) or "from_task" not in source:
+async def supervisor_node(state: AgentState) -> AgentState:
+    task_plan: list[Task] = state.get("task_plan", [])
+    done_map = {t["task_id"]: t for t in task_plan if t["status"] == "done"}
+
+    for task in task_plan:
+        if task["status"] not in ("pending", "in_progress"):
             continue
-        src_task = done_map.get(source["from_task"], {})
-        resolved[param_name] = src_task.get(source.get("field", "result"), "")
 
-    if resolved:
-        params_text = "\n".join(f"  {k} = {v}" for k, v in resolved.items())
-        task["_resolved_description"] = (
-            f"{task['description']}\n\n【运行时参数】\n{params_text}"
-        )
-    else:
-        task["_resolved_description"] = task["description"]
+        unmet = [dep for dep in task.get("depends_on", []) if dep not in done_map]
+        if unmet:
+            print(f"\n  ⏳ 任务[{task['task_id']}] 等待依赖 {unmet}，跳过")
+            continue
 
+        if task.get("agent") == "direct":
+            print(f"\n  🧭 Supervisor → direct_answer（任务[{task['task_id']}]）")
+            print(f"     意图：{task['description'][:80]}")
+            task["status"] = "in_progress"
+            return {
+                **state,
+                "next_agent":      "direct_answer",
+                "current_task_id": task["task_id"],
+                "task_plan":       task_plan,
+            }
 
-def supervisor_dispatch(state: AgentState) -> list[Send]:
-    task_plan = state.get("task_plan", [])
-    done_map  = {t["task_id"]: t for t in task_plan if t["status"] == "done"}
+        print(f"\n  🧭 Supervisor → {task['agent']}（任务[{task['task_id']}]）")
+        print(f"     {task.get('_resolved_description', task['description']).replace(chr(10), ' | ')}")
 
-    ready_tasks = [
-        t for t in task_plan
-        if t["status"] == "pending"
-        and all(dep in done_map for dep in t.get("depends_on", []))
-    ]
+        resolved_inputs: dict[str, str] = {}
+        for param_name, source in task.get("inputs", {}).items():
+            from_id   = source["from_task"]
+            src_field = source.get("field", "result")
+            src_task  = done_map.get(from_id, {})
+            resolved_inputs[param_name] = src_task.get(src_field, "")
 
-    if not ready_tasks:
-        stuck = [t for t in task_plan if t["status"] == "pending"]
-        if stuck:
-            print(f"\n  ⚠️ 任务 {[t['task_id'] for t in stuck]} 依赖无法满足，强制跳过")
-            for t in stuck:
-                t["status"] = "done"
-                t["result"] = "⚠️ 依赖未满足，跳过"
-        print("\n  🧭 Supervisor → final_answer（无更多就绪任务）")
-        return [Send("final_answer", state)]
-
-    print(f"\n  🚀 本轮并行分发 {len(ready_tasks)} 个任务：")
-    sends: list[Send] = []
-    for task in ready_tasks:
-        task["status"] = "in_progress"
-        _resolve_task_inputs(task, done_map)
-        target = task["agent"] if task["agent"] != "direct" else "direct_answer"
-        print(f"     [{task['task_id']}] → {target}: {task['description'][:55]}")
-        sends.append(Send(target, {
-            "task_plan":       task_plan,
-            "current_task_id": task["task_id"],
-            "messages":        state.get("messages", []),
-        }))
-
-    return sends
-
-
-# ══════════════════════════════════════════════════════
-# 10. Replanner（纯逻辑失败检测）
-# ══════════════════════════════════════════════════════
-_FAILURE_MARKERS = ("❌", "Error", "error", "失败", "timeout",
-                    "⚠️ 依赖", "exception", "Exception")
-
-def _is_task_failed(result: str) -> bool:
-    return any(marker in result for marker in _FAILURE_MARKERS)
-
-
-def _cascade_skip(task_plan: list[Task], failed_id: int) -> None:
-    to_skip: set[int] = set()
-    queue = [failed_id]
-    while queue:
-        current = queue.pop()
-        for task in task_plan:
-            if (task["status"] == "pending"
-                    and current in task.get("depends_on", [])
-                    and task["task_id"] not in to_skip):
-                to_skip.add(task["task_id"])
-                queue.append(task["task_id"])
-    for task in task_plan:
-        if task["task_id"] in to_skip:
-            task["status"] = "done"
-            task["result"] = f"⚠️ 跳过：依赖任务[{failed_id}]执行失败"
-            print(f"     → 任务[{task['task_id']}]({task['description'][:40]}) 已跳过")
-
-
-def _check_and_cascade_failures(task_plan: list[Task]) -> None:
-    for task in task_plan:
-        if (task["status"] == "done"
-                and _is_task_failed(task.get("result", ""))
-                and not task["result"].startswith("⚠️ 跳过：")):
-            print(f"  ⚠️ Re-Planner：任务[{task['task_id']}] 失败，触发级联跳过")
-            _cascade_skip(task_plan, task["task_id"])
-
-
-# ══════════════════════════════════════════════════════
-# 11. Collect 汇聚节点
-# ══════════════════════════════════════════════════════
-def collect_node(state: AgentState) -> AgentState:
-    task_plan     = state.get("task_plan", [])
-    done_count    = sum(1 for t in task_plan if t["status"] == "done")
-    pending_count = sum(1 for t in task_plan if t["status"] == "pending")
-    print(f"\n  📥 collect_node：已完成 {done_count} 个，待执行 {pending_count} 个")
-    _check_and_cascade_failures(task_plan)
-    return {**state, "task_plan": task_plan}
-
-
-# ══════════════════════════════════════════════════════
-# 12. 通用工具 Agent 执行器
-# ══════════════════════════════════════════════════════
-async def run_agent(state: WorkerState, agent_name: str, system_prompt: str) -> dict:
-    # ★ 修复 G：用 threading.Event + run_in_executor 等待，
-    #   跨 event loop / 跨线程安全，彻底避免 asyncio.Event 跨 loop 失效问题。
-    if not _registry.agents:
-        print(f"  ⏳ [{agent_name}] _registry 尚未就绪，等待 lifespan 初始化...")
-        try:
-            loop = asyncio.get_event_loop()
-            ready = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: _registry_ready_event.wait(timeout=60)),
-                timeout=65,
+        if resolved_inputs:
+            params_text = "\n".join(f"  {k} = {v}" for k, v in resolved_inputs.items())
+            task["_resolved_description"] = (
+                f"{task['description']}\n\n"
+                f"【运行时参数】\n{params_text}"
             )
-            if not _registry_ready_event.is_set():
-                print(f"  ❌ [{agent_name}] 等待 _registry 超时（60s）")
-            else:
-                print(f"  ✅ [{agent_name}] _registry 已就绪，继续执行")
-        except asyncio.TimeoutError:
-            print(f"  ❌ [{agent_name}] 等待 _registry 超时（60s）")
+        else:
+            task["_resolved_description"] = task["description"]
 
+        if task["agent"] not in _registry.agents:
+            print(f"  ❌ [{task['agent']}] 未在 registry 中注册，跳过任务[{task['task_id']}]")
+            print(f"     当前可用 agents: {_registry.agents}")
+            task["status"] = "done"
+            task["result"] = (
+                f"⚠️ {task['agent']} 未注册（可能 MCP 未启动）。"
+                f"可用 agents: {_registry.agents}"
+            )
+            continue
+
+        return {
+            **state,
+            "next_agent":      task["agent"],
+            "current_task_id": task["task_id"],
+            "task_plan":       task_plan,
+        }
+
+    pending = [t for t in task_plan if t["status"] == "pending"]
+    if pending:
+        print(f"\n  ⚠️ 任务 {[t['task_id'] for t in pending]} 依赖无法满足，强制跳过")
+        for t in pending:
+            t["status"] = "done"
+            t["result"] = "⚠️ 依赖未满足，跳过"
+
+    print("\n  🧭 Supervisor → FINISH")
+    return {**state, "next_agent": "FINISH", "task_plan": task_plan}
+
+
+# ══════════════════════════════════════════════════════
+# 9. Re-Planner
+# ══════════════════════════════════════════════════════
+def _replanner_system() -> str:
+    valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用 Agent）"
+    return f"""你是任务再规划器。在每个工具子任务完成后，你需要判断是否需要调整剩余计划。
+
+{_registry.agent_desc_block}
+
+你会收到：
+1. 用户的原始问题
+2. 已完成任务的结果摘要
+3. 还未执行的 pending 任务列表
+
+你的决策：
+
+【情况A】计划不需要调整（绝大多数情况）
+直接输出：{{"action": "continue"}}
+
+【情况B】需要调整剩余计划（仅当出现以下情况时）
+- 某个任务的结果表明后续任务的方向需要改变
+- 发现原计划遗漏了必要步骤
+- 某个任务失败，需要用替代方案
+输出修改后的完整 pending 任务列表：
+{{"action": "replan", "new_pending_tasks": [...]}}
+
+注意事项：
+- new_pending_tasks 是完整的新 pending 列表，会替换掉所有旧的 pending 任务
+- task_id 从当前已完成任务的最大 id + 1 开始重新编号
+- inputs 里的 from_task 如果引用已完成任务，task_id 保持原来的值不变
+- status 统一写 "pending"，result 和 _resolved_description 写空字符串
+- agent 只能是：{valid_agents}（replan 时不应产生 direct 任务）
+- 不要新增任何"等待用户输入"、"获取数据"、"读取数据"类的占位任务
+- 如果不确定要不要 replan，选择 continue
+
+严格只输出 JSON，不要有任何其他内容。"""
+
+
+async def replanner_node(state: AgentState) -> AgentState:
+    task_plan: list[Task] = state.get("task_plan", [])
+    current_task_id: int  = state.get("current_task_id", -1)
+
+    done_tasks    = [t for t in task_plan if t["status"] == "done"]
+    pending_tasks = [t for t in task_plan if t["status"] == "pending"]
+
+    if not pending_tasks:
+        print("\n  🔄 Re-Planner：无剩余任务，跳过")
+        return state
+
+    done_summary    = "\n".join(
+        f"  任务[{t['task_id']}]（{t['description']}）→ 结果：{t['result'][:100]}"
+        for t in done_tasks
+    )
+    pending_summary = json.dumps(pending_tasks, ensure_ascii=False, indent=2)
+
+    print(f"\n  🔄 Re-Planner 检查任务[{current_task_id}]完成后是否需要调整计划...")
+
+    response = await llm.ainvoke([
+        SystemMessage(content=_replanner_system()),
+        HumanMessage(content=(
+            f"用户原始问题：{_get_message_content(state['messages'][0])}\n\n"
+            f"已完成任务：\n{done_summary}\n\n"
+            f"待执行任务（pending）：\n{pending_summary}"
+        )),
+    ])
+
+    raw = _extract_json(_extract_llm_content(response))
+
+    try:
+        decision = json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"  ⚠️ Re-Planner JSON 解析失败，保持原计划：{raw[:100]}")
+        return state
+
+    if decision.get("action") == "continue":
+        print("  ✅ Re-Planner：计划无需调整，继续执行")
+        return state
+
+    if decision.get("action") == "replan":
+        new_pending: list[Task] = decision.get("new_pending_tasks", [])
+        if not new_pending:
+            print("  ✅ Re-Planner：replan 但 new_pending_tasks 为空，继续执行")
+            return state
+
+        valid_agents = set(_registry.agents)
+        new_pending  = [t for t in new_pending if t.get("agent") in valid_agents]
+        if not new_pending:
+            print("  ⚠️ Re-Planner：所有新任务 agent 非法，保持原计划")
+            return state
+
+        updated_plan = done_tasks + new_pending
+        print(f"  🔁 Re-Planner：计划已调整，新增/修改 {len(new_pending)} 个 pending 任务：")
+        for t in new_pending:
+            print(f"     [{t['task_id']}] {t['agent']} ← {t['description']}")
+        return {**state, "task_plan": updated_plan}
+
+    print("  ✅ Re-Planner：未识别的 action，保持原计划")
+    return state
+
+
+# ══════════════════════════════════════════════════════
+# 10. 通用工具 Agent 执行器
+# ══════════════════════════════════════════════════════
+async def run_agent(
+    state: AgentState,
+    agent_name: str,
+    system_prompt: str,
+) -> AgentState:
     lc_tools   = _registry.tools_for(agent_name)
     tool_names = _registry.tool_names_for(agent_name)
     by_name    = {t.name: t for t in lc_tools}
 
-    task_plan    = state.get("task_plan", [])
-    task_id: int = state.get("current_task_id", 0)
-    current_task = next((t for t in task_plan if t["task_id"] == task_id), None)
+    task_plan: list[Task] = state.get("task_plan", [])
+    task_id: int          = state.get("current_task_id", 0)
 
+    current_task = next((t for t in task_plan if t["task_id"] == task_id), None)
     if not current_task:
         print(f"  ⚠️ [{agent_name}] 找不到任务 task_id={task_id}")
-        return {"task_plan": task_plan}
+        return state
 
     task_description = current_task.get("_resolved_description") or current_task["description"]
 
     if not lc_tools:
         current_task["status"] = "done"
         current_task["result"] = f"⚠️ 没有可用工具（{agent_name} 未注册任何工具）"
-        return {"task_plan": task_plan}
+        return {**state, "task_plan": task_plan}
 
     tool_hint = "可用工具：" + "、".join(
         f"{t.name}（{t.description or '无描述'}）" for t in lc_tools
     )
     full_system = (
-        f"{system_prompt}\n\n{tool_hint}\n\n"
+        f"{system_prompt}\n\n"
+        f"{tool_hint}\n\n"
         "【重要约束】你必须通过调用工具来完成任务，严禁凭记忆、推理或编造直接给出答案。"
-        "即使你认为自己知道答案，也必须先调用工具获取真实结果。"
+        "即使你认为自己知道答案，也必须先调用工具获取真实结果，再基于工具返回值回答。"
     )
-    agent_llm     = llm.bind_tools(lc_tools)
-    msgs          = [SystemMessage(content=full_system), HumanMessage(content=task_description)]
-    last_response = None
+    agent_llm = llm.bind_tools(lc_tools)
+    msgs = [
+        SystemMessage(content=full_system),
+        HumanMessage(content=task_description),
+    ]
 
     print(f"\n  ▶ {agent_name} 执行任务[{task_id}]（工具：{tool_names}）")
 
-    for step in range(10):
+    max_steps     = 10
+    last_response = None
+
+    for step in range(max_steps):
         response = await agent_llm.ainvoke(msgs)
         last_response = response
         msgs.append(response)
@@ -874,12 +953,14 @@ async def run_agent(state: WorkerState, agent_name: str, system_prompt: str) -> 
         has_tool_calls = hasattr(response, "tool_calls") and response.tool_calls
 
         if step == 0 and not has_tool_calls:
-            print(f"  ⚠️ {agent_name} 第1轮未调用工具，追加强制提示重试...")
-            msgs.append(HumanMessage(content=(
+            tool_list_str = "、".join(tool_names)
+            force_msg = (
                 f"你刚才没有调用任何工具就直接回答了，这是不允许的。\n"
-                f"你拥有以下工具：{'、'.join(tool_names)}\n"
-                "请立即调用对应工具来完成任务，不要直接给出文字答案。"
-            )))
+                f"你拥有以下工具：{tool_list_str}\n"
+                f"请立即调用对应工具来完成任务，不要直接给出文字答案。"
+            )
+            print(f"  ⚠️ {agent_name} 第1轮未调用工具，追加强制提示重试...")
+            msgs.append(HumanMessage(content=force_msg))
             continue
 
         if not has_tool_calls:
@@ -896,16 +977,18 @@ async def run_agent(state: WorkerState, agent_name: str, system_prompt: str) -> 
                 result_text = f"❌ 未找到工具：{tc['name']}"
             msgs.append(ToolMessage(content=result_text, tool_call_id=tc["id"]))
     else:
-        print(f"  ⚠️ {agent_name} 达到最大步数，强制终止")
+        print(f"  ⚠️ {agent_name} 达到最大步数 {max_steps}，强制终止")
 
     current_task["status"] = "done"
     current_task["result"] = _extract_llm_content(last_response) if last_response else "（无结果）"
-    return {"task_plan": task_plan}
+
+    return {**state, "task_plan": task_plan}
 
 
 # ══════════════════════════════════════════════════════
-# 13. 图构建
+# 11. 图构建
 # ══════════════════════════════════════════════════════
+
 AGENT_SYSTEM_PROMPTS: dict[str, str] = {
     "math_agent": (
         "你是数学计算专家。根据任务描述和【运行时参数】（如果有），"
@@ -944,15 +1027,18 @@ DEFAULT_AGENT_SYSTEM_PROMPT = (
 
 def build_graph() -> Any:
 
-    async def direct_answer_node(state: WorkerState) -> dict:
-        task_plan    = state.get("task_plan", [])
-        task_id: int = state.get("current_task_id", 0)
+    async def direct_answer_node(state: AgentState) -> AgentState:
+        task_plan: list[Task] = state.get("task_plan", [])
+        task_id: int          = state.get("current_task_id", 0)
         current_task = next((t for t in task_plan if t["task_id"] == task_id), None)
+
         if not current_task:
-            return {"task_plan": task_plan}
+            print("  ⚠️ direct_answer：找不到当前任务")
+            return state
 
         intent = current_task.get("description", "")
-        print(f"\n  💬 direct_answer（意图：{intent[:60]}）")
+        print(f"\n  💬 direct_answer 调用 LLM（意图：{intent[:60]}）")
+
         response = await llm.ainvoke([
             SystemMessage(content=(
                 "你是一个友善的 AI 助手。请只回答当前分配给你的这一个子任务，"
@@ -960,33 +1046,43 @@ def build_graph() -> Any:
             )),
             HumanMessage(content=intent),
         ])
+
         answer = _extract_llm_content(response)
         print(f"  ✅ direct_answer 完成：{answer[:80]}")
+
         current_task["status"] = "done"
         current_task["result"] = answer
-        return {"task_plan": task_plan}
+
+        return {
+            **state,
+            "messages": state["messages"] + [AIMessage(content=answer)],
+            "task_plan": task_plan,
+        }
 
     async def final_answer_node(state: AgentState) -> AgentState:
-        task_plan    = state.get("task_plan", [])
+        task_plan: list[Task] = state.get("task_plan", [])
+
         tool_tasks   = [t for t in task_plan if t.get("agent") != "direct"]
         direct_tasks = [t for t in task_plan if t.get("agent") == "direct"]
 
         if not tool_tasks:
-            combined = "\n\n".join(t["result"] for t in direct_tasks if t.get("result"))
-            if combined:
-                return {**state, "messages": state["messages"] + [AIMessage(content=combined)]}
+            print("\n  📝 所有任务均为 direct，最终回答已在消息流中")
             return state
 
-        lines: list[str] = []
+        all_results_lines: list[str] = []
         if direct_tasks:
-            lines.append("【直接回答任务】")
+            all_results_lines.append("【直接回答任务】")
             for t in direct_tasks:
-                lines.append(f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}")
-        lines.append("【工具执行任务】")
+                all_results_lines.append(
+                    f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
+                )
+        all_results_lines.append("【工具执行任务】")
         for t in tool_tasks:
-            lines.append(f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}")
+            all_results_lines.append(
+                f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
+            )
 
-        results_text = "\n".join(lines)
+        results_text = "\n".join(all_results_lines)
         print(f"\n  📝 汇总所有任务结果：\n{results_text}")
 
         response = await llm.ainvoke([
@@ -1003,133 +1099,106 @@ def build_graph() -> Any:
 
     def planner_route(state: AgentState) -> str:
         if state.get("next_agent") == "FINISH":
-            print("  ⛔ Planner 规划失败，直接终止")
+            print("  ⛔ Planner 规划失败，直接终止，不进入 Supervisor")
             return "END"
-        return "supervisor_dispatch"
+        return "supervisor"
 
-    def collect_route(state: AgentState) -> list[Send]:
-        return supervisor_dispatch(state)
+    def supervisor_route(state: AgentState) -> str:
+        next_node = state.get("next_agent", "FINISH")
+        if next_node == "FINISH":
+            return "final_answer"
+        return next_node
 
     def make_agent_node(name: str):
         system_prompt = AGENT_SYSTEM_PROMPTS.get(name, DEFAULT_AGENT_SYSTEM_PROMPT)
-        async def _node(state: WorkerState) -> dict:
+        async def _node(state: AgentState) -> AgentState:
             return await run_agent(state, name, system_prompt)
         _node.__name__ = name
         return _node
 
     g = StateGraph(AgentState)
+
     g.add_node("planner",       planner_node)
-    g.add_node("collect",       collect_node)
+    g.add_node("supervisor",    supervisor_node)
+    g.add_node("replanner",     replanner_node)
     g.add_node("direct_answer", direct_answer_node)
     g.add_node("final_answer",  final_answer_node)
 
-    # 用 AGENT_SYSTEM_PROMPTS 的 key 作为固定节点集，不依赖 _registry
-    known_agents = list(AGENT_SYSTEM_PROMPTS.keys())
+    known_agents = _registry.agents or list(AGENT_SYSTEM_PROMPTS.keys())
     for agent_name in known_agents:
         g.add_node(agent_name, make_agent_node(agent_name))
 
     g.set_entry_point("planner")
+
     g.add_conditional_edges("planner", planner_route, {
-        "END": END,
-        "supervisor_dispatch": "supervisor_dispatch_node",
+        "END":        END,
+        "supervisor": "supervisor",
     })
 
-    async def _supervisor_dispatch_node(state: AgentState) -> AgentState:
-        return state
+    agent_routes = {name: name for name in known_agents}
+    agent_routes["direct_answer"] = "direct_answer"
+    agent_routes["final_answer"]  = "final_answer"
+    g.add_conditional_edges("supervisor", supervisor_route, agent_routes)
 
-    g.add_node("supervisor_dispatch_node", _supervisor_dispatch_node)
-    g.add_conditional_edges(
-        "supervisor_dispatch_node",
-        supervisor_dispatch,
-        {name: name for name in [*known_agents, "direct_answer", "final_answer"]},
-    )
+    g.add_edge("direct_answer", "supervisor")
 
     for agent_name in known_agents:
-        g.add_edge(agent_name, "collect")
-    g.add_edge("direct_answer", "collect")
+        g.add_edge(agent_name, "replanner")
+    g.add_edge("replanner", "supervisor")
 
-    g.add_conditional_edges(
-        "collect",
-        collect_route,
-        {name: name for name in [*known_agents, "direct_answer", "final_answer"]},
-    )
     g.add_edge("final_answer", END)
 
     return g.compile()
 
 
 # ══════════════════════════════════════════════════════
-# 14. 图实例（模块导入时构建一次，不再重建）
+# 12. 图实例
 # ══════════════════════════════════════════════════════
 graph = build_graph()
 
 
 # ══════════════════════════════════════════════════════
-# 15. lifespan 已移至 src/webapp.py
-#
-# ★★★ 正确的 langgraph.json 配置 ★★★
-# {
-#   "graphs": {
-#     "supervisorpalner": "src/langgraph_stdio_agent.py:graph"
-#   },
-#   "http": {
-#     "app": "src/webapp.py:app"
-#   },
-#   "env": ".env",
-#   "dependencies": ["."]
-# }
-#
-# 注意：langgraph.json 里的 "lifespan" 字段是无效的，langgraph dev 不会识别它。
-#      lifespan 必须绑定到 FastAPI app 对象，通过 "http": {"app": "..."} 注册。
+# 13. lifespan —— 仅 langgraph dev 通过 webapp.py 调用
+#     ★ SSE 版本：子进程已由 webapp.py lifespan 拉起，
+#       这里只负责建立 SSE 连接，不再自己 spawn 进程。
 # ══════════════════════════════════════════════════════
+@asynccontextmanager
+async def lifespan(app):
+    print(f"🟢 [lifespan] 启动，连接 MCP SSE sessions...")
+    await _start_mcp_sessions()
+    try:
+        yield
+    finally:
+        await _stop_mcp_sessions()
 
 
 # ══════════════════════════════════════════════════════
-# 16. __main__ —— 单独运行测试
+# 14. __main__ —— 后端测试，直接用 stdio_client
+#     命令：uv run python src/langgraph_stdio_agent.py
+#     完全独立，不依赖 SSE 进程，不影响前端测试
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
-    if not SERVER_PATH.exists():
-        print(f"❌ 找不到 server.py：{SERVER_PATH}")
-        sys.exit(1)
-
     QUESTIONS = [
         "列出 File Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
         # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
-        # "计算 99 乘以 9，然后把结果写入 File Agent/result.txt 文件",
-        # "先介绍一下你自己，然后帮我计算 99 乘以 9",
-        # "你好，我叫 tony",
     ]
 
     async def main():
-        # ★ __main__ 路径同样预创建 Event，保持与 lifespan 路径一致的初始化顺序
-        _ensure_registry_event()
-
-        async with stdio_client(mcp_params()) as (r1, w1):
-            async with ClientSession(r1, w1) as s1:
-                await s1.initialize()
-                server_tools = await load_tools(s1)
-                print(f"✅ server.py 工具：{[t.name for t in server_tools]}")
-
-                async with stdio_client(filesystem_mcp_params()) as (r2, w2):
-                    async with ClientSession(r2, w2) as s2:
-                        await s2.initialize()
-                        fs_tools = await load_tools(s2)
-                        print(f"✅ filesystem 工具：{[t.name for t in fs_tools]}")
-
-                        _tools.extend(server_tools + fs_tools)
-                        _init_registry(server_tools + fs_tools)
-
-                        for q in QUESTIONS:
-                            print(f"\n{'━'*60}\n❓ {q}\n{'━'*60}")
-                            result = await graph.ainvoke({
-                                "messages":   [HumanMessage(content=q)],
-                                "task_plan":  [],
-                                "next_agent": "",
-                            })
-                            print(f"\n✨ 最终答案：{_get_message_content(result['messages'][-1])}")
+        # ★ 后端测试专用：使用 stdio_client 直接 spawn 子进程
+        await _start_mcp_sessions_stdio()
+        try:
+            for q in QUESTIONS:
+                print(f"\n{'━'*60}\n❓ {q}\n{'━'*60}")
+                result = await graph.ainvoke({
+                    "messages":        [HumanMessage(content=q)],
+                    "task_plan":       [],
+                    "current_task_id": 0,
+                    "next_agent":      "",
+                })
+                print(f"\n✨ 最终答案：{_get_message_content(result['messages'][-1])}")
+        finally:
+            await _stop_mcp_sessions()
 
     if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        pass  # ProactorEventLoop 已在模块顶层设置
     asyncio.run(main())
-
-# uv run python src/langgraph_stdio_agent.py

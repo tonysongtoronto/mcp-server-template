@@ -32,7 +32,6 @@ async def fetch_url(url: str, timeout: float = 10.0) -> str:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, follow_redirects=True)
             resp.raise_for_status()
-            # 如果是 JSON，直接返回格式化字符串；否则返回纯文本（截断 2000 字）
             content_type = resp.headers.get("content-type", "")
             if "json" in content_type:
                 import json
@@ -136,14 +135,15 @@ def multiply_numbers(a: int, b: int) -> int:
     """两个数字相乘"""
     return a * b
 
+
 @mcp.tool()
 def divide_numbers(a: float, b: float) -> float:
     """两个数字相除"""
     if b == 0:
         raise ValueError("除数不能为 0")
     return a / b
-    
-    
+
+
 @mcp.tool()
 def get_server_info() -> str:
     """返回服务器信息"""
@@ -164,29 +164,24 @@ def server_info() -> str:
     return f"运行在 {sys.platform} 平台，Python {sys.version}"
 
 
+# ──────────────────────────────────────────
+# 启动入口
+# ──────────────────────────────────────────
+
 if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
- 
 
-    # 单独运行时用 --dev 启动 SSE 模式，可以在浏览器测试
-    if "--dev" in sys.argv:
-        os.environ.setdefault("HOST", "0.0.0.0")
-        os.environ.setdefault("PORT", "8000")
-        
-        port = os.environ['PORT']
-        print(f"🚀 开发模式启动，访问 http://127.0.0.1:{port}", file=sys.stderr)
-        print(f"📡 实际配置 - HOST: {os.environ['HOST']}, PORT: {port}", file=sys.stderr)
-        
-        mcp.run(transport="sse")
+    # ★ --sse 模式：给 langgraph dev（通过 webapp.py lifespan）调用
+    #   监听端口优先读环境变量 PORT（webapp.py 启动时会注入），默认 8001
+    if "--sse" in sys.argv or "--dev" in sys.argv:
+        port = int(os.environ.get("PORT", "8001"))
+        print(f"🚀 SSE 模式启动，监听 http://0.0.0.0:{port}", file=sys.stderr)
+        mcp.run(transport="sse", port=port)
+
     else:
-        # 默认 stdio 模式，给 MCP 客户端（Claude Desktop 等）用
-          # stdio 模式也可以读取环境变量（如果有的话）
-        host = os.environ.get("HOST", "N/A")
-        port = os.environ.get("PORT", "N/A")
-        
-        print(f"🚀 后台模式启动 (STDIO)", file=sys.stderr)
-        print(f"📡 配置: HOST={host}, PORT={port}", file=sys.stderr)
-        print(f"💡 传输协议: 标准输入输出", file=sys.stderr)
-        
+        # ★ 默认 stdio 模式：给后端测试（__main__）和 Claude Desktop 等 MCP 客户端用
+        #   后端测试命令：uv run python src/langgraph_stdio_agent.py
+        #   langgraph_stdio_agent.py 的 __main__ 直接用 stdio_client spawn 本进程
+        print("🚀 stdio 模式启动（后端测试 / MCP 客户端）", file=sys.stderr)
         mcp.run(transport="stdio")
