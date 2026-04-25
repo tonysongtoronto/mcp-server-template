@@ -1141,20 +1141,6 @@ def build_graph() -> Any:
 graph = build_graph()
 
 
-# ══════════════════════════════════════════════════════
-# 13. lifespan —— 仅 langgraph dev 通过 webapp.py 调用
-#     ★ SSE 版本：子进程已由 webapp.py lifespan 拉起，
-#       这里只负责建立 SSE 连接，不再自己 spawn 进程。
-# ══════════════════════════════════════════════════════
-@asynccontextmanager
-async def lifespan(app):
-    print(f"🟢 [lifespan] 启动，连接 MCP SSE sessions...")
-    await _start_mcp_sessions()
-    try:
-        yield
-    finally:
-        await _stop_mcp_sessions()
-
 
 # ══════════════════════════════════════════════════════
 # 14. __main__ —— 后端测试，直接用 stdio_client
