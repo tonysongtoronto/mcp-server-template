@@ -57,7 +57,11 @@ from mcp import StdioServerParameters
 from pathlib import Path
 from pydantic import create_model
 
-load_dotenv()
+# ★ load_dotenv() 调用同步的 os.getcwd()，在 async 上下文里会被 blockbuster 拦截。
+#   改用 override=False + find_dotenv 在模块加载时（同步阶段）完成，不进入 async 上下文。
+from dotenv import find_dotenv
+_dotenv_path = find_dotenv(usecwd=True)
+load_dotenv(_dotenv_path, override=False)
 
 # ★ Windows 下后端测试（__main__）需要 ProactorEventLoop 才能 spawn 子进程。
 #   前端（langgraph dev）走 SSE，不再 spawn 子进程，此设置对前端无害。
@@ -288,10 +292,9 @@ async def _ensure_registry() -> None:
 
 async def _start_mcp_sessions() -> None:
     """
-    ★ 前端路径（langgraph dev）：通过 SSE 连接由 webapp.py lifespan 已拉起的进程。
-    也被 _ensure_registry() 的懒加载路径调用（lifespan 未触发时的兜底）。
-
-    SSE 连接完全不 spawn 子进程，彻底绕开 Windows SelectorEventLoop 限制。
+    ★ 前端路径（langgraph dev）：通过 SSE 连接 server.py。
+    server.py 已内置所有工具（http/data/math/file），一个连接搞定。
+    子进程由 webapp.py lifespan 负责拉起。
     """
     global _mcp_exit_stack
     if _mcp_exit_stack is not None:
@@ -299,13 +302,12 @@ async def _start_mcp_sessions() -> None:
         return
 
     print(f"🔍 [MCP] platform={sys.platform}  python={sys.executable}")
-    print(f"🔍 [MCP] server SSE URL:     {_SERVER_SSE_URL}")
-    print(f"🔍 [MCP] filesystem SSE URL: {_FS_PROXY_SSE_URL}")
+    print(f"🔍 [MCP] server SSE URL: {_SERVER_SSE_URL}")
 
     stack = AsyncExitStack()
     all_tools: list[StructuredTool] = []
 
-    # ── server.py MCP（SSE）──────────────────────────────
+    # ── server.py MCP（含 http/data/math/file 全部工具）────
     try:
         r1, w1 = await stack.enter_async_context(sse_client(_SERVER_SSE_URL))
         s1     = await stack.enter_async_context(ClientSession(r1, w1))
@@ -317,21 +319,9 @@ async def _start_mcp_sessions() -> None:
         print(f"❌ [MCP] server.py SSE 连接失败：{exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
-    # ── filesystem MCP（SSE via mcp-proxy）───────────────
-    try:
-        r2, w2 = await stack.enter_async_context(sse_client(_FS_PROXY_SSE_URL))
-        s2     = await stack.enter_async_context(ClientSession(r2, w2))
-        await s2.initialize()
-        fs_tools = await load_tools(s2)
-        print(f"✅ [MCP] filesystem 工具：{[t.name for t in fs_tools]}")
-        all_tools.extend(fs_tools)
-    except Exception as exc:
-        print(f"⚠️ [MCP] filesystem SSE 连接失败（降级，无 file_agent）：{exc}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-
     # ── 提交结果 ─────────────────────────────────────────
     if not all_tools:
-        print("❌ [MCP] 全部 MCP 连接失败，registry 未就绪，下次请求将重试", file=sys.stderr)
+        print("❌ [MCP] MCP 连接失败，registry 未就绪", file=sys.stderr)
         try:
             await stack.aclose()
         except Exception:
@@ -347,7 +337,8 @@ async def _start_mcp_sessions() -> None:
 
 async def _start_mcp_sessions_stdio() -> None:
     """
-    ★ 后端路径（__main__ 直接运行）：用 stdio_client spawn 子进程。
+    ★ 后端路径（__main__ 直接运行）：用 stdio_client spawn server.py 子进程。
+    server.py 已内置所有工具（http/data/math/file），不再单独连 filesystem MCP。
     仅在 __main__ 里调用，前端路径不使用此函数。
     """
     global _mcp_exit_stack
@@ -361,7 +352,7 @@ async def _start_mcp_sessions_stdio() -> None:
     stack = AsyncExitStack()
     all_tools: list[StructuredTool] = []
 
-    # ── server.py MCP（stdio）────────────────────────────
+    # ── server.py MCP（stdio，含全部工具）────────────────
     if not SERVER_PATH.exists():
         print(f"❌ [MCP-stdio] 找不到 MCP server：{SERVER_PATH}", file=sys.stderr)
     else:
@@ -376,22 +367,8 @@ async def _start_mcp_sessions_stdio() -> None:
             print(f"❌ [MCP-stdio] server.py 启动失败：{exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
-    # ── filesystem MCP（stdio）────────────────────────────
-    try:
-        r2, w2 = await stack.enter_async_context(stdio_client(filesystem_mcp_params()))
-        s2     = await stack.enter_async_context(ClientSession(r2, w2))
-        await s2.initialize()
-        fs_tools = await load_tools(s2)
-        print(f"✅ [MCP-stdio] filesystem 工具：{[t.name for t in fs_tools]}")
-        all_tools.extend(fs_tools)
-    except Exception as exc:
-        print(f"⚠️ [MCP-stdio] filesystem MCP 启动失败：{exc}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        print(f"    提示：请确认 npx 已安装且在 PATH 中，BASE_DIR={_FS_BASE_DIR} 存在",
-              file=sys.stderr)
-
     if not all_tools:
-        print("❌ [MCP-stdio] 全部 MCP 连接失败", file=sys.stderr)
+        print("❌ [MCP-stdio] MCP 连接失败", file=sys.stderr)
         try:
             await stack.aclose()
         except Exception:
