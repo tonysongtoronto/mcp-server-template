@@ -36,9 +36,15 @@ from fastapi import FastAPI
 # ──────────────────────────────────────────
 # 配置
 # ──────────────────────────────────────────
-_SERVER_PORT   = int(os.getenv("MCP_SERVER_PORT",     "8001"))
-_FS_PROXY_PORT = int(os.getenv("MCP_FS_PROXY_PORT",   "8002"))
-_FS_BASE_DIR   = Path(os.getenv("MCP_FS_BASE_DIR", "./File Agent")).resolve()
+_SERVER_PORT   = int(os.getenv("MCP_SERVER_PORT",   "8001"))
+_FS_PROXY_PORT = int(os.getenv("MCP_FS_PROXY_PORT", "8002"))
+
+# ★ 同样避免相对路径 + .resolve()，改用 __file__ 推导绝对路径
+_MCP_FS_ENV = os.getenv("MCP_FS_BASE_DIR", "")
+if _MCP_FS_ENV:
+    _FS_BASE_DIR = Path(_MCP_FS_ENV)
+else:
+    _FS_BASE_DIR = Path(__file__).parent.parent / "File_Agent"
 
 # server.py 的绝对路径（相对于本文件推导）
 _SERVER_PY = Path(__file__).parent / "mcp_server_template" / "server.py"

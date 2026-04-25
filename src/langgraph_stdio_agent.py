@@ -57,11 +57,11 @@ from mcp import StdioServerParameters
 from pathlib import Path
 from pydantic import create_model
 
-# ★ load_dotenv() 调用同步的 os.getcwd()，在 async 上下文里会被 blockbuster 拦截。
-#   改用 override=False + find_dotenv 在模块加载时（同步阶段）完成，不进入 async 上下文。
-from dotenv import find_dotenv
-_dotenv_path = find_dotenv(usecwd=True)
-load_dotenv(_dotenv_path, override=False)
+# ★ load_dotenv() 和 find_dotenv() 内部都会调用同步的 os.getcwd()，
+#   在 async 上下文（langgraph dev）里会被 blockbuster 拦截报 BlockingError。
+#   改用 __file__ 推导 .env 绝对路径，完全不调用 os.getcwd()。
+_dotenv_path = Path(__file__).parent.parent / ".env"
+load_dotenv(str(_dotenv_path), override=False)
 
 # ★ Windows 下后端测试（__main__）需要 ProactorEventLoop 才能 spawn 子进程。
 #   前端（langgraph dev）走 SSE，不再 spawn 子进程，此设置对前端无害。
@@ -82,7 +82,14 @@ llm = ChatOpenAI(
 # 2. MCP server 路径 & 启动参数（后端测试用）
 # ══════════════════════════════════════════════════════
 SERVER_PATH = Path(__file__).parent / "mcp_server_template" / "server.py"
-_FS_BASE_DIR = Path(os.getenv("MCP_FS_BASE_DIR", "./File Agent")).resolve()
+
+# ★ _FS_BASE_DIR：优先读环境变量（绝对路径），否则基于 __file__ 推导，
+#   避免用相对路径 + .resolve()（会调用 os.getcwd() 被 blockbuster 拦截）
+_MCP_FS_ENV = os.getenv("MCP_FS_BASE_DIR", "")
+if _MCP_FS_ENV:
+    _FS_BASE_DIR = Path(_MCP_FS_ENV)          # 环境变量里已是绝对路径，直接用
+else:
+    _FS_BASE_DIR = Path(__file__).parent.parent / "File_Agent"  # 绝对路径，不调 getcwd
 
 # ★ SSE 端点配置（前端测试用，由 webapp.py lifespan 拉起对应进程）
 _SERVER_PORT   = int(os.getenv("MCP_SERVER_PORT",   "8001"))
@@ -1156,7 +1163,7 @@ async def lifespan(app):
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
     QUESTIONS = [
-        "列出 File Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
+        "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
         # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
     ]
 
