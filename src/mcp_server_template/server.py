@@ -2,7 +2,6 @@ import asyncio
 import json as _json
 import logging
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -16,19 +15,8 @@ os.environ.setdefault("PORT", "8000")
 logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
 
 mcp = FastMCP("MCP Server Template", host="0.0.0.0")
-
-# ★ Filesystem 工具的根目录，从环境变量读取，默认 ./File_Agent
-_FS_BASE = Path(os.environ.get("MCP_FS_BASE_DIR", "./File_Agent")).resolve()
-
-
-def _safe_path(relative_path: str) -> Path:
-    """
-    把相对路径解析为绝对路径，并确保在 _FS_BASE 目录内（防止路径穿越）。
-    """
-    target = (_FS_BASE / relative_path).resolve()
-    if not str(target).startswith(str(_FS_BASE)):
-        raise PermissionError(f"禁止访问授权目录以外的路径：{target}")
-    return target
+# ★ 文件系统工具已移除，改由 mcp-server-filesystem 独立进程提供。
+#   见 webapp.py lifespan（SSE 模式）和 langgraph_stdio_agent.py（stdio 模式）。
 
 # ──────────────────────────────────────────
 # 🌐 HTTP 工具（依赖 httpx）
@@ -166,179 +154,6 @@ def get_server_info() -> str:
         sys.platform, sys.version.split()[0]
     )
 
-
-# ──────────────────────────────────────────
-# 📁 Filesystem 工具（替代 mcp-proxy + @modelcontextprotocol/server-filesystem）
-# 所有操作限制在 MCP_FS_BASE_DIR 目录内
-# ──────────────────────────────────────────
-
-@mcp.tool()
-def list_directory(path: str = "") -> str:
-    """
-    列出目录内容。
-    参数:
-        path - 相对于授权根目录的路径，默认为根目录（""）
-    """
-    try:
-        target = _safe_path(path)
-        if not target.exists():
-            return f"❌ 路径不存在：{path or '/'}"
-        if not target.is_dir():
-            return f"❌ 不是目录：{path}"
-        items = []
-        for item in sorted(target.iterdir()):
-            kind = "📁" if item.is_dir() else "📄"
-            size = f"  ({item.stat().st_size} bytes)" if item.is_file() else ""
-            items.append(f"{kind} {item.name}{size}")
-        return f"目录：{path or '/'}\n" + ("\n".join(items) if items else "（空目录）")
-    except PermissionError as e:
-        return f"❌ 权限错误：{e}"
-    except Exception as e:
-        return f"❌ 错误：{e}"
-
-
-@mcp.tool()
-def read_file(path: str) -> str:
-    """
-    读取文件内容。
-    参数:
-        path - 相对于授权根目录的文件路径，例如 "hello.txt"
-    """
-    try:
-        target = _safe_path(path)
-        if not target.exists():
-            return f"❌ 文件不存在：{path}"
-        if not target.is_file():
-            return f"❌ 不是文件：{path}"
-        content = target.read_text(encoding="utf-8", errors="replace")
-        if len(content) > 5000:
-            content = content[:5000] + f"\n\n…（已截断，原文件 {target.stat().st_size} bytes）"
-        return content
-    except PermissionError as e:
-        return f"❌ 权限错误：{e}"
-    except Exception as e:
-        return f"❌ 读取失败：{e}"
-
-
-@mcp.tool()
-def write_file(path: str, content: str) -> str:
-    """
-    写入文件内容（覆盖已有文件）。
-    参数:
-        path    - 相对于授权根目录的文件路径，例如 "hello.txt"
-        content - 要写入的文本内容
-    """
-    try:
-        target = _safe_path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return f"✅ 已写入：{path}（{len(content.encode())} bytes）"
-    except PermissionError as e:
-        return f"❌ 权限错误：{e}"
-    except Exception as e:
-        return f"❌ 写入失败：{e}"
-
-
-@mcp.tool()
-def create_directory(path: str) -> str:
-    """
-    创建目录（含所有父目录）。
-    参数:
-        path - 相对于授权根目录的目录路径
-    """
-    try:
-        target = _safe_path(path)
-        target.mkdir(parents=True, exist_ok=True)
-        return f"✅ 目录已创建：{path}"
-    except PermissionError as e:
-        return f"❌ 权限错误：{e}"
-    except Exception as e:
-        return f"❌ 创建失败：{e}"
-
-
-@mcp.tool()
-def move_file(source: str, destination: str) -> str:
-    """
-    移动或重命名文件/目录。
-    参数:
-        source      - 源路径（相对于授权根目录）
-        destination - 目标路径（相对于授权根目录）
-    """
-    try:
-        src = _safe_path(source)
-        dst = _safe_path(destination)
-        if not src.exists():
-            return f"❌ 源路径不存在：{source}"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
-        return f"✅ 已移动：{source} → {destination}"
-    except PermissionError as e:
-        return f"❌ 权限错误：{e}"
-    except Exception as e:
-        return f"❌ 移动失败：{e}"
-
-
-@mcp.tool()
-def search_files(pattern: str, path: str = "") -> str:
-    """
-    在授权目录内搜索匹配的文件（支持 glob 模式）。
-    参数:
-        pattern - 文件名模式，例如 "*.txt"、"hello*"
-        path    - 搜索起始目录（相对于授权根目录），默认为根目录
-    """
-    try:
-        base = _safe_path(path)
-        if not base.is_dir():
-            return f"❌ 不是目录：{path or '/'}"
-        matches = list(base.rglob(pattern))
-        if not matches:
-            return f"未找到匹配 '{pattern}' 的文件"
-        lines = [f"找到 {len(matches)} 个匹配："]
-        for m in matches[:50]:
-            rel = m.relative_to(_FS_BASE)
-            lines.append(f"  {'📁' if m.is_dir() else '📄'} {rel}")
-        if len(matches) > 50:
-            lines.append(f"  …（仅显示前 50 条，共 {len(matches)} 条）")
-        return "\n".join(lines)
-    except PermissionError as e:
-        return f"❌ 权限错误：{e}"
-    except Exception as e:
-        return f"❌ 搜索失败：{e}"
-
-
-@mcp.tool()
-def get_file_info(path: str) -> str:
-    """
-    获取文件或目录的详细信息。
-    参数:
-        path - 相对于授权根目录的路径
-    """
-    try:
-        target = _safe_path(path)
-        if not target.exists():
-            return f"❌ 路径不存在：{path}"
-        stat = target.stat()
-        import datetime
-        mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        kind  = "目录" if target.is_dir() else "文件"
-        lines = [
-            f"路径：{path}",
-            f"类型：{kind}",
-            f"大小：{stat.st_size} bytes",
-            f"修改时间：{mtime}",
-        ]
-        return "\n".join(lines)
-    except PermissionError as e:
-        return f"❌ 权限错误：{e}"
-    except Exception as e:
-        return f"❌ 获取信息失败：{e}"
-
-
-@mcp.tool()
-def list_allowed_directories() -> str:
-    """列出所有允许访问的根目录"""
-    exists = _FS_BASE.exists()
-    return f"授权根目录：{_FS_BASE}（{'存在' if exists else '不存在'}）"
 
 
 @mcp.resource("welcome://message")

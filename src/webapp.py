@@ -189,14 +189,23 @@ _subprocesses: list[subprocess.Popen] = []
 async def lifespan(app: FastAPI):
     """
     FastAPI lifespan：
-      启动时 → 用 Popen 拉起子进程（绕开 Windows SelectorEventLoop 限制）
-             → 用 httpx 异步等待 SSE 端点就绪
+      启动时 → 用 Popen 拉起两个子进程（绕开 Windows SelectorEventLoop 限制）
+             1. server.py          @ 8001  →  math / data / http 工具
+             2. mcp-proxy          @ 8002  →  mcp-server-filesystem 文件系统工具
+             → 用 httpx 异步等待两个 SSE 端点就绪
              → 初始化 MCP sessions（SSE 连接）
-      关闭时 → 关闭 MCP sessions → 终止子进程
+      关闭时 → 关闭 MCP sessions → 终止所有子进程
+
+    ★ Windows mcp-proxy 命令说明：
+      mcp-proxy 在 Windows 下直接 spawn npx 会 ENOENT，
+      必须加 --shell 并把子命令包成单个字符串才能找到 npx.cmd。
+      已验证命令：
+        npx.cmd mcp-proxy --port 8002 --server sse --shell --
+          "npx -y @modelcontextprotocol/server-filesystem <path>"
     """
     print("\n🟢 [lifespan] 开始启动 MCP 子进程...", file=sys.stderr)
 
-    # ── 启动 server.py（SSE，8001，含 filesystem 工具）──
+    # ── 1. 启动 server.py（SSE @ 8001：math / data / http）──────────
     server_proc = _launch_subprocess(
         tag="server.py",
         cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
@@ -210,12 +219,33 @@ async def lifespan(app: FastAPI):
         print(f"  ⏳ [server.py] 等待 SSE 就绪 http://127.0.0.1:{_SERVER_PORT}/sse ...",
               file=sys.stderr)
         ok = await _wait_for_sse(f"http://127.0.0.1:{_SERVER_PORT}/sse")
-        if ok:
-            print(f"  ✅ [server.py] SSE 就绪", file=sys.stderr)
-        else:
-            print(f"  ❌ [server.py] SSE 超时（30s）", file=sys.stderr)
+        print(f"  {'✅' if ok else '❌'} [server.py] SSE {'就绪' if ok else '超时（30s）'}",
+              file=sys.stderr)
 
-    # ── 初始化 MCP sessions（SSE 连接）────────────────
+    # ── 2. 启动 mcp-proxy（SSE @ 8002：mcp-server-filesystem）────────
+    # ★ Windows 关键：--shell + 子命令整体加引号，让 shell 去解析 npx.cmd。
+    #   子命令必须是单个字符串，不能拆开，否则 mcp-proxy 会把路径当 npm 包名。
+    _fs_sub_cmd = (
+        f"npx -y @modelcontextprotocol/server-filesystem {_FS_BASE_DIR}"
+    )
+    fs_proc = _launch_subprocess(
+        tag="mcp-proxy(fs)",
+        cmd=[_NPX, "mcp-proxy",
+             "--port", str(_FS_PROXY_PORT),
+             "--server", "sse",
+             "--shell",
+             "--", _fs_sub_cmd],
+        port=_FS_PROXY_PORT,
+    )
+    if fs_proc:
+        _subprocesses.append(fs_proc)
+        print(f"  ⏳ [mcp-proxy] 等待 SSE 就绪 http://127.0.0.1:{_FS_PROXY_PORT}/sse ...",
+              file=sys.stderr)
+        ok = await _wait_for_sse(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse")
+        print(f"  {'✅' if ok else '❌'} [mcp-proxy] SSE {'就绪' if ok else '超时（30s）'}",
+              file=sys.stderr)
+
+    # ── 3. 初始化 MCP sessions（SSE 连接）────────────────────────────
     from src.langgraph_stdio_agent import _start_mcp_sessions
     await _start_mcp_sessions()
     print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
