@@ -25,6 +25,12 @@ src/langgraph_stdio_agent.py
   【修复12】_ensure_registry() 调用时机提前到 task_plan 判断之前
   【SSE改造】前端改用 SSE 传输，绕开 Windows ProactorLoop 限制
   【Lock修复】_lazy_init_lock 改为惰性创建
+
+最新修复：
+  【修复13】db_agent system prompt 禁用 ask_db，改为直接写 SQL 用 query_db
+            原因：ask_db 内部二次调用 LLM，导致 stdio 模式事件循环死锁/超时
+  【修复14】Planner system prompt 同步去掉"优先 ask_db"误导说明
+  【改进15】__main__ 改为交互式 CLI 循环，支持连续多轮对话，无需修改代码重跑
 """
 
 import asyncio
@@ -572,7 +578,7 @@ def _planner_system() -> str:
 db_agent 连接的是电商数据库，包含以下表：
   users（用户）、products（商品）、categories（分类）、
   orders（订单）、order_items（订单明细）、reviews（评价）、inventory_log（库存日志）
-优先使用 ask_db 工具（自然语言查询），只有在明确知道 SQL 时才用 query_db。
+db_agent 会自己写 SQL 用 query_db 执行，禁止在 planner 层面指定使用 ask_db。
 
 ━━ 其他规则（严格遵守）━━
 1. description 只写任务意图，绝不提前计算数值或给出最终答案
@@ -676,13 +682,25 @@ async def supervisor_node(state: AgentState) -> AgentState:
         return {**state, "next_agent": "FINISH"}
 
     # 解析运行时参数
+    # LLM 有时生成简写格式 {"param": task_id} 而不是规范的 {"param": {"from_task": task_id, "field": "result"}}
+    # 这里做兼容处理，两种格式都能正确解析
     inputs = next_task.get("inputs", {})
     resolved_parts = []
     for param_name, task_input in inputs.items():
-        src_id  = task_input.get("from_task")
-        field   = task_input.get("field", "result")
-        src     = next((t for t in task_plan if t["task_id"] == src_id), None)
-        val     = src.get(field, "") if src else ""
+        if isinstance(task_input, dict):
+            # 规范格式：{"from_task": 0, "field": "result"}
+            src_id = task_input.get("from_task")
+            field  = task_input.get("field", "result")
+        elif isinstance(task_input, int):
+            # 简写格式：直接是 task_id 整数
+            src_id = task_input
+            field  = "result"
+        else:
+            # 其他异常格式，跳过
+            print(f"  ⚠️ [Supervisor] inputs[{param_name}] 格式异常（{type(task_input).__name__}），已跳过")
+            continue
+        src = next((t for t in task_plan if t["task_id"] == src_id), None)
+        val = src.get(field, "") if src else ""
         resolved_parts.append(f"【{param_name}】= {val}")
 
     resolved_desc = next_task["description"]
@@ -826,21 +844,27 @@ AGENT_SYSTEM_PROMPTS: dict[str, str] = {
         "  - 获取文件信息 → get_file_info\n"
         "操作成功后返回简洁的结果说明，失败时返回具体错误信息。"
     ),
-    # ★ 新增 db_agent
+    # ★ db_agent —— 禁用 ask_db，直接写 SQL 避免二次 LLM 调用导致超时
     "db_agent": (
         "你是电商数据库查询专家。数据库包含以下表：\n"
-        "  users（用户：id/name/email/age/city/status）\n"
-        "  products（商品：id/name/category_id/price/stock/status）\n"
-        "  categories（分类：id/name/parent_id）\n"
-        "  orders（订单：id/user_id/status/total/shipping_address/created_at）\n"
-        "  order_items（订单明细：id/order_id/product_id/qty/unit_price）\n"
-        "  reviews（评价：id/user_id/product_id/rating/comment）\n"
-        "  inventory_log（库存日志：id/product_id/delta/reason/created_at）\n\n"
-        "工具使用原则：\n"
-        "  - 优先使用 ask_db（自然语言输入，AI 自动生成 SQL）\n"
-        "  - 需要查看表结构时使用 get_schema\n"
-        "  - 明确知道 SQL 时可直接用 query_db（SELECT）或 execute_db（INSERT/UPDATE）\n"
-        "  - 得到结果后用中文简洁总结，不要重复罗列原始数据"
+        "  users         （用户：id / name / email / age / city / status / created_at）\n"
+        "  products      （商品：id / name / category_id / price / stock / status）\n"
+        "  categories    （分类：id / name / parent_id）\n"
+        "  orders        （订单：id / user_id / status / total / shipping_address / created_at）\n"
+        "  order_items   （订单明细：id / order_id / product_id / qty / unit_price）\n"
+        "  reviews       （评价：id / user_id / product_id / rating / comment）\n"
+        "  inventory_log （库存日志：id / product_id / delta / reason / created_at）\n\n"
+        "【工具使用规则 — 严格遵守】\n"
+        "  1. 禁止使用 ask_db。ask_db 内部会再次调用 LLM，速度极慢且容易超时。\n"
+        "  2. 直接根据上面的表结构自己写 SQL，使用 query_db 执行 SELECT 查询。\n"
+        "  3. INSERT / UPDATE 操作使用 execute_db。\n"
+        "  4. 只有在极不确定表结构时才调用 get_schema 一次，之后立即用 query_db。\n"
+        "  5. 拿到查询结果后，用中文简洁总结，不要把原始 JSON 全部输出给用户。\n\n"
+        "【常用 SQL 模式参考】\n"
+        "  - 按城市筛选用户：SELECT * FROM users WHERE city = 'Toronto' AND status = 'active'\n"
+        "  - 统计分组：SELECT city, COUNT(*) as cnt FROM users GROUP BY city ORDER BY cnt DESC\n"
+        "  - 联表查询：SELECT u.name, o.total FROM orders o JOIN users u ON o.user_id = u.id\n"
+        "  - TOP N：SELECT * FROM products ORDER BY price DESC LIMIT 5\n"
     ),
 }
 
@@ -984,9 +1008,24 @@ graph = build_graph()
 # 13. __main__ —— 后端测试（stdio 模式，直接运行）
 #     命令：uv run python src/langgraph_stdio_agent.py
 # ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
+# 13. __main__ —— 交互式 CLI（stdio 模式，直接运行）
+#     命令：uv run python src/langgraph_stdio_agent.py
+#
+#  两种运行模式（二选一）：
+#  ① 交互式 CLI（默认）：启动后在终端输入问题，quit/exit/q 退出
+#  ② 批量测试：将 BATCH_MODE 改为 True，自动跑完 QUESTIONS 列表后退出
+# ══════════════════════════════════════════════════════
 if __name__ == "__main__":
+
+    # ── 批量测试问题列表（BATCH_MODE=True 时使用）──────────────────
+    BATCH_MODE = True   # ← 改为 True 即切换为批量测试模式
+
     QUESTIONS = [
         # ── 纯 DB 查询测试 ──
+        # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        # "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
+        
         "查询所有来自 Toronto 的活跃用户",
         # "统计每个城市的用户数量，按数量降序排列",
         # "找出销售额最高的前 5 个商品",
@@ -998,19 +1037,69 @@ if __name__ == "__main__":
         # "查询 Toronto 用户数量，然后计算这个数字的平方",
     ]
 
+    # ── 公共：执行单条问题 ──────────────────────────────────────────
+    async def _run_question(q: str) -> None:
+        print(f"\n{'━' * 60}\n❓ {q}\n{'━' * 60}")
+        try:
+            result = await graph.ainvoke({
+                "messages":        [HumanMessage(content=q)],
+                "task_plan":       [],
+                "current_task_id": 0,
+                "next_agent":      "",
+            })
+            answer = _get_message_content(result["messages"][-1])
+            print(f"\n{'═' * 60}")
+            print(f"✨ 最终答案：\n{answer}")
+            print(f"{'═' * 60}")
+        except Exception as e:
+            print(f"\n❌ 执行出错：{e}")
+            traceback.print_exc()
+
+    # ── 模式①：交互式 CLI ──────────────────────────────────────────
+    async def _interactive() -> None:
+        print("\n" + "═" * 60)
+        print("🤖  MCP Multi-Agent CLI 就绪")
+        print("    输入问题后回车执行，输入 'quit' / 'exit' / 'q' 退出")
+        print("    输入 'batch' 快速跑完 QUESTIONS 列表")
+        print("═" * 60)
+
+        while True:
+            try:
+                q = input("\n❓ > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n👋 再见！")
+                break
+
+            if not q:
+                continue
+            if q.lower() in ("quit", "exit", "q"):
+                print("👋 再见！")
+                break
+            if q.lower() == "batch":
+                print(f"\n🚀 批量执行 {len(QUESTIONS)} 个问题...")
+                for bq in QUESTIONS:
+                    await _run_question(bq)
+                continue
+
+            await _run_question(q)
+
+    # ── 模式②：批量测试 ────────────────────────────────────────────
+    async def _batch() -> None:
+        print(f"\n🚀 批量测试模式，共 {len(QUESTIONS)} 个问题")
+        for q in QUESTIONS:
+            await _run_question(q)
+
+    # ── 入口 ───────────────────────────────────────────────────────
     async def main():
         await _start_mcp_sessions_stdio()
         try:
-            for q in QUESTIONS:
-                print(f"\n{'━'*60}\n❓ {q}\n{'━'*60}")
-                result = await graph.ainvoke({
-                    "messages":        [HumanMessage(content=q)],
-                    "task_plan":       [],
-                    "current_task_id": 0,
-                    "next_agent":      "",
-                })
-                print(f"\n✨ 最终答案：{_get_message_content(result['messages'][-1])}")
+            if BATCH_MODE:
+                await _batch()
+            else:
+                await _interactive()
         finally:
             await _stop_mcp_sessions()
 
     asyncio.run(main())
+
+    # uv run python src/langgraph_stdio_agent.py
