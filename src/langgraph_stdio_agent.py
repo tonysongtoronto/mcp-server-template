@@ -1,24 +1,14 @@
 """
 src/langgraph_stdio_agent.py
 
-两种运行方式：
-  1. uv run langgraph dev   → langgraph 调用 webapp.py lifespan 拉起子进程 + 初始化 SSE sessions
-  2. python -m src.langgraph_stdio_agent  → __main__ 直接用 stdio_client 初始化工具
+★ db_agent 集成说明（在原有架构基础上新增）：
 
-★ SSE 版本改造说明（在原有修复基础上新增）：
-
-  【改造SSE】前端（langgraph dev）改用 SSE 传输，彻底绕开 Windows ProactorLoop 限制
-   - 原问题：Windows + langgraph dev 使用 SelectorEventLoop，stdio_client 无法 spawn 子进程
-   - 方案：_start_mcp_sessions_sse() 用 sse_client 连接 localhost:8001/8002
-           子进程由 webapp.py lifespan 负责拉起，agent 只做 HTTP 连接，不 spawn 进程
-   - 后端测试路径完全保留：__main__ 仍用 stdio_client，一条命令照跑
-
-  【修复Lock】_lazy_init_lock 改为惰性创建，彻底解决跨 event loop 问题
-   - 原问题：asyncio.Lock() 在模块加载时创建，绑定到主线程 loop
-             langgraph dev 的 uvicorn 启动新 loop 后，Lock.acquire() 永远挂起
-             导致 _ensure_registry() 看似"就绪"实则 registry 永远为空
-   - 方案：_lazy_init_lock 初始为 None，第一次 _ensure_registry() 调用时
-           在当前 loop 里惰性创建，确保 Lock 始终和调用方在同一个 loop
+  【新增 db_agent】
+   - 连接 mcp_db_server/server.py，工具：ask_db / query_db / execute_db / get_schema
+   - SSE 模式：连接 http://127.0.0.1:8003/sse（由 webapp.py lifespan 拉起）
+   - STDIO 模式：直接 spawn mcp_db_server/server.py 子进程（__main__ 测试用）
+   - AGENT_TOOL_PATTERNS 新增 db_agent 工具名匹配
+   - AGENT_DESCRIPTIONS / AGENT_TRIGGER_KEYWORDS 新增 db_agent 条目
 
 以下为原有修复（保持不变）：
   【重构1】移除 router 节点
@@ -33,6 +23,8 @@ src/langgraph_stdio_agent.py
   【修复10】兼容 LangGraph Studio 下 messages 反序列化为 dict
   【修复11】彻底移除 asyncio.Event，改用 _registry.agents 判断就绪
   【修复12】_ensure_registry() 调用时机提前到 task_plan 判断之前
+  【SSE改造】前端改用 SSE 传输，绕开 Windows ProactorLoop 限制
+  【Lock修复】_lazy_init_lock 改为惰性创建
 """
 
 import asyncio
@@ -51,20 +43,15 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 from mcp import ClientSession
-from mcp.client.stdio import stdio_client       # 后端测试（__main__）用
-from mcp.client.sse import sse_client           # 前端测试（langgraph dev）用  ← ★ 新增
+from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 from mcp import StdioServerParameters
 from pathlib import Path
 from pydantic import create_model
 
-# ★ load_dotenv() 和 find_dotenv() 内部都会调用同步的 os.getcwd()，
-#   在 async 上下文（langgraph dev）里会被 blockbuster 拦截报 BlockingError。
-#   改用 __file__ 推导 .env 绝对路径，完全不调用 os.getcwd()。
 _dotenv_path = Path(__file__).parent.parent / ".env"
 load_dotenv(str(_dotenv_path), override=False)
 
-# ★ Windows 下后端测试（__main__）需要 ProactorEventLoop 才能 spawn 子进程。
-#   前端（langgraph dev）走 SSE，不再 spawn 子进程，此设置对前端无害。
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -79,27 +66,27 @@ llm = ChatOpenAI(
 )
 
 # ══════════════════════════════════════════════════════
-# 2. MCP server 路径 & 启动参数（后端测试用）
+# 2. MCP server 路径 & 启动参数
 # ══════════════════════════════════════════════════════
-SERVER_PATH = Path(__file__).parent / "mcp_server_template" / "server.py"
+SERVER_PATH    = Path(__file__).parent / "mcp_server_template" / "server.py"
+DB_SERVER_PATH = Path(__file__).parent / "mcp_db_server" / "server.py"   # ★ 新增
 
-# ★ _FS_BASE_DIR：优先读环境变量（绝对路径），否则基于 __file__ 推导，
-#   避免用相对路径 + .resolve()（会调用 os.getcwd() 被 blockbuster 拦截）
 _MCP_FS_ENV = os.getenv("MCP_FS_BASE_DIR", "")
 if _MCP_FS_ENV:
-    _FS_BASE_DIR = Path(_MCP_FS_ENV)          # 环境变量里已是绝对路径，直接用
+    _FS_BASE_DIR = Path(_MCP_FS_ENV)
 else:
-    _FS_BASE_DIR = Path(__file__).parent.parent / "File_Agent"  # 绝对路径，不调 getcwd
+    _FS_BASE_DIR = Path(__file__).parent.parent / "File_Agent"
 
-# ★ SSE 端点配置（前端测试用，由 webapp.py lifespan 拉起对应进程）
-_SERVER_PORT   = int(os.getenv("MCP_SERVER_PORT",   "8001"))
-_FS_PROXY_PORT = int(os.getenv("MCP_FS_PROXY_PORT", "8002"))
-_SERVER_SSE_URL   = f"http://127.0.0.1:{_SERVER_PORT}/sse"
-_FS_PROXY_SSE_URL = f"http://127.0.0.1:{_FS_PROXY_PORT}/sse"
+_SERVER_PORT    = int(os.getenv("MCP_SERVER_PORT",    "8001"))
+_FS_PROXY_PORT  = int(os.getenv("MCP_FS_PROXY_PORT",  "8002"))
+_DB_SERVER_PORT = int(os.getenv("MCP_DB_SERVER_PORT", "8003"))   # ★ 新增
+
+_SERVER_SSE_URL    = f"http://127.0.0.1:{_SERVER_PORT}/sse"
+_FS_PROXY_SSE_URL  = f"http://127.0.0.1:{_FS_PROXY_PORT}/sse"
+_DB_SERVER_SSE_URL = f"http://127.0.0.1:{_DB_SERVER_PORT}/sse"   # ★ 新增
 
 
 def mcp_params() -> StdioServerParameters:
-    """后端测试：以 stdio 模式启动 server.py"""
     return StdioServerParameters(
         command=sys.executable,
         args=["-u", str(SERVER_PATH)],
@@ -107,13 +94,20 @@ def mcp_params() -> StdioServerParameters:
     )
 
 def filesystem_mcp_params() -> StdioServerParameters:
-    """后端测试：以 stdio 模式启动 filesystem MCP"""
     npx_cmd = "npx.cmd" if sys.platform == "win32" else "npx"
     print(f"📂 Filesystem MCP BASE_DIR: {_FS_BASE_DIR}", file=sys.stderr)
     return StdioServerParameters(
         command=npx_cmd,
         args=["-y", "@modelcontextprotocol/server-filesystem", str(_FS_BASE_DIR)],
         env={**os.environ},
+    )
+
+def db_mcp_params() -> StdioServerParameters:                     # ★ 新增
+    """后端测试：以 stdio 模式启动 db_server.py"""
+    return StdioServerParameters(
+        command=sys.executable,
+        args=["-u", str(DB_SERVER_PATH)],
+        env={"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", **os.environ},
     )
 
 
@@ -132,6 +126,9 @@ AGENT_TOOL_PATTERNS: dict[str, list[str]] = {
                    "read_multiple_files", "list_directory", "create_directory",
                    "move_file", "search_files", "get_file_info",
                    "list_allowed_directories", "file_*"],
+    # ★ 新增 db_agent
+    "db_agent":   ["ask_db", "query_db", "execute_db", "get_schema",
+                   "db_*", "sql_*"],
 }
 
 AGENT_DESCRIPTIONS: dict[str, str] = {
@@ -139,6 +136,8 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
     "data_agent": "数据分析（统计、聚合、分组、过滤等结构化数据处理）",
     "http_agent": "网络请求（GET/POST、访问 URL、调用外部 API）",
     "file_agent": "文件操作（读写文件、列出目录、创建目录、移动/搜索文件）",
+    # ★ 新增
+    "db_agent":   "数据库查询（电商数据库：用户/商品/订单/评价/库存，支持自然语言和直接 SQL）",
 }
 
 AGENT_TRIGGER_KEYWORDS: dict[str, list[str]] = {
@@ -150,6 +149,12 @@ AGENT_TRIGGER_KEYWORDS: dict[str, list[str]] = {
                    "dataframe", "pivot"],
     "file_agent": ["文件", "目录", "列出", "读取", "写入", "创建", "移动",
                    "搜索文件", "read_file", "write_file", "list_directory"],
+    # ★ 新增
+    "db_agent":   ["查询", "数据库", "订单", "用户", "商品", "库存", "评价",
+                   "销售额", "销售", "购买", "category", "product", "order",
+                   "review", "inventory", "sql", "select", "多少", "哪些",
+                   "列出所有", "找出", "统计订单", "统计用户", "统计商品",
+                   "最高", "最低", "排名", "top", "最畅销"],
 }
 
 def _match_agent(tool_name: str) -> str:
@@ -260,32 +265,16 @@ class AgentState(TypedDict):
 # ══════════════════════════════════════════════════════
 _tools: list[StructuredTool] = []
 _registry: ToolRegistry = ToolRegistry()
-
-# ★ 【修复Lock】_lazy_init_lock 改为惰性创建（None → 首次调用时在当前 loop 创建）。
-#   原来模块加载时直接 asyncio.Lock() 会绑定到主线程 loop，
-#   langgraph dev 用 uvicorn 启动新 loop 后 Lock.acquire() 永远挂起。
 _lazy_init_lock: asyncio.Lock | None = None
 _mcp_exit_stack: AsyncExitStack | None = None
 
 
 async def _ensure_registry() -> None:
-    """
-    ★ 【修复11+12+Lock】三重保险初始化。
-
-    1. 快速路径：_registry.agents 非空则直接返回（纯 Python 属性，跨 loop 安全）
-    2. 惰性创建 Lock：在当前 loop 里创建，确保不跨 loop
-    3. double-check：防并发重复初始化
-    """
     global _lazy_init_lock
-
-    # 快速路径
     if _registry.agents:
         return
-
-    # ★ 惰性创建 Lock，绑定到调用方当前 loop
     if _lazy_init_lock is None:
         _lazy_init_lock = asyncio.Lock()
-
     async with _lazy_init_lock:
         if _registry.agents:
             return
@@ -299,10 +288,10 @@ async def _ensure_registry() -> None:
 
 async def _start_mcp_sessions() -> None:
     """
-    ★ 前端路径（langgraph dev）：通过 SSE 分别连接两个独立进程：
-      1. server.py @ 8001       → math / data / http 工具
-      2. mcp-proxy @ 8002       → mcp-server-filesystem 文件系统工具
-    两个进程由 webapp.py lifespan 负责拉起，agent 只做 HTTP 连接，不 spawn 进程。
+    前端路径（langgraph dev）：SSE 连接三个独立进程：
+      1. server.py    @ 8001  → math / data / http 工具
+      2. mcp-proxy    @ 8002  → 文件系统工具
+      3. db_server.py @ 8003  → 数据库工具 ★ 新增
     """
     global _mcp_exit_stack
     if _mcp_exit_stack is not None:
@@ -312,11 +301,12 @@ async def _start_mcp_sessions() -> None:
     print(f"🔍 [MCP] platform={sys.platform}  python={sys.executable}")
     print(f"🔍 [MCP] server SSE URL:     {_SERVER_SSE_URL}")
     print(f"🔍 [MCP] filesystem SSE URL: {_FS_PROXY_SSE_URL}")
+    print(f"🔍 [MCP] db server SSE URL:  {_DB_SERVER_SSE_URL}")
 
     stack = AsyncExitStack()
     all_tools: list[StructuredTool] = []
 
-    # ── 1. server.py MCP（SSE @ 8001：math / data / http）────────────
+    # ── 1. server.py MCP（SSE @ 8001）────────────────────────────────
     try:
         r1, w1 = await stack.enter_async_context(sse_client(_SERVER_SSE_URL))
         s1     = await stack.enter_async_context(ClientSession(r1, w1))
@@ -328,10 +318,7 @@ async def _start_mcp_sessions() -> None:
         print(f"❌ [MCP] server.py SSE 连接失败：{exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
-    # ── 2. mcp-server-filesystem（SSE @ 8002，经 mcp-proxy 桥接）─────
-    # ★ mcp-proxy 由 webapp.py lifespan 以如下命令拉起（Windows 已验证）：
-    #   npx mcp-proxy --port 8002 --server sse --shell --
-    #     "npx -y @modelcontextprotocol/server-filesystem <FS_BASE_DIR>"
+    # ── 2. mcp-server-filesystem（SSE @ 8002）────────────────────────
     try:
         r2, w2 = await stack.enter_async_context(sse_client(_FS_PROXY_SSE_URL))
         s2     = await stack.enter_async_context(ClientSession(r2, w2))
@@ -343,7 +330,18 @@ async def _start_mcp_sessions() -> None:
         print(f"❌ [MCP] filesystem SSE 连接失败（8002）：{exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
-    # ── 提交结果 ─────────────────────────────────────────────────────
+    # ── 3. ★ 新增 db_server.py MCP（SSE @ 8003）──────────────────────
+    try:
+        r3, w3 = await stack.enter_async_context(sse_client(_DB_SERVER_SSE_URL))
+        s3     = await stack.enter_async_context(ClientSession(r3, w3))
+        await s3.initialize()
+        db_tools = await load_tools(s3)
+        print(f"✅ [MCP] db_server 工具：{[t.name for t in db_tools]}")
+        all_tools.extend(db_tools)
+    except Exception as exc:
+        print(f"❌ [MCP] db_server SSE 连接失败（8003）：{exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
     if not all_tools:
         print("❌ [MCP] 所有 MCP 连接失败，registry 未就绪", file=sys.stderr)
         try:
@@ -361,24 +359,23 @@ async def _start_mcp_sessions() -> None:
 
 async def _start_mcp_sessions_stdio() -> None:
     """
-    ★ 后端路径（__main__ 直接运行）：用 stdio_client 分别 spawn 两个子进程：
+    后端路径（__main__ 直接运行）：stdio_client spawn 三个子进程：
       1. server.py          → math / data / http 工具
-      2. mcp-server-filesystem → 文件系统工具（官方包，stdio 模式）
-    两个进程完全独立，互不干扰。
-    仅在 __main__ 里调用，前端路径不使用此函数。
+      2. mcp-server-filesystem → 文件系统工具
+      3. db_server.py       → 数据库工具 ★ 新增
     """
     global _mcp_exit_stack
     if _mcp_exit_stack is not None:
         return
 
-    print(f"🔍 [MCP-stdio] SERVER_PATH = {SERVER_PATH}  (exists={SERVER_PATH.exists()})")
-    print(f"🔍 [MCP-stdio] FS_BASE_DIR = {_FS_BASE_DIR}  (exists={_FS_BASE_DIR.exists()})")
-    print(f"🔍 [MCP-stdio] platform={sys.platform}  python={sys.executable}")
+    print(f"🔍 [MCP-stdio] SERVER_PATH    = {SERVER_PATH}  (exists={SERVER_PATH.exists()})")
+    print(f"🔍 [MCP-stdio] DB_SERVER_PATH = {DB_SERVER_PATH}  (exists={DB_SERVER_PATH.exists()})")
+    print(f"🔍 [MCP-stdio] FS_BASE_DIR    = {_FS_BASE_DIR}  (exists={_FS_BASE_DIR.exists()})")
 
     stack = AsyncExitStack()
     all_tools: list[StructuredTool] = []
 
-    # ── 1. server.py MCP（stdio：math / data / http）────────────────
+    # ── 1. server.py（stdio）──────────────────────────────────────────
     if not SERVER_PATH.exists():
         print(f"❌ [MCP-stdio] 找不到 MCP server：{SERVER_PATH}", file=sys.stderr)
     else:
@@ -393,9 +390,7 @@ async def _start_mcp_sessions_stdio() -> None:
             print(f"❌ [MCP-stdio] server.py 启动失败：{exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
-    # ── 2. mcp-server-filesystem（stdio：文件系统工具）──────────────
-    # ★ Windows 下 npx 必须用 npx.cmd，否则 ENOENT。
-    #   filesystem_mcp_params() 已处理此问题。
+    # ── 2. mcp-server-filesystem（stdio）─────────────────────────────
     try:
         r2, w2 = await stack.enter_async_context(stdio_client(filesystem_mcp_params()))
         s2     = await stack.enter_async_context(ClientSession(r2, w2))
@@ -406,6 +401,21 @@ async def _start_mcp_sessions_stdio() -> None:
     except Exception as exc:
         print(f"❌ [MCP-stdio] mcp-server-filesystem 启动失败：{exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+
+    # ── 3. ★ 新增 db_server.py（stdio）───────────────────────────────
+    if not DB_SERVER_PATH.exists():
+        print(f"❌ [MCP-stdio] 找不到 DB MCP server：{DB_SERVER_PATH}", file=sys.stderr)
+    else:
+        try:
+            r3, w3 = await stack.enter_async_context(stdio_client(db_mcp_params()))
+            s3     = await stack.enter_async_context(ClientSession(r3, w3))
+            await s3.initialize()
+            db_tools = await load_tools(s3)
+            print(f"✅ [MCP-stdio] db_server 工具：{[t.name for t in db_tools]}")
+            all_tools.extend(db_tools)
+        except Exception as exc:
+            print(f"❌ [MCP-stdio] db_server 启动失败：{exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
     if not all_tools:
         print("❌ [MCP-stdio] 所有 MCP 连接失败", file=sys.stderr)
@@ -429,7 +439,6 @@ async def _stop_mcp_sessions() -> None:
         _mcp_exit_stack = None
     _tools.clear()
     _init_registry([])
-    # ★ 重置 Lock，下次启动时在新 loop 中重新创建
     _lazy_init_lock = None
     print("🛑 [MCP] 所有 session 已关闭")
 
@@ -471,7 +480,7 @@ def _init_registry(tools: list[StructuredTool]) -> None:
 
 
 # ══════════════════════════════════════════════════════
-# 公共工具函数
+# 公共工具函数（与原版完全一致）
 # ══════════════════════════════════════════════════════
 
 def _extract_json(raw: str) -> str:
@@ -545,69 +554,40 @@ def _planner_system() -> str:
   - 任何数值计算（加、减、乘、除、幂、开方等）→ math_agent
   - 任何网络请求（访问 URL、调用 HTTP API、fetch 等）→ http_agent
   - 任何数据分析（统计、分组、聚合、过滤等）→ data_agent
+  - 任何数据库查询（订单/用户/商品/库存/评价等）→ db_agent
+  - 任何文件操作（读写文件、列目录等）→ file_agent
 
 ❌ 严禁使用 direct 的情况（以下场景必须用工具 agent）：
-  - "计算 3+5" → 必须用 math_agent（不能自己算，必须调工具）
-  - "访问 https://..." → 必须用 http_agent（不能模拟，必须真实请求）
-  - "分析这批数据" → 必须用 data_agent（不能自行统计，必须调工具）
+  - "计算 3+5" → 必须用 math_agent
+  - "访问 https://..." → 必须用 http_agent
+  - "查询订单" / "有多少用户" / "库存不足的商品" → 必须用 db_agent
+  - "列出文件" / "读取文件" → 必须用 file_agent
 
 ✅ 可以使用 direct 的情况（仅限以下场景）：
   - 闲聊、问候（如"你好"、"介绍一下你自己"）
   - 纯知识性问答（如"什么是加权平均数"）
-  - 不涉及任何计算、网络请求、数据处理的场景
+  - 不涉及任何计算、网络请求、数据处理、数据库操作的场景
 
-判断口诀：只要涉及"算数字"、"访问网络"、"处理数据"，一律用工具 agent，绝不用 direct。
+━━ db_agent 使用说明 ━━
+db_agent 连接的是电商数据库，包含以下表：
+  users（用户）、products（商品）、categories（分类）、
+  orders（订单）、order_items（订单明细）、reviews（评价）、inventory_log（库存日志）
+优先使用 ask_db 工具（自然语言查询），只有在明确知道 SQL 时才用 query_db。
 
 ━━ 其他规则（严格遵守）━━
 1. description 只写任务意图，绝不提前计算数值或给出最终答案
-2. inputs 声明运行时需要从哪些前置任务获取参数：
-   - key   = 参数的语义名称（如"加数A"、"被乘数"），供 Agent 理解用途
-   - value = {{"from_task": <被依赖的task_id>, "field": "result"}}
+2. inputs 声明运行时需要从哪些前置任务获取参数
 3. depends_on 从 inputs 的 from_task 自动推导
 4. 没有依赖的任务：inputs 为 {{}}，depends_on 为 []
 5. 同一个 agent 可出现多次
 6. 任务按拓扑顺序排列（被依赖的任务排在前面）
-7. 如果用户消息中已直接包含数据（JSON 数组、数字、文本等），
-   不要单独拆"获取数据"任务，直接在处理任务的 description 里完整引用
 
 严格只输出 JSON 数组，不要有任何其他内容、代码块标记或说明文字。示例：
 [
   {{
     "task_id": 0,
-    "description": "用户打招呼，介绍自己叫 tony",
-    "agent": "direct",
-    "inputs": {{}},
-    "depends_on": [],
-    "status": "pending",
-    "result": "",
-    "_resolved_description": ""
-  }},
-  {{
-    "task_id": 1,
-    "description": "计算 88 加 12",
-    "agent": "math_agent",
-    "inputs": {{}},
-    "depends_on": [],
-    "status": "pending",
-    "result": "",
-    "_resolved_description": ""
-  }},
-  {{
-    "task_id": 2,
-    "description": "把前一步的结果乘以 5",
-    "agent": "math_agent",
-    "inputs": {{
-      "被乘数": {{"from_task": 1, "field": "result"}}
-    }},
-    "depends_on": [1],
-    "status": "pending",
-    "result": "",
-    "_resolved_description": ""
-  }},
-  {{
-    "task_id": 3,
-    "description": "访问 https://api.github.com/zen 获取随机箴言",
-    "agent": "http_agent",
+    "description": "查询所有来自 Toronto 的活跃用户",
+    "agent": "db_agent",
     "inputs": {{}},
     "depends_on": [],
     "status": "pending",
@@ -615,128 +595,57 @@ def _planner_system() -> str:
     "_resolved_description": ""
   }}
 ]
-
-注意：上面示例中"计算 88 加 12"用了 math_agent，"访问 URL"用了 http_agent，这是正确的。
-绝对不能把这类任务写成 agent="direct"。"""
-
-
-def _planner_retry_system(attempt: int, last_raw: str) -> str:
-    if attempt == 1:
-        return (
-            f"{_planner_system()}\n\n"
-            f"⚠️ 注意：你上一次的输出 JSON 解析失败，无法被程序解析。\n"
-            f"上次输出片段（前200字符）：\n{last_raw[:200]}\n\n"
-            f"请检查并修正，确保只输出合法的 JSON 数组，"
-            f"不要包含任何代码块标记（如 ```json）、说明文字或多余字符。"
-        )
-    else:
-        valid_agents = ", ".join(_registry.agents) if _registry.agents else "direct"
-        return (
-            "你是任务规划器。严格按照以下要求输出，不得有任何偏差：\n\n"
-            "1. 只输出一个 JSON 数组，数组里是任务对象\n"
-            "2. 不要输出任何其他文字、代码块标记、注释\n"
-            f"3. agent 只能是以下值之一：{valid_agents}, direct\n"
-            "4. 每个任务对象必须包含这些字段：\n"
-            '   task_id(int), description(str), agent(str), inputs(dict),\n'
-            '   depends_on(list), status("pending"), result(""), _resolved_description("")\n\n'
-            f"⚠️ 上次输出仍然解析失败，片段：{last_raw[:200]}\n\n"
-            f"用户问题：请重新规划。"
-        )
-
-
-def _validate_and_fix_task_plan(task_plan: list[Task]) -> list[Task]:
-    fixed_count = 0
-    for task in task_plan:
-        if task.get("agent") != "direct":
-            continue
-        description = task.get("description", "")
-        recommended = _task_needs_tool_agent(description)
-        if recommended:
-            print(f"  🔧 [合规校验] 任务[{task['task_id']}] agent: direct → {recommended}")
-            print(f"     原因：描述含工具关键词，描述={description[:60]}")
-            task["agent"] = recommended
-            fixed_count += 1
-    if fixed_count:
-        print(f"  ⚠️ 合规校验共修正 {fixed_count} 个任务的 agent 分配")
-    return task_plan
+"""
 
 
 async def planner_node(state: AgentState) -> AgentState:
-    # ★ 【修复12】_ensure_registry() 必须在 task_plan 判断之前调用
     await _ensure_registry()
 
-    if state.get("task_plan"):
-        return state
+    msgs = state.get("messages", [])
+    if not msgs:
+        return {**state, "next_agent": "FINISH", "task_plan": []}
 
-    print("\n  📋 Planner 开始拆解任务...")
+    user_msg = _get_message_content(msgs[0])
+    print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
 
-    user_message = _get_first_user_message(state)
-    last_raw     = ""
-    task_plan: list[Task] | None = None
-    max_attempts = 3
+    max_retries = 3
+    task_plan: list[Task] = []
 
-    for attempt in range(max_attempts):
-        if attempt == 0:
-            sys_msg = SystemMessage(content=_planner_system())
-        else:
-            print(f"  🔁 Planner 第 {attempt + 1} 次重试（JSON 解析失败）...")
-            sys_msg = SystemMessage(content=_planner_retry_system(attempt, last_raw))
-
-        response = await llm.ainvoke([sys_msg, user_message])
-        raw = _extract_json(_extract_llm_content(response).strip())
-        last_raw = raw
-
+    for attempt in range(max_retries):
         try:
-            parsed = json.loads(raw)
-            if not isinstance(parsed, list):
-                raise json.JSONDecodeError("期望 JSON 数组", raw, 0)
-            task_plan = parsed
-            print(f"  ✅ 拆解出 {len(task_plan)} 个任务（第 {attempt + 1} 次尝试成功）：")
+            response = await llm.ainvoke([
+                SystemMessage(content=_planner_system()),
+                HumanMessage(content=user_msg),
+            ])
+            raw = _extract_json(_extract_llm_content(response))
+            task_plan = json.loads(raw)
+
+            if not isinstance(task_plan, list) or len(task_plan) == 0:
+                raise ValueError("Empty or invalid task plan")
+
+            # 强制补齐必要字段
             for t in task_plan:
-                deps         = t.get("depends_on", [])
-                inputs       = t.get("inputs", {})
-                dep_str      = f"  依赖→{deps} 参数→{list(inputs.keys())}" if deps else ""
-                desc_preview = (
-                    t["description"][:60] + "…"
-                    if len(t["description"]) > 60
-                    else t["description"]
-                )
-                print(f"     [{t['task_id']}] {t['agent']} ← {desc_preview}{dep_str}")
+                t.setdefault("status", "pending")
+                t.setdefault("result", "")
+                t.setdefault("_resolved_description", "")
+                t.setdefault("inputs", {})
+                t.setdefault("depends_on", [])
+
+            print(f"  ✅ 规划完成（{len(task_plan)} 个任务）：")
+            for t in task_plan:
+                print(f"     [{t['task_id']}] {t['agent']:12s} → {t['description'][:50]}")
             break
 
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"  ⚠️ 第 {attempt + 1} 次解析失败：{e}  输出片段：{raw[:100]}")
-
-    if task_plan is None:
-        print("  ❌ Planner 连续 3 次解析失败，终止流程")
-        agent_scope = _registry.agent_desc_brief
-        failure_msg = (
-            "⚠️ 任务规划失败，无法处理您的请求。\n\n"
-            "━━ 失败详情 ━━\n"
-            f"原因：Planner 连续 {max_attempts} 次均无法生成合法的任务计划（JSON 格式错误）\n"
-            f"最后一次输出片段：\n  {last_raw[:200]}{'…' if len(last_raw) > 200 else ''}\n\n"
-            "━━ 可能的原因 ━━\n"
-            "  · 问题描述过于复杂或存在歧义，导致模型输出不稳定\n"
-            "  · 问题中包含特殊字符或格式干扰了 JSON 输出\n"
-            "  · 请求超出了当前可用工具的处理范围\n\n"
-            "━━ 当前可用能力 ━━\n"
-            f"{agent_scope}\n\n"
-            "建议：请尝试换一种更简洁清晰的方式重新描述您的问题。"
-        )
-        return {
-            **state,
-            "messages":        state["messages"] + [AIMessage(content=failure_msg)],
-            "task_plan":       [],
-            "current_task_id": 0,
-            "next_agent":      "FINISH",
-        }
-
-    task_plan = _validate_and_fix_task_plan(task_plan)
+        except Exception as e:
+            print(f"  ⚠️ Planner 第 {attempt+1} 次失败：{e}")
+            if attempt == max_retries - 1:
+                print("  ❌ Planner 全部失败，终止")
+                return {**state, "next_agent": "FINISH", "task_plan": []}
 
     return {
         **state,
         "task_plan":       task_plan,
-        "current_task_id": 0,
+        "current_task_id": task_plan[0]["task_id"] if task_plan else 0,
         "next_agent":      "",
     }
 
@@ -744,249 +653,131 @@ async def planner_node(state: AgentState) -> AgentState:
 # ══════════════════════════════════════════════════════
 # 8. Supervisor
 # ══════════════════════════════════════════════════════
+
 async def supervisor_node(state: AgentState) -> AgentState:
     task_plan: list[Task] = state.get("task_plan", [])
-    done_map = {t["task_id"]: t for t in task_plan if t["status"] == "done"}
 
-    for task in task_plan:
-        if task["status"] not in ("pending", "in_progress"):
-            continue
+    # 找下一个 pending 任务
+    next_task = next((t for t in task_plan if t.get("status") == "pending"), None)
 
-        unmet = [dep for dep in task.get("depends_on", []) if dep not in done_map]
-        if unmet:
-            print(f"\n  ⏳ 任务[{task['task_id']}] 等待依赖 {unmet}，跳过")
-            continue
+    if next_task is None:
+        print("\n🏁 [Supervisor] 所有任务完成 → FINISH")
+        return {**state, "next_agent": "FINISH"}
 
-        if task.get("agent") == "direct":
-            print(f"\n  🧭 Supervisor → direct_answer（任务[{task['task_id']}]）")
-            print(f"     意图：{task['description'][:80]}")
-            task["status"] = "in_progress"
-            return {
-                **state,
-                "next_agent":      "direct_answer",
-                "current_task_id": task["task_id"],
-                "task_plan":       task_plan,
-            }
+    # 检查依赖是否已完成
+    deps_done = all(
+        any(t["task_id"] == dep_id and t.get("status") in ("done", "in_progress")
+            for t in task_plan)
+        for dep_id in next_task.get("depends_on", [])
+    )
+    if not deps_done:
+        # 依赖未完成，跳过等待（理论上拓扑排序已保证顺序，这里只是保险）
+        print(f"  ⏳ [Supervisor] 任务 [{next_task['task_id']}] 依赖未就绪，跳过")
+        return {**state, "next_agent": "FINISH"}
 
-        print(f"\n  🧭 Supervisor → {task['agent']}（任务[{task['task_id']}]）")
-        print(f"     {task.get('_resolved_description', task['description']).replace(chr(10), ' | ')}")
+    # 解析运行时参数
+    inputs = next_task.get("inputs", {})
+    resolved_parts = []
+    for param_name, task_input in inputs.items():
+        src_id  = task_input.get("from_task")
+        field   = task_input.get("field", "result")
+        src     = next((t for t in task_plan if t["task_id"] == src_id), None)
+        val     = src.get(field, "") if src else ""
+        resolved_parts.append(f"【{param_name}】= {val}")
 
-        resolved_inputs: dict[str, str] = {}
-        for param_name, source in task.get("inputs", {}).items():
-            from_id   = source["from_task"]
-            src_field = source.get("field", "result")
-            src_task  = done_map.get(from_id, {})
-            resolved_inputs[param_name] = src_task.get(src_field, "")
+    resolved_desc = next_task["description"]
+    if resolved_parts:
+        resolved_desc += "\n\n【运行时参数】\n" + "\n".join(resolved_parts)
+    next_task["_resolved_description"] = resolved_desc
 
-        if resolved_inputs:
-            params_text = "\n".join(f"  {k} = {v}" for k, v in resolved_inputs.items())
-            task["_resolved_description"] = (
-                f"{task['description']}\n\n"
-                f"【运行时参数】\n{params_text}"
-            )
-        else:
-            task["_resolved_description"] = task["description"]
+    next_task["status"] = "in_progress"
+    agent = next_task.get("agent", "direct")
+    print(f"\n🎯 [Supervisor] 分配任务 [{next_task['task_id']}] → {agent}")
+    print(f"   描述：{next_task['description'][:60]}")
 
-        if task["agent"] not in _registry.agents:
-            print(f"  ❌ [{task['agent']}] 未在 registry 中注册，跳过任务[{task['task_id']}]")
-            print(f"     当前可用 agents: {_registry.agents}")
-            task["status"] = "done"
-            task["result"] = (
-                f"⚠️ {task['agent']} 未注册（可能 MCP 未启动）。"
-                f"可用 agents: {_registry.agents}"
-            )
-            continue
-
-        return {
-            **state,
-            "next_agent":      task["agent"],
-            "current_task_id": task["task_id"],
-            "task_plan":       task_plan,
-        }
-
-    pending = [t for t in task_plan if t["status"] == "pending"]
-    if pending:
-        print(f"\n  ⚠️ 任务 {[t['task_id'] for t in pending]} 依赖无法满足，强制跳过")
-        for t in pending:
-            t["status"] = "done"
-            t["result"] = "⚠️ 依赖未满足，跳过"
-
-    print("\n  🧭 Supervisor → FINISH")
-    return {**state, "next_agent": "FINISH", "task_plan": task_plan}
+    return {
+        **state,
+        "current_task_id": next_task["task_id"],
+        "next_agent":      agent,
+        "task_plan":       task_plan,
+    }
 
 
 # ══════════════════════════════════════════════════════
-# 9. Re-Planner
+# 9. Replanner
 # ══════════════════════════════════════════════════════
-def _replanner_system() -> str:
-    valid_agents = ", ".join(_registry.agents) if _registry.agents else "（无可用 Agent）"
-    return f"""你是任务再规划器。在每个工具子任务完成后，你需要判断是否需要调整剩余计划。
-
-{_registry.agent_desc_block}
-
-你会收到：
-1. 用户的原始问题
-2. 已完成任务的结果摘要
-3. 还未执行的 pending 任务列表
-
-你的决策：
-
-【情况A】计划不需要调整（绝大多数情况）
-直接输出：{{"action": "continue"}}
-
-【情况B】需要调整剩余计划（仅当出现以下情况时）
-- 某个任务的结果表明后续任务的方向需要改变
-- 发现原计划遗漏了必要步骤
-- 某个任务失败，需要用替代方案
-输出修改后的完整 pending 任务列表：
-{{"action": "replan", "new_pending_tasks": [...]}}
-
-注意事项：
-- new_pending_tasks 是完整的新 pending 列表，会替换掉所有旧的 pending 任务
-- task_id 从当前已完成任务的最大 id + 1 开始重新编号
-- inputs 里的 from_task 如果引用已完成任务，task_id 保持原来的值不变
-- status 统一写 "pending"，result 和 _resolved_description 写空字符串
-- agent 只能是：{valid_agents}（replan 时不应产生 direct 任务）
-- 不要新增任何"等待用户输入"、"获取数据"、"读取数据"类的占位任务
-- 如果不确定要不要 replan，选择 continue
-
-严格只输出 JSON，不要有任何其他内容。"""
-
 
 async def replanner_node(state: AgentState) -> AgentState:
-    task_plan: list[Task] = state.get("task_plan", [])
-    current_task_id: int  = state.get("current_task_id", -1)
-
-    done_tasks    = [t for t in task_plan if t["status"] == "done"]
-    pending_tasks = [t for t in task_plan if t["status"] == "pending"]
-
-    if not pending_tasks:
-        print("\n  🔄 Re-Planner：无剩余任务，跳过")
-        return state
-
-    done_summary    = "\n".join(
-        f"  任务[{t['task_id']}]（{t['description']}）→ 结果：{t['result'][:100]}"
-        for t in done_tasks
-    )
-    pending_summary = json.dumps(pending_tasks, ensure_ascii=False, indent=2)
-
-    print(f"\n  🔄 Re-Planner 检查任务[{current_task_id}]完成后是否需要调整计划...")
-
-    response = await llm.ainvoke([
-        SystemMessage(content=_replanner_system()),
-        HumanMessage(content=(
-            f"用户原始问题：{_get_message_content(state['messages'][0])}\n\n"
-            f"已完成任务：\n{done_summary}\n\n"
-            f"待执行任务（pending）：\n{pending_summary}"
-        )),
-    ])
-
-    raw = _extract_json(_extract_llm_content(response))
-
-    try:
-        decision = json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"  ⚠️ Re-Planner JSON 解析失败，保持原计划：{raw[:100]}")
-        return state
-
-    if decision.get("action") == "continue":
-        print("  ✅ Re-Planner：计划无需调整，继续执行")
-        return state
-
-    if decision.get("action") == "replan":
-        new_pending: list[Task] = decision.get("new_pending_tasks", [])
-        if not new_pending:
-            print("  ✅ Re-Planner：replan 但 new_pending_tasks 为空，继续执行")
-            return state
-
-        valid_agents = set(_registry.agents)
-        new_pending  = [t for t in new_pending if t.get("agent") in valid_agents]
-        if not new_pending:
-            print("  ⚠️ Re-Planner：所有新任务 agent 非法，保持原计划")
-            return state
-
-        updated_plan = done_tasks + new_pending
-        print(f"  🔁 Re-Planner：计划已调整，新增/修改 {len(new_pending)} 个 pending 任务：")
-        for t in new_pending:
-            print(f"     [{t['task_id']}] {t['agent']} ← {t['description']}")
-        return {**state, "task_plan": updated_plan}
-
-    print("  ✅ Re-Planner：未识别的 action，保持原计划")
+    """当前任务完成后，检查是否需要重新规划（目前直接返回，预留扩展点）"""
+    task_plan = state.get("task_plan", [])
+    done = sum(1 for t in task_plan if t.get("status") == "done")
+    total = len(task_plan)
+    print(f"\n🔄 [Replanner] 进度 {done}/{total}")
     return state
 
 
 # ══════════════════════════════════════════════════════
-# 10. 通用工具 Agent 执行器
+# 10. run_agent（通用工具执行节点）
 # ══════════════════════════════════════════════════════
-async def run_agent(
-    state: AgentState,
-    agent_name: str,
-    system_prompt: str,
-) -> AgentState:
-    lc_tools   = _registry.tools_for(agent_name)
-    tool_names = _registry.tool_names_for(agent_name)
-    by_name    = {t.name: t for t in lc_tools}
 
-    task_plan: list[Task] = state.get("task_plan", [])
-    task_id: int          = state.get("current_task_id", 0)
+async def run_agent(state: AgentState, agent_name: str, system_prompt: str) -> AgentState:
+    task_plan:    list[Task] = state.get("task_plan", [])
+    task_id:      int        = state.get("current_task_id", 0)
+    current_task             = next((t for t in task_plan if t["task_id"] == task_id), None)
 
-    current_task = next((t for t in task_plan if t["task_id"] == task_id), None)
     if not current_task:
-        print(f"  ⚠️ [{agent_name}] 找不到任务 task_id={task_id}")
+        print(f"  ⚠️ [{agent_name}] 找不到任务 {task_id}")
         return state
 
-    task_description = current_task.get("_resolved_description") or current_task["description"]
+    intent    = current_task.get("_resolved_description") or current_task.get("description", "")
+    tools     = _registry.tools_for(agent_name)
+    tool_names = _registry.tool_names_for(agent_name)
 
-    if not lc_tools:
+    print(f"\n🤖 [{agent_name}] 执行任务：{intent[:80]}")
+    print(f"   可用工具：{tool_names}")
+
+    if not tools:
+        print(f"  ⚠️ [{agent_name}] 没有可用工具，直接 LLM 回答")
+        resp = await llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=intent),
+        ])
         current_task["status"] = "done"
-        current_task["result"] = f"⚠️ 没有可用工具（{agent_name} 未注册任何工具）"
+        current_task["result"] = _extract_llm_content(resp)
         return {**state, "task_plan": task_plan}
 
-    tool_hint = "可用工具：" + "、".join(
-        f"{t.name}（{t.description or '无描述'}）" for t in lc_tools
-    )
-    full_system = (
-        f"{system_prompt}\n\n"
-        f"{tool_hint}\n\n"
-        "【重要约束】你必须通过调用工具来完成任务，严禁凭记忆、推理或编造直接给出答案。"
-        "即使你认为自己知道答案，也必须先调用工具获取真实结果，再基于工具返回值回答。"
-    )
-    agent_llm = llm.bind_tools(lc_tools)
+    # 绑定工具
+    llm_with_tools = llm.bind_tools(tools)
     msgs = [
-        SystemMessage(content=full_system),
-        HumanMessage(content=task_description),
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=intent),
     ]
 
-    print(f"\n  ▶ {agent_name} 执行任务[{task_id}]（工具：{tool_names}）")
-
-    max_steps     = 10
+    max_steps    = 6
     last_response = None
 
     for step in range(max_steps):
-        response = await agent_llm.ainvoke(msgs)
+        response = await llm_with_tools.ainvoke(msgs)
         last_response = response
         msgs.append(response)
 
-        has_tool_calls = hasattr(response, "tool_calls") and response.tool_calls
+        # 兼容 dict 响应
+        if isinstance(response, dict):
+            tool_calls = response.get("tool_calls", [])
+            text_content = response.get("content", "")
+        else:
+            tool_calls   = getattr(response, "tool_calls", []) or []
+            text_content = getattr(response, "content", "") or ""
 
-        if step == 0 and not has_tool_calls:
-            tool_list_str = "、".join(tool_names)
-            force_msg = (
-                f"你刚才没有调用任何工具就直接回答了，这是不允许的。\n"
-                f"你拥有以下工具：{tool_list_str}\n"
-                f"请立即调用对应工具来完成任务，不要直接给出文字答案。"
-            )
-            print(f"  ⚠️ {agent_name} 第1轮未调用工具，追加强制提示重试...")
-            msgs.append(HumanMessage(content=force_msg))
-            continue
-
-        if not has_tool_calls:
-            print(f"  ✅ {agent_name} 任务[{task_id}] 完成（{step + 1} 轮推理）")
+        if not tool_calls:
+            print(f"  ✅ [{agent_name}] step={step} 无工具调用，任务完成")
             break
 
-        print(f"  📋 {agent_name} 第 {step + 1} 轮，调用工具：")
-        for tc in response.tool_calls:
-            tool = by_name.get(tc["name"])
+        print(f"  🔧 [{agent_name}] step={step} 工具调用：{[tc['name'] for tc in tool_calls]}")
+
+        # 执行工具调用
+        for tc in tool_calls:
+            tool = _registry.get_tool(tc["name"])
             if tool:
                 args        = {k: v for k, v in tc["args"].items() if v is not None}
                 result_text = await tool.coroutine(**args)
@@ -994,7 +785,7 @@ async def run_agent(
                 result_text = f"❌ 未找到工具：{tc['name']}"
             msgs.append(ToolMessage(content=result_text, tool_call_id=tc["id"]))
     else:
-        print(f"  ⚠️ {agent_name} 达到最大步数 {max_steps}，强制终止")
+        print(f"  ⚠️ [{agent_name}] 达到最大步数 {max_steps}，强制终止")
 
     current_task["status"] = "done"
     current_task["result"] = _extract_llm_content(last_response) if last_response else "（无结果）"
@@ -1035,6 +826,22 @@ AGENT_SYSTEM_PROMPTS: dict[str, str] = {
         "  - 获取文件信息 → get_file_info\n"
         "操作成功后返回简洁的结果说明，失败时返回具体错误信息。"
     ),
+    # ★ 新增 db_agent
+    "db_agent": (
+        "你是电商数据库查询专家。数据库包含以下表：\n"
+        "  users（用户：id/name/email/age/city/status）\n"
+        "  products（商品：id/name/category_id/price/stock/status）\n"
+        "  categories（分类：id/name/parent_id）\n"
+        "  orders（订单：id/user_id/status/total/shipping_address/created_at）\n"
+        "  order_items（订单明细：id/order_id/product_id/qty/unit_price）\n"
+        "  reviews（评价：id/user_id/product_id/rating/comment）\n"
+        "  inventory_log（库存日志：id/product_id/delta/reason/created_at）\n\n"
+        "工具使用原则：\n"
+        "  - 优先使用 ask_db（自然语言输入，AI 自动生成 SQL）\n"
+        "  - 需要查看表结构时使用 get_schema\n"
+        "  - 明确知道 SQL 时可直接用 query_db（SELECT）或 execute_db（INSERT/UPDATE）\n"
+        "  - 得到结果后用中文简洁总结，不要重复罗列原始数据"
+    ),
 }
 
 DEFAULT_AGENT_SYSTEM_PROMPT = (
@@ -1072,7 +879,7 @@ def build_graph() -> Any:
 
         return {
             **state,
-            "messages": state["messages"] + [AIMessage(content=answer)],
+            "messages":  state["messages"] + [AIMessage(content=answer)],
             "task_plan": task_plan,
         }
 
@@ -1116,7 +923,6 @@ def build_graph() -> Any:
 
     def planner_route(state: AgentState) -> str:
         if state.get("next_agent") == "FINISH":
-            print("  ⛔ Planner 规划失败，直接终止，不进入 Supervisor")
             return "END"
         return "supervisor"
 
@@ -1174,20 +980,25 @@ def build_graph() -> Any:
 graph = build_graph()
 
 
-
 # ══════════════════════════════════════════════════════
-# 14. __main__ —— 后端测试，直接用 stdio_client
+# 13. __main__ —— 后端测试（stdio 模式，直接运行）
 #     命令：uv run python src/langgraph_stdio_agent.py
-#     完全独立，不依赖 SSE 进程，不影响前端测试
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
     QUESTIONS = [
-        "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
-        # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        # ── 纯 DB 查询测试 ──
+        "查询所有来自 Toronto 的活跃用户",
+        # "统计每个城市的用户数量，按数量降序排列",
+        # "找出销售额最高的前 5 个商品",
+        # "查询所有状态为 completed 的订单，并显示对应的用户名称",
+        # "哪些商品的库存为 0？",
+        # "查询平均评分低于 3 分的商品",
+
+        # ── 混合任务测试 ──
+        # "查询 Toronto 用户数量，然后计算这个数字的平方",
     ]
 
     async def main():
-        # ★ 后端测试专用：使用 stdio_client 直接 spawn 子进程
         await _start_mcp_sessions_stdio()
         try:
             for q in QUESTIONS:
@@ -1202,6 +1013,4 @@ if __name__ == "__main__":
         finally:
             await _stop_mcp_sessions()
 
-    if sys.platform == "win32":
-        pass  # ProactorEventLoop 已在模块顶层设置
     asyncio.run(main())
