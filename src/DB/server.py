@@ -32,12 +32,15 @@ def ping() -> str:
 @mcp.tool()
 def ask_db(question: str) -> str:
     """用自然语言查询数据库，返回 SQL 和查询结果"""
+    log(f"DEEPSEEK_API_KEY 存在: {bool(os.getenv('DEEPSEEK_API_KEY'))}")
     log(f"ask_db() 收到问题: {question}")
     try:
         log("正在调用 run()...")
         result = run(question)
         log(f"run() 返回成功, SQL: {result.get('sql', '?')}")
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        # ✅ STDIO 模式：不能用 indent，必须单行 JSON
+        # ✅ SSE 模式：单行也完全正常
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         log(f"ask_db() 出错: {e}")
         return json.dumps({"error": str(e)}, ensure_ascii=False)
@@ -52,7 +55,6 @@ if __name__ == "__main__":
         log(f"SSE 模式启动，监听 http://0.0.0.0:{port}")
         log(f"Inspector 连接地址: http://localhost:{port}/sse")
 
-        # ✅ 手动加 CORS 中间件，解决 Inspector OPTIONS 405 问题
         from starlette.middleware.cors import CORSMiddleware
         import uvicorn
 

@@ -33,6 +33,8 @@ def get_llm():
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com",
             temperature=0,
+            timeout=30,        # ← 加这行
+            max_retries=1,     # ← 加这行
         )
     return _llm
 
@@ -88,17 +90,26 @@ def explain_result(question: str, result):
 # =========================
 def run(question: str):
     from DBAgent.tools import query_db, execute_db
+    import sys
+
+    def log(msg):
+        print(f"[agent] {msg}", file=sys.stderr, flush=True)
 
     # 1. NL → SQL
+    log("开始 nl_to_sql...")
     sql = nl_to_sql(question)
+    log(f"nl_to_sql 完成: {sql}")
 
     # 2. 优化 SQL
+    log("开始 optimize...")
     try:
         optimized = get_optimizer().optimize(sql)
     except ValueError as e:
         return {"error": str(e), "sql": sql, "result": None}
+    log(f"optimize 完成: {optimized.sql}")
 
     # 3. 执行 SQL
+    log("开始执行 SQL...")
     try:
         if optimized.action == "query_db":
             result = query_db(optimized.sql)
@@ -106,8 +117,8 @@ def run(question: str):
             result = execute_db(optimized.sql)
     except Exception as e:
         return {"error": f"执行失败: {str(e)}", "sql": optimized.sql, "result": None}
+    log(f"SQL 执行完成: {result}")
 
-    # 4. 返回结果
     return {
         "sql": optimized.sql,
         "action": optimized.action,
