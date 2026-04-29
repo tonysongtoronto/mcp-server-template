@@ -5,9 +5,12 @@
 #   "http": { "app": "./src/webapp.py:app" }
 #
 # ★ 子进程清单（lifespan 负责拉起 + 关闭）：
-#   1. mcp_server_template/server.py  → SSE @ 8001  math / data / http 工具
+#   1. mcp_server_template/server.py  → SSE @ 8001  data / http 工具
 #   2. mcp-proxy (filesystem)         → SSE @ 8002  文件系统工具
-#   3. mcp_db_server/server.py        → SSE @ 8003  数据库工具（新增）
+#   3. mcp_db_server/server.py        → SSE @ 8003  数据库工具
+#   4. mcp-proxy (math-mcp)           → SSE @ 8004  数学工具（★ 新增）
+#      └─ 底层：node src/math-mcp/build/index.js（stdio）
+#              由 mcp-proxy 包成 SSE 对外暴露
 
 import os
 import signal
@@ -25,9 +28,10 @@ from fastapi import FastAPI
 # ──────────────────────────────────────────
 # 配置
 # ──────────────────────────────────────────
-_SERVER_PORT    = int(os.getenv("MCP_SERVER_PORT",    "8001"))
-_FS_PROXY_PORT  = int(os.getenv("MCP_FS_PROXY_PORT",  "8002"))
-_DB_SERVER_PORT = int(os.getenv("MCP_DB_SERVER_PORT", "8003"))   # ★ 新增
+_SERVER_PORT     = int(os.getenv("MCP_SERVER_PORT",     "8001"))
+_FS_PROXY_PORT   = int(os.getenv("MCP_FS_PROXY_PORT",   "8002"))
+_DB_SERVER_PORT  = int(os.getenv("MCP_DB_SERVER_PORT",  "8003"))
+_MATH_PROXY_PORT = int(os.getenv("MCP_MATH_PROXY_PORT", "8004"))   # ★ 新增
 
 _MCP_FS_ENV = os.getenv("MCP_FS_BASE_DIR", "")
 if _MCP_FS_ENV:
@@ -36,9 +40,13 @@ else:
     _FS_BASE_DIR = Path(__file__).parent.parent / "File_Agent"
 
 _SERVER_PY    = Path(__file__).parent / "mcp_server_template" / "server.py"
-_DB_SERVER_PY = Path(__file__).parent / "mcp_db_server" / "server.py"   # ★ 新增
+_DB_SERVER_PY = Path(__file__).parent / "mcp_db_server" / "server.py"
+
+# ★ 新增：math-mcp Node.js 入口（src/math-mcp/build/index.js）
+_MATH_MCP_JS  = Path(__file__).parent / "math-mcp" / "build" / "index.js"
 
 _NPX = "npx.cmd" if sys.platform == "win32" else "npx"
+_NODE = "node.exe" if sys.platform == "win32" else "node"
 
 
 # ──────────────────────────────────────────
@@ -156,7 +164,7 @@ _subprocesses: list[subprocess.Popen] = []
 async def lifespan(app: FastAPI):
     print("\n🟢 [lifespan] 开始启动 MCP 子进程...", file=sys.stderr)
 
-    # ── 1. 启动 server.py（SSE @ 8001：math / data / http）──────────
+    # ── 1. 启动 server.py（SSE @ 8001：data / http）──────────────────
     server_proc = _launch_subprocess(
         tag="server.py",
         cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
@@ -195,7 +203,7 @@ async def lifespan(app: FastAPI):
         print(f"  {'✅' if ok else '❌'} [mcp-proxy] SSE {'就绪' if ok else '超时（30s）'}",
               file=sys.stderr)
 
-    # ── 3. ★ 新增：启动 db_server.py（SSE @ 8003：数据库工具）───────
+    # ── 3. 启动 db_server.py（SSE @ 8003：数据库工具）───────────────
     db_proc = _launch_subprocess(
         tag="db_server.py",
         cmd=[sys.executable, "-u", str(_DB_SERVER_PY), "--sse"],
@@ -214,7 +222,28 @@ async def lifespan(app: FastAPI):
         print(f"  {'✅' if ok else '❌'} [db_server.py] SSE {'就绪' if ok else '超时（30s）'}",
               file=sys.stderr)
 
-    # ── 4. 初始化 MCP sessions（SSE 连接）────────────────────────────
+    # ── 4. ★ 新增：启动 mcp-proxy（SSE @ 8004：math-mcp Node.js）────
+    #   底层命令：node src/math-mcp/build/index.js（stdio 模式）
+    #   由 mcp-proxy 包成 SSE 对外暴露，保持与其他 MCP 服务一致的接入方式。
+    _math_sub_cmd = f"{_NODE} {_MATH_MCP_JS}"
+    math_proc = _launch_subprocess(
+        tag="mcp-proxy(math)",
+        cmd=[_NPX, "mcp-proxy",
+             "--port", str(_MATH_PROXY_PORT),
+             "--server", "sse",
+             "--shell",
+             "--", _math_sub_cmd],
+        port=_MATH_PROXY_PORT,
+    )
+    if math_proc:
+        _subprocesses.append(math_proc)
+        print(f"  ⏳ [mcp-proxy(math)] 等待 SSE 就绪 http://127.0.0.1:{_MATH_PROXY_PORT}/sse ...",
+              file=sys.stderr)
+        ok = await _wait_for_sse(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse")
+        print(f"  {'✅' if ok else '❌'} [mcp-proxy(math)] SSE {'就绪' if ok else '超时（30s）'}",
+              file=sys.stderr)
+
+    # ── 5. 初始化 MCP sessions（SSE 连接）────────────────────────────
     from src.langgraph_stdio_agent import _start_mcp_sessions
     await _start_mcp_sessions()
     print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
@@ -222,11 +251,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # ── 5. 关闭 MCP sessions ─────────────────────────
+        # ── 6. 关闭 MCP sessions ─────────────────────────
         from src.langgraph_stdio_agent import _stop_mcp_sessions
         await _stop_mcp_sessions()
 
-        # ── 6. 终止所有子进程 ────────────────────────────
+        # ── 7. 终止所有子进程 ────────────────────────────
         print("\n🛑 [lifespan] 关闭子进程...", file=sys.stderr)
         for proc in reversed(_subprocesses):
             _terminate_subprocess("subprocess", proc)

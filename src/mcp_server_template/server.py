@@ -17,6 +17,8 @@ logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
 mcp = FastMCP("MCP Server Template", host="0.0.0.0")
 # ★ 文件系统工具已移除，改由 mcp-server-filesystem 独立进程提供。
 #   见 webapp.py lifespan（SSE 模式）和 langgraph_stdio_agent.py（stdio 模式）。
+# ★ 数学工具已移除（add_numbers / multiply_numbers / divide_numbers），
+#   改由 math-mcp（Node.js）独立进程提供，见 webapp.py lifespan @ 8004。
 
 # ──────────────────────────────────────────
 # 🌐 HTTP 工具（依赖 httpx）
@@ -128,32 +130,11 @@ def group_and_aggregate(
 
 
 @mcp.tool()
-def add_numbers(a: int, b: int) -> int:
-    """两个数字相加"""
-    return a + b
-
-
-@mcp.tool()
-def multiply_numbers(a: int, b: int) -> int:
-    """两个数字相乘"""
-    return a * b
-
-
-@mcp.tool()
-def divide_numbers(a: float, b: float) -> float:
-    """两个数字相除"""
-    if b == 0:
-        raise ValueError("除数不能为 0")
-    return a / b
-
-
-@mcp.tool()
 def get_server_info() -> str:
     """返回服务器信息"""
     return "MCP Server Template 运行中，平台: {}, Python: {}".format(
         sys.platform, sys.version.split()[0]
     )
-
 
 
 @mcp.resource("welcome://message")

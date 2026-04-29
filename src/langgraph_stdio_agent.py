@@ -75,7 +75,10 @@ llm = ChatOpenAI(
 # 2. MCP server 路径 & 启动参数
 # ══════════════════════════════════════════════════════
 SERVER_PATH    = Path(__file__).parent / "mcp_server_template" / "server.py"
-DB_SERVER_PATH = Path(__file__).parent / "mcp_db_server" / "server.py"   # ★ 新增
+DB_SERVER_PATH = Path(__file__).parent / "mcp_db_server" / "server.py"
+
+# ★ 新增：math-mcp Node.js 入口（src/math-mcp/build/index.js）
+MATH_MCP_JS    = Path(__file__).parent / "math-mcp" / "build" / "index.js"
 
 _MCP_FS_ENV = os.getenv("MCP_FS_BASE_DIR", "")
 if _MCP_FS_ENV:
@@ -83,13 +86,15 @@ if _MCP_FS_ENV:
 else:
     _FS_BASE_DIR = Path(__file__).parent.parent / "File_Agent"
 
-_SERVER_PORT    = int(os.getenv("MCP_SERVER_PORT",    "8001"))
-_FS_PROXY_PORT  = int(os.getenv("MCP_FS_PROXY_PORT",  "8002"))
-_DB_SERVER_PORT = int(os.getenv("MCP_DB_SERVER_PORT", "8003"))   # ★ 新增
+_SERVER_PORT     = int(os.getenv("MCP_SERVER_PORT",     "8001"))
+_FS_PROXY_PORT   = int(os.getenv("MCP_FS_PROXY_PORT",   "8002"))
+_DB_SERVER_PORT  = int(os.getenv("MCP_DB_SERVER_PORT",  "8003"))
+_MATH_PROXY_PORT = int(os.getenv("MCP_MATH_PROXY_PORT", "8004"))   # ★ 新增
 
 _SERVER_SSE_URL    = f"http://127.0.0.1:{_SERVER_PORT}/sse"
 _FS_PROXY_SSE_URL  = f"http://127.0.0.1:{_FS_PROXY_PORT}/sse"
-_DB_SERVER_SSE_URL = f"http://127.0.0.1:{_DB_SERVER_PORT}/sse"   # ★ 新增
+_DB_SERVER_SSE_URL = f"http://127.0.0.1:{_DB_SERVER_PORT}/sse"
+_MATH_PROXY_SSE_URL = f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse"  # ★ 新增
 
 
 def mcp_params() -> StdioServerParameters:
@@ -108,12 +113,21 @@ def filesystem_mcp_params() -> StdioServerParameters:
         env={**os.environ},
     )
 
-def db_mcp_params() -> StdioServerParameters:                     # ★ 新增
+def db_mcp_params() -> StdioServerParameters:
     """后端测试：以 stdio 模式启动 db_server.py"""
     return StdioServerParameters(
         command=sys.executable,
         args=["-u", str(DB_SERVER_PATH)],
         env={"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", **os.environ},
+    )
+
+def math_mcp_params() -> StdioServerParameters:                    # ★ 新增
+    """后端测试：以 stdio 模式启动 math-mcp（Node.js）"""
+    node_cmd = "node.exe" if sys.platform == "win32" else "node"
+    return StdioServerParameters(
+        command=node_cmd,
+        args=[str(MATH_MCP_JS)],
+        env={**os.environ},
     )
 
 
@@ -122,8 +136,9 @@ def db_mcp_params() -> StdioServerParameters:                     # ★ 新增
 # ══════════════════════════════════════════════════════
 
 AGENT_TOOL_PATTERNS: dict[str, list[str]] = {
-    "math_agent": ["add_numbers", "multiply_numbers", "subtract_numbers",
-                   "divide_numbers", "power*", "sqrt*", "math_*"],
+    # ★ 更新：使用 math-mcp（Node.js）的实际工具名
+    #   add / subtract / multiply / division（四则运算，够用）
+    "math_agent": ["add", "subtract", "multiply", "division"],
     "data_agent": ["dataframe_summary", "group_and_aggregate", "filter_rows",
                    "sort_dataframe", "pivot_table", "data_*", "df_*"],
     "http_agent": ["fetch_url", "post_json", "http_get", "http_post",
@@ -132,7 +147,6 @@ AGENT_TOOL_PATTERNS: dict[str, list[str]] = {
                    "read_multiple_files", "list_directory", "create_directory",
                    "move_file", "search_files", "get_file_info",
                    "list_allowed_directories", "file_*"],
-    # ★ 新增 db_agent
     "db_agent":   ["ask_db", "query_db", "execute_db", "get_schema",
                    "db_*", "sql_*"],
 }
@@ -308,6 +322,7 @@ async def _start_mcp_sessions() -> None:
     print(f"🔍 [MCP] server SSE URL:     {_SERVER_SSE_URL}")
     print(f"🔍 [MCP] filesystem SSE URL: {_FS_PROXY_SSE_URL}")
     print(f"🔍 [MCP] db server SSE URL:  {_DB_SERVER_SSE_URL}")
+    print(f"🔍 [MCP] math-mcp SSE URL:   {_MATH_PROXY_SSE_URL}")
 
     stack = AsyncExitStack()
     all_tools: list[StructuredTool] = []
@@ -348,6 +363,18 @@ async def _start_mcp_sessions() -> None:
         print(f"❌ [MCP] db_server SSE 连接失败（8003）：{exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
+    # ── 4. ★ 新增 math-mcp（SSE @ 8004）─────────────────────────────
+    try:
+        r4, w4 = await stack.enter_async_context(sse_client(_MATH_PROXY_SSE_URL))
+        s4     = await stack.enter_async_context(ClientSession(r4, w4))
+        await s4.initialize()
+        math_tools = await load_tools(s4)
+        print(f"✅ [MCP] math-mcp 工具：{[t.name for t in math_tools]}")
+        all_tools.extend(math_tools)
+    except Exception as exc:
+        print(f"❌ [MCP] math-mcp SSE 连接失败（8004）：{exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
     if not all_tools:
         print("❌ [MCP] 所有 MCP 连接失败，registry 未就绪", file=sys.stderr)
         try:
@@ -376,6 +403,7 @@ async def _start_mcp_sessions_stdio() -> None:
 
     print(f"🔍 [MCP-stdio] SERVER_PATH    = {SERVER_PATH}  (exists={SERVER_PATH.exists()})")
     print(f"🔍 [MCP-stdio] DB_SERVER_PATH = {DB_SERVER_PATH}  (exists={DB_SERVER_PATH.exists()})")
+    print(f"🔍 [MCP-stdio] MATH_MCP_JS    = {MATH_MCP_JS}  (exists={MATH_MCP_JS.exists()})")
     print(f"🔍 [MCP-stdio] FS_BASE_DIR    = {_FS_BASE_DIR}  (exists={_FS_BASE_DIR.exists()})")
 
     stack = AsyncExitStack()
@@ -421,6 +449,22 @@ async def _start_mcp_sessions_stdio() -> None:
             all_tools.extend(db_tools)
         except Exception as exc:
             print(f"❌ [MCP-stdio] db_server 启动失败：{exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+    # ── 4. ★ 新增 math-mcp（stdio）───────────────────────────────────
+    if not MATH_MCP_JS.exists():
+        print(f"❌ [MCP-stdio] 找不到 math-mcp：{MATH_MCP_JS}", file=sys.stderr)
+        print(f"   请先执行：cd src/math-mcp && npm install && npm run build", file=sys.stderr)
+    else:
+        try:
+            r4, w4 = await stack.enter_async_context(stdio_client(math_mcp_params()))
+            s4     = await stack.enter_async_context(ClientSession(r4, w4))
+            await s4.initialize()
+            math_tools = await load_tools(s4)
+            print(f"✅ [MCP-stdio] math-mcp 工具：{[t.name for t in math_tools]}")
+            all_tools.extend(math_tools)
+        except Exception as exc:
+            print(f"❌ [MCP-stdio] math-mcp 启动失败：{exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
     if not all_tools:
@@ -1023,7 +1067,7 @@ if __name__ == "__main__":
 
     QUESTIONS = [
         # ── 纯 DB 查询测试 ──
-        # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
         # "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
         
         "查询所有来自 Toronto 的活跃用户",
