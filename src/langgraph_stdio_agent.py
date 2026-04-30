@@ -758,7 +758,9 @@ async def supervisor_node(state: AgentState) -> AgentState:
     agent = next_task.get("agent", "direct")
     if agent == "direct":
         agent = "direct_answer"
-    print(f"\n🎯 [Supervisor] 分配任务 [{next_task['task_id']}] → {agent}")
+    done  = sum(1 for t in task_plan if t.get("status") == "done")
+    total = len(task_plan)
+    print(f"\n🎯 [Supervisor] 进度 {done}/{total} | 分配任务 [{next_task['task_id']}] → {agent}")
     print(f"   描述：{next_task['description'][:60]}")
 
     return {
@@ -770,20 +772,7 @@ async def supervisor_node(state: AgentState) -> AgentState:
 
 
 # ══════════════════════════════════════════════════════
-# 9. Replanner
-# ══════════════════════════════════════════════════════
-
-async def replanner_node(state: AgentState) -> AgentState:
-    """当前任务完成后，检查是否需要重新规划（目前直接返回，预留扩展点）"""
-    task_plan = state.get("task_plan", [])
-    done = sum(1 for t in task_plan if t.get("status") == "done")
-    total = len(task_plan)
-    print(f"\n🔄 [Replanner] 进度 {done}/{total}")
-    return state
-
-
-# ══════════════════════════════════════════════════════
-# 10. run_agent（通用工具执行节点）
+# 9. run_agent（通用工具执行节点）
 # ══════════════════════════════════════════════════════
 
 async def run_agent(state: AgentState, agent_name: str, system_prompt: str) -> AgentState:
@@ -1019,7 +1008,6 @@ def build_graph() -> Any:
 
     g.add_node("planner",       planner_node)
     g.add_node("supervisor",    supervisor_node)
-    g.add_node("replanner",     replanner_node)
     g.add_node("direct_answer", direct_answer_node)
     g.add_node("final_answer",  final_answer_node)
 
@@ -1046,9 +1034,9 @@ def build_graph() -> Any:
 
     g.add_edge("direct_answer", "supervisor")
 
+    # replanner 已移除，agent 执行完直接回 supervisor
     for agent_name in known_agents:
-        g.add_edge(agent_name, "replanner")
-    g.add_edge("replanner", "supervisor")
+        g.add_edge(agent_name, "supervisor")
 
     g.add_edge("final_answer", END)
 
@@ -1085,12 +1073,12 @@ if __name__ == "__main__":
 
     QUESTIONS = [
         # ── 纯 DB 查询测试 ──
-       
+        " , l "
         # "你好",
-        "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
         # "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
         
-        "查询所有来自 Toronto 的活跃用户",
+        # "查询所有来自 Toronto 的活跃用户",
         # "统计每个城市的用户数量，按数量降序排列",
         # "找出销售额最高的前 5 个商品",
         # "查询所有状态为 completed 的订单，并显示对应的用户名称",
