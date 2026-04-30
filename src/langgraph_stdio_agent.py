@@ -754,6 +754,8 @@ async def supervisor_node(state: AgentState) -> AgentState:
 
     next_task["status"] = "in_progress"
     agent = next_task.get("agent", "direct")
+    if agent == "direct":
+        agent = "direct_answer"
     print(f"\n🎯 [Supervisor] 分配任务 [{next_task['task_id']}] → {agent}")
     print(f"   描述：{next_task['description'][:60]}")
 
@@ -1067,10 +1069,12 @@ if __name__ == "__main__":
 
     QUESTIONS = [
         # ── 纯 DB 查询测试 ──
-        "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        " , l "
+        # "你好",
+        # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
         # "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
         
-        "查询所有来自 Toronto 的活跃用户",
+        # "查询所有来自 Toronto 的活跃用户",
         # "统计每个城市的用户数量，按数量降序排列",
         # "找出销售额最高的前 5 个商品",
         # "查询所有状态为 completed 的订单，并显示对应的用户名称",
