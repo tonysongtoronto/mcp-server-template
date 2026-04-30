@@ -525,8 +525,10 @@ async def load_tools(session: ClientSession) -> list[StructuredTool]:
 
 
 def _init_registry(tools: list[StructuredTool]) -> None:
-    global _registry
+    global _registry, graph
     _registry = ToolRegistry.build(tools) if tools else ToolRegistry()
+    # ★ 修复：registry 就绪后立刻重新编译图，确保 default_agent 等动态节点都能进图
+    graph = build_graph()
 
 
 # ══════════════════════════════════════════════════════
@@ -912,6 +914,10 @@ AGENT_SYSTEM_PROMPTS: dict[str, str] = {
         "  - 联表查询：SELECT u.name, o.total FROM orders o JOIN users u ON o.user_id = u.id\n"
         "  - TOP N：SELECT * FROM products ORDER BY price DESC LIMIT 5\n"
     ),
+    # ★ 修复：default_agent 必须在此声明，确保 build_graph() 回退时也能加入图
+    "default_agent": (
+        "你是通用任务执行专家。根据任务描述，调用合适的工具完成任务，给出简洁结果。"
+    ),
 }
 
 DEFAULT_AGENT_SYSTEM_PROMPT = (
@@ -1017,7 +1023,12 @@ def build_graph() -> Any:
     g.add_node("direct_answer", direct_answer_node)
     g.add_node("final_answer",  final_answer_node)
 
-    known_agents = _registry.agents or list(AGENT_SYSTEM_PROMPTS.keys())
+    # ★ 修复：取 registry.agents 与 AGENT_SYSTEM_PROMPTS.keys() 的并集
+    # 确保无论 registry 是否就绪，AGENT_SYSTEM_PROMPTS 中声明的 agent（含 default_agent）都进图
+    # registry 就绪后 _init_registry 会调用 build_graph() 重新编译，届时 registry.agents 也全部进图
+    _reg_agents  = _registry.agents
+    _prompt_keys = list(AGENT_SYSTEM_PROMPTS.keys())
+    known_agents = list(dict.fromkeys(_reg_agents + _prompt_keys))  # 去重保序
     for agent_name in known_agents:
         g.add_node(agent_name, make_agent_node(agent_name))
 
@@ -1047,6 +1058,11 @@ def build_graph() -> Any:
 # ══════════════════════════════════════════════════════
 # 12. 图实例
 # ══════════════════════════════════════════════════════
+# ★ 修复说明：
+#   此处先用空 registry 编译一个占位图，让 langgraph.json 能找到 "graph" 变量。
+#   真正的图会在 _init_registry() 里 MCP 就绪后重新编译并覆盖此变量。
+#   占位图已包含 AGENT_SYSTEM_PROMPTS 中所有 agent（含 default_agent），
+#   所以即使 __main__ 场景下 _init_registry 重新编译前有请求进来也不会 KeyError。
 graph = build_graph()
 
 
@@ -1069,12 +1085,12 @@ if __name__ == "__main__":
 
     QUESTIONS = [
         # ── 纯 DB 查询测试 ──
-        " , l "
+       
         # "你好",
-        # "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
         # "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
         
-        # "查询所有来自 Toronto 的活跃用户",
+        "查询所有来自 Toronto 的活跃用户",
         # "统计每个城市的用户数量，按数量降序排列",
         # "找出销售额最高的前 5 个商品",
         # "查询所有状态为 completed 的订单，并显示对应的用户名称",
