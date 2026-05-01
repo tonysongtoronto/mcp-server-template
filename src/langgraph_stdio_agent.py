@@ -576,14 +576,7 @@ def _get_first_user_message(state: "AgentState") -> Any:
     return msg
 
 
-def _task_needs_tool_agent(description: str) -> str | None:
-    desc_lower = description.lower()
-    for agent, keywords in AGENT_TRIGGER_KEYWORDS.items():
-        if agent not in _registry.agents:
-            continue
-        if any(kw.lower() in desc_lower for kw in keywords):
-            return agent
-    return None
+
 
 
 # ══════════════════════════════════════════════════════
@@ -954,7 +947,7 @@ def build_graph() -> Any:
         tool_tasks   = [t for t in task_plan if t.get("agent") != "direct"]
         direct_tasks = [t for t in task_plan if t.get("agent") == "direct"]
 
-        if not tool_tasks:
+        if not tool_tasks and len(direct_tasks) <= 1:
             print("\n  📝 所有任务均为 direct，最终回答已在消息流中")
             return state
 
