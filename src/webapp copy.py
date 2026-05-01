@@ -244,9 +244,7 @@ async def lifespan(app: FastAPI):
               file=sys.stderr)
 
     # ── 5. 初始化 MCP sessions（SSE 连接）────────────────────────────
-    from src.langgraph_parallel_agent import _start_mcp_sessions, _USE_SSE
-    import src.langgraph_parallel_agent as _agent_mod
-    _agent_mod._USE_SSE = True   # webapp 模式：用 SSE 连接已有子进程
+    from src.langgraph_stdio_agent import _start_mcp_sessions
     await _start_mcp_sessions()
     print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
 
@@ -254,7 +252,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # ── 6. 关闭 MCP sessions ─────────────────────────
-        from src.langgraph_parallel_agent import _stop_mcp_sessions
+        from src.langgraph_stdio_agent import _stop_mcp_sessions
         await _stop_mcp_sessions()
 
         # ── 7. 终止所有子进程 ────────────────────────────
