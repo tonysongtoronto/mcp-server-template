@@ -18,7 +18,7 @@ dependencies = [
     "langgraph-cli[inmem]>=0.4.22",
     "langsmith>=0.7.30",
     "nest-asyncio>=1.6.0",
-    "langgraph-api>=0.8.3",
+    "langgraph-api>=0.8.5",
     "fastapi>=0.136.0",
 ]
 
