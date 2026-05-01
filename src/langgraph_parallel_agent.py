@@ -921,7 +921,8 @@ async def _run_direct_task(task: Task) -> str:
 # ══════════════════════════════════════════════════════
 
 # webapp.py 的 SSE 模式由此标志切换
-_USE_SSE: bool = False   # __main__ 默认 stdio；webapp lifespan 启动后应设为 True
+def _use_sse() -> bool:
+    return os.environ.get("MCP_USE_SSE", "0") == "1"
 
 
 async def parallel_executor_node(state: AgentState) -> AgentState:
@@ -1005,7 +1006,7 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
                 result = await _run_direct_task(task)
             else:
                 system_prompt = AGENT_SYSTEM_PROMPTS.get(agent, DEFAULT_AGENT_SYSTEM_PROMPT)
-                result = await run_agent_isolated(task, system_prompt, use_sse=_USE_SSE)
+                result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
             return task["task_id"], result
 
         results: list[tuple[int, str]] = await asyncio.gather(
@@ -1187,62 +1188,83 @@ graph = build_graph()
 if __name__ == "__main__":
 
     BATCH_MODE = True  # True → 自动跑完 QUESTIONS；False → 交互式 CLI
-
     QUESTIONS = [
-    # ── math_agent: add / subtract / multiply / division ──
-    "计算 (100 + 50 - 30) × 4 ÷ 6",
+        # ── 纯 DB 查询测试 ──
+  
 
-    # ── default_agent 数学工具: round / floor / ceiling ──
-    "分别计算 3.7 的四舍五入、向下取整、向上取整",
 
-    # ── default_agent 数学工具: sin / degreesToRadians ──
-    "计算 sin(45度) 的值",
+        # "你好",
+        "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
+        "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
+        #  """计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20,
+		# 查询所有来自 Toronto 的活跃用户,查询所有状态为 completed 的订单，并显示对应的用户名称,列出 File_Agent
+		# 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！""",
+        "查询所有来自 Toronto 的活跃用户",
+        # "统计每个城市的用户数量，按数量降序排列",
+        # "找出销售额最高的前 5 个商品",
+        # "查询所有状态为 completed 的订单，并显示对应的用户名称",
+        # "哪些商品的库存为 0？",
+        # "查询平均评分低于 3 分的商品",
 
-    # ── default_agent 数学工具: mean / median / mode / min / max / sum / modulo ──
-    "对 [3, 7, 7, 2, 9, 5] 计算：总和、平均数、中位数、众数、最大值、最小值，以及 9 mod 4",
+        # ── 混合任务测试 ──
+        # "查询 Toronto 用户数量，然后计算这个数字的平方",
+    ]
 
-    # ── http_agent: fetch_url ──
-    "访问 https://api.github.com/zen 获取一句格言",
+    # QUESTIONS = [
+    # # ── math_agent: add / subtract / multiply / division ──
+    # "计算 (100 + 50 - 30) × 4 ÷ 6",
 
-    # ── http_agent: post_json ──
-    "向 https://httpbin.org/post 发送 POST 请求，body 为 {\"name\": \"test\", \"value\": 42}",
+    # # ── default_agent 数学工具: round / floor / ceiling ──
+    # "分别计算 3.7 的四舍五入、向下取整、向上取整",
 
-    # ── default_agent: get_server_info + ping ──
-    "获取服务器信息，同时 ping 数据库服务确认是否在线",
+    # # ── default_agent 数学工具: sin / degreesToRadians ──
+    # "计算 sin(45度) 的值",
 
-    # ── db_agent: get_schema ──
-    "获取数据库的完整表结构",
+    # # ── default_agent 数学工具: mean / median / mode / min / max / sum / modulo ──
+    # "对 [3, 7, 7, 2, 9, 5] 计算：总和、平均数、中位数、众数、最大值、最小值，以及 9 mod 4",
 
-    # ── db_agent: query_db ──
-    "查询来自 Vancouver 的所有活跃用户",
+    # # ── http_agent: fetch_url ──
+    # "访问 https://api.github.com/zen 获取一句格言",
 
-    # ── db_agent: execute_db ──
-    "把数据库中 id=13 的商品库存更新为 480",
+    # # ── http_agent: post_json ──
+    # "向 https://httpbin.org/post 发送 POST 请求，body 为 {\"name\": \"test\", \"value\": 42}",
 
-    # ── file_agent: create_directory / write_file / read_file ──
-    "在 File_Agent 下创建 demo 目录，写入 demo/note.txt 内容为'这是测试笔记'，然后读取确认",
+    # # ── default_agent: get_server_info + ping ──
+    # "获取服务器信息，同时 ping 数据库服务确认是否在线",
 
-    # ── file_agent: list_directory / get_file_info ──
-    "列出 File_Agent 目录下所有文件，并获取 low_rating.txt 的详细信息",
+    # # ── db_agent: get_schema ──
+    # "获取数据库的完整表结构",
 
-    # ── file_agent: search_files ──
-    "在 File_Agent 目录下搜索所有 .txt 文件",
+    # # ── db_agent: query_db ──
+    # "查询来自 Vancouver 的所有活跃用户",
 
-    # ── file_agent: read_multiple_files ──
-    "同时读取 File_Agent/low_rating.txt 和 File_Agent/report.txt 的内容",
+    # # ── db_agent: execute_db ──
+    # "把数据库中 id=13 的商品库存更新为 480",
 
-    # ── file_agent: edit_file ──
-    "在 File_Agent/demo/note.txt 末尾追加一行：'已于测试时编辑'",
+    # # ── file_agent: create_directory / write_file / read_file ──
+    # "在 File_Agent 下创建 demo 目录，写入 demo/note.txt 内容为'这是测试笔记'，然后读取确认",
 
-    # ── file_agent: move_file ──
-    "把 File_Agent/demo/note.txt 移动到 File_Agent/note_moved.txt",
+    # # ── file_agent: list_directory / get_file_info ──
+    # "列出 File_Agent 目录下所有文件，并获取 low_rating.txt 的详细信息",
 
-    # ── 混合并行: db + math ──
-    "查询数据库中价格最高的商品价格，同时计算这个价格的平方根",
+    # # ── file_agent: search_files ──
+    # "在 File_Agent 目录下搜索所有 .txt 文件",
 
-    # ── 混合并行: http + file ──
-    "访问 https://api.github.com/zen 获取格言，同时列出 File_Agent 目录，完成后把格言写入 File_Agent/zen.txt",
-     ]
+    # # ── file_agent: read_multiple_files ──
+    # "同时读取 File_Agent/low_rating.txt 和 File_Agent/report.txt 的内容",
+
+    # # ── file_agent: edit_file ──
+    # "在 File_Agent/demo/note.txt 末尾追加一行：'已于测试时编辑'",
+
+    # # ── file_agent: move_file ──
+    # "把 File_Agent/demo/note.txt 移动到 File_Agent/note_moved.txt",
+
+    # # ── 混合并行: db + math ──
+    # "查询数据库中价格最高的商品价格，同时计算这个价格的平方根",
+
+    # # ── 混合并行: http + file ──
+    # "访问 https://api.github.com/zen 获取格言，同时列出 File_Agent 目录，完成后把格言写入 File_Agent/zen.txt",
+    #  ]
     async def _run_question(q: str) -> None:
         print(f"\n{'━' * 60}\n❓ {q}\n{'━' * 60}")
         try:

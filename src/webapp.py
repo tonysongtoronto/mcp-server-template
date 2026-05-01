@@ -17,7 +17,6 @@ import signal
 import socket
 import subprocess
 import sys
-import time
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -45,34 +44,42 @@ _DB_SERVER_PY = Path(__file__).parent / "mcp_db_server" / "server.py"
 # ★ 新增：math-mcp Node.js 入口（src/math-mcp/build/index.js）
 _MATH_MCP_JS  = Path(__file__).parent / "math-mcp" / "build" / "index.js"
 
-_NPX = "npx.cmd" if sys.platform == "win32" else "npx"
+_NPX  = "npx.cmd" if sys.platform == "win32" else "npx"
 _NODE = "node.exe" if sys.platform == "win32" else "node"
 
 
 # ──────────────────────────────────────────
-# 工具函数（与原版完全一致，不改动）
+# 工具函数（全部改为 async，消除阻塞调用）
 # ──────────────────────────────────────────
 
 def _port_in_use(port: int) -> bool:
+    """同步检测端口是否被占用（仅 socket 连接，耗时极短，无需 async）。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _kill_port(port: int) -> None:
+async def _kill_port(port: int) -> None:
+    """
+    异步释放端口：
+    - os.system 通过 asyncio.to_thread 放到线程池执行，避免阻塞事件循环。
+    - time.sleep → await asyncio.sleep。
+    """
     print(f"  ⚠️  端口 {port} 被占用，尝试强制释放...", file=sys.stderr)
     if sys.platform == "win32":
-        os.system(
+        await asyncio.to_thread(
+            os.system,
             f'FOR /F "tokens=5" %P IN '
-            f'(\'netstat -ano ^| findstr ":{port} "\') DO taskkill /F /PID %P >nul 2>&1'
+            f'(\'netstat -ano ^| findstr ":{port} "\') DO taskkill /F /PID %P >nul 2>&1',
         )
     else:
-        ret = os.system(f"fuser -k {port}/tcp 2>/dev/null")
+        ret = await asyncio.to_thread(os.system, f"fuser -k {port}/tcp 2>/dev/null")
         if ret != 0:
-            os.system(
-                f"lsof -ti tcp:{port} 2>/dev/null | xargs kill -9 2>/dev/null || true"
+            await asyncio.to_thread(
+                os.system,
+                f"lsof -ti tcp:{port} 2>/dev/null | xargs kill -9 2>/dev/null || true",
             )
-    time.sleep(0.8)
+    await asyncio.sleep(0.8)   # ✅ 替换 time.sleep，不阻塞事件循环
 
 
 async def _wait_for_sse(url: str, timeout: float = 30.0, interval: float = 1.0) -> bool:
@@ -89,14 +96,19 @@ async def _wait_for_sse(url: str, timeout: float = 30.0, interval: float = 1.0) 
     return False
 
 
-def _launch_subprocess(
+async def _launch_subprocess(
     tag: str,
     cmd: list[str],
     env: dict | None = None,
     port: int | None = None,
 ) -> subprocess.Popen | None:
+    """
+    异步启动子进程：
+    - _kill_port 已改为 async，直接 await。
+    - subprocess.Popen 通过 asyncio.to_thread 放到线程池，避免阻塞事件循环。
+    """
     if port and _port_in_use(port):
-        _kill_port(port)
+        await _kill_port(port)          # ✅ await async 版本
         if _port_in_use(port):
             print(f"  ❌ [{tag}] 端口 {port} 无法释放，跳过启动", file=sys.stderr)
             return None
@@ -113,7 +125,8 @@ def _launch_subprocess(
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
-        proc = subprocess.Popen(cmd, **kwargs)
+        # ✅ Popen 是阻塞系统调用，放到线程池执行
+        proc: subprocess.Popen = await asyncio.to_thread(subprocess.Popen, cmd, **kwargs)
         print(f"  ✅ [{tag}] 进程已启动 PID={proc.pid}", file=sys.stderr)
         return proc
 
@@ -125,7 +138,11 @@ def _launch_subprocess(
         return None
 
 
-def _terminate_subprocess(tag: str, proc: subprocess.Popen) -> None:
+async def _terminate_subprocess(tag: str, proc: subprocess.Popen) -> None:
+    """
+    异步终止子进程：
+    - proc.wait(timeout=...) 通过 asyncio.to_thread 放到线程池，避免阻塞事件循环。
+    """
     if proc.poll() is not None:
         return
     print(f"  🛑 [{tag}] 终止子进程 PID={proc.pid}", file=sys.stderr)
@@ -133,13 +150,13 @@ def _terminate_subprocess(tag: str, proc: subprocess.Popen) -> None:
         if sys.platform == "win32":
             proc.send_signal(signal.CTRL_BREAK_EVENT)
             try:
-                proc.wait(timeout=3)
+                await asyncio.to_thread(proc.wait, timeout=3)   # ✅ 非阻塞等待
             except subprocess.TimeoutExpired:
                 proc.kill()
         else:
             proc.terminate()
             try:
-                proc.wait(timeout=5)
+                await asyncio.to_thread(proc.wait, timeout=5)   # ✅ 非阻塞等待
             except subprocess.TimeoutExpired:
                 proc.kill()
     except Exception as e:
@@ -162,10 +179,11 @@ _subprocesses: list[subprocess.Popen] = []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    os.environ["MCP_USE_SSE"] = "1"
     print("\n🟢 [lifespan] 开始启动 MCP 子进程...", file=sys.stderr)
 
     # ── 1. 启动 server.py（SSE @ 8001：data / http）──────────────────
-    server_proc = _launch_subprocess(
+    server_proc = await _launch_subprocess(      # ✅ await
         tag="server.py",
         cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
         env={
@@ -186,7 +204,7 @@ async def lifespan(app: FastAPI):
 
     # ── 2. 启动 mcp-proxy（SSE @ 8002：mcp-server-filesystem）───────
     _fs_sub_cmd = f"npx -y @modelcontextprotocol/server-filesystem {_FS_BASE_DIR}"
-    fs_proc = _launch_subprocess(
+    fs_proc = await _launch_subprocess(          # ✅ await
         tag="mcp-proxy(fs)",
         cmd=[_NPX, "mcp-proxy",
              "--port", str(_FS_PROXY_PORT),
@@ -204,7 +222,7 @@ async def lifespan(app: FastAPI):
               file=sys.stderr)
 
     # ── 3. 启动 db_server.py（SSE @ 8003：数据库工具）───────────────
-    db_proc = _launch_subprocess(
+    db_proc = await _launch_subprocess(          # ✅ await
         tag="db_server.py",
         cmd=[sys.executable, "-u", str(_DB_SERVER_PY), "--sse"],
         env={
@@ -226,7 +244,7 @@ async def lifespan(app: FastAPI):
     #   底层命令：node src/math-mcp/build/index.js（stdio 模式）
     #   由 mcp-proxy 包成 SSE 对外暴露，保持与其他 MCP 服务一致的接入方式。
     _math_sub_cmd = f"{_NODE} {_MATH_MCP_JS}"
-    math_proc = _launch_subprocess(
+    math_proc = await _launch_subprocess(        # ✅ await
         tag="mcp-proxy(math)",
         cmd=[_NPX, "mcp-proxy",
              "--port", str(_MATH_PROXY_PORT),
@@ -244,9 +262,7 @@ async def lifespan(app: FastAPI):
               file=sys.stderr)
 
     # ── 5. 初始化 MCP sessions（SSE 连接）────────────────────────────
-    from src.langgraph_parallel_agent import _start_mcp_sessions, _USE_SSE
-    import src.langgraph_parallel_agent as _agent_mod
-    _agent_mod._USE_SSE = True   # webapp 模式：用 SSE 连接已有子进程
+    from src.langgraph_parallel_agent import _start_mcp_sessions
     await _start_mcp_sessions()
     print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
 
@@ -260,7 +276,7 @@ async def lifespan(app: FastAPI):
         # ── 7. 终止所有子进程 ────────────────────────────
         print("\n🛑 [lifespan] 关闭子进程...", file=sys.stderr)
         for proc in reversed(_subprocesses):
-            _terminate_subprocess("subprocess", proc)
+            await _terminate_subprocess("subprocess", proc)   # ✅ await
         _subprocesses.clear()
         print("🛑 [lifespan] 全部已关闭\n", file=sys.stderr)
 

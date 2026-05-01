@@ -1,6 +1,6 @@
 {
   "graphs": {
-    "supervisorpalner": "./src/langgraph_stdio_agent.py:graph"
+    "supervisorpalner": "./src/langgraph_parallel_agent.py:graph"
   },
   "http": {
     "app": "./src/webapp.py:app"
