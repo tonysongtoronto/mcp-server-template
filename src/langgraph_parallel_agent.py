@@ -989,7 +989,6 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
                         resolved_parts.append(f"【任务{dep_id}的结果】= {val}")
 
             resolved_desc = task["description"]
-            resolved_desc = task["description"]
             if resolved_parts:
                 resolved_desc += "\n\n【运行时参数】\n" + "\n".join(resolved_parts)
             task["_resolved_description"] = resolved_desc
@@ -1045,10 +1044,6 @@ async def final_answer_node(state: AgentState) -> AgentState:
     tool_tasks   = [t for t in task_plan if t.get("agent") != "direct"]
     direct_tasks = [t for t in task_plan if t.get("agent") == "direct"]
 
-    if not tool_tasks and len(direct_tasks) <= 1:
-        print("\n  📝 所有任务均为 direct，最终回答已在消息流中")
-        return state
-
     all_results_lines: list[str] = []
     if direct_tasks:
         all_results_lines.append("【直接回答任务】")
@@ -1056,11 +1051,13 @@ async def final_answer_node(state: AgentState) -> AgentState:
             all_results_lines.append(
                 f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
             )
-    all_results_lines.append("【工具执行任务】")
-    for t in tool_tasks:
-        all_results_lines.append(
-            f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
-        )
+            
+    if tool_tasks:
+        all_results_lines.append("【工具执行任务】")
+        for t in tool_tasks:
+            all_results_lines.append(
+                f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
+            )
 
     results_text = "\n".join(all_results_lines)
     print(f"\n  📝 汇总所有任务结果：\n{results_text}")
