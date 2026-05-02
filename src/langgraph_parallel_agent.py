@@ -11,6 +11,15 @@ src/langgraph_parallel_agent.py
       改造前：planner → supervisor ⇄ agentX（循环）→ final_answer
       改造后：planner → parallel_executor → final_answer
 
+【✅ 阶段一新增：MemorySaver Checkpoint 支持】
+  改动点共 5 处，搜索 "★ CHECKPOINT" 可快速定位全部改动：
+  1. imports 区：新增 MemorySaver + add_messages 导入
+  2. AgentState：messages 字段加 Annotated[list, add_messages] reducer
+  3. 全局变量区：新增 _checkpointer = MemorySaver() 单例
+  4. build_graph()：接收 checkpointer 参数并传给 compile()
+  5. _init_registry()：复用 _checkpointer，不再每次新建
+  6. __main__ _run_question()：传入 thread_id + config
+
 【新增函数】
   - _topo_layers()             拓扑 BFS 分层，返回按批次排列的任务列表
   - _spawn_session_for()       按 agent 类型决定 spawn 哪个 MCP server
@@ -19,16 +28,12 @@ src/langgraph_parallel_agent.py
 
 【Bug 修复】
   - deps_done 只认 "done"，不再把 "in_progress" 视为已满足
-    （原版：依赖未就绪 → 直接 FINISH；新版：跳过当前批次，不中断整体流程）
-    注：parallel_executor 按拓扑层调度，此 bug 在新架构下理论上不会触发，
-        但 _topo_layers 的实现本身已从根本上规避了该问题。
 
 【保留不变】
   - planner_node / direct_answer_node / final_answer_node
   - ToolRegistry / load_tools / _extract_* 等全部工具函数
   - MCP server 路径、SSE URL、AGENT_* 配置表
   - _start_mcp_sessions / _stop_mcp_sessions（供 webapp.py lifespan 调用）
-  - __main__ 交互式 CLI / 批量测试模式
 
 原有所有修复（修复1–15）均保留，不再重复列出。
 """
@@ -42,13 +47,38 @@ import time
 import traceback
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any, Optional, TypedDict
+
+# ★ CHECKPOINT 改动1/6：新增两个导入
+#
+# Annotated 是 Python 类型系统的工具，用来给类型附加"元信息"。
+# 这里的用途：告诉 LangGraph "messages 字段用 add_messages 函数来合并"。
+#
+# add_messages 是 LangGraph 内置的 reducer（合并函数）。
+# 什么是 reducer？
+#   - 普通字段：新值直接覆盖旧值。  旧=[A,B]  新=[C]  → 结果=[C]   ← 对话历史丢失！
+#   - add_messages：新消息追加到末尾。旧=[A,B]  新=[C]  → 结果=[A,B,C] ← 对话历史保留 ✅
+#
+# 为什么 checkpoint 必须用 add_messages？
+#   checkpoint 保存的是整个 state。下次 invoke 恢复 state 后，
+#   新的 HumanMessage 需要"追加"到历史里，而不是"替换"历史。
+#   如果不加 add_messages，每次对话都会把之前的消息全部清空。
+from typing import Any, Optional, TypedDict, Annotated
+from langgraph.graph.message import add_messages   # ← 新增
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
+
+# ★ CHECKPOINT 改动2/6：新增 MemorySaver 导入
+#
+# MemorySaver 是 LangGraph 内置的"内存版"存储后端。
+# 它把每个 thread_id 的 checkpoint（state 快照）存在 Python 字典里。
+# 优点：零配置，开发测试直接用。
+# 缺点：进程重启后数据全部清空（阶段二换 SqliteSaver 解决）。
+from langgraph.checkpoint.memory import MemorySaver   # ← 新增
+
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
@@ -263,8 +293,32 @@ class Task(TypedDict):
     result: str
     _resolved_description: str
 
+
+# ★ CHECKPOINT 改动3/6：AgentState 的 messages 字段加 Annotated + add_messages
+#
+# 改动前：messages: list
+# 改动后：messages: Annotated[list, add_messages]
+#
+# 详细解释：
+#   LangGraph 的 checkpoint 机制在每次节点执行完之后，
+#   会把节点返回的 state 与已保存的 state "合并"（merge）。
+#
+#   合并规则由字段类型决定：
+#   ┌─────────────────┬────────────────────────────────────────────┐
+#   │ 字段类型         │ 合并行为                                    │
+#   ├─────────────────┼────────────────────────────────────────────┤
+#   │ 普通 list       │ 新值直接覆盖旧值（旧消息全部丢失！）           │
+#   │ Annotated+      │ 新消息追加到旧消息末尾（对话历史完整保留）✅   │
+#   │ add_messages    │                                            │
+#   └─────────────────┴────────────────────────────────────────────┘
+#
+#   多轮对话场景：
+#   第1轮：用户问"计算3+5"  → messages = [Human("计算3+5"), AI("答案是8")]
+#   第2轮：用户问"刚才的结果乘以2是多少"
+#          → 有 add_messages：messages = [Human("计算3+5"), AI("8"), Human("乘以2"), ...]
+#          → 没有 add_messages：messages = [Human("乘以2")]  ← AI 不知道上文，无法回答！
 class AgentState(TypedDict):
-    messages: list
+    messages: Annotated[list, add_messages]   # ← 改动：加了 Annotated[list, add_messages]
     task_plan: list[Task]
     current_task_id: int
     next_agent: str
@@ -277,6 +331,31 @@ _tools: list[StructuredTool] = []
 _registry: ToolRegistry = ToolRegistry()
 _lazy_init_lock: asyncio.Lock | None = None
 _mcp_exit_stack: AsyncExitStack | None = None
+
+
+# ★ CHECKPOINT 改动4/6：_checkpointer 模块级单例
+#
+# 为什么必须是"模块级单例"？
+#
+# 问题背景：
+#   你的代码里 _init_registry() 会调用 build_graph()，
+#   每次工具列表更新时都会重建 graph 对象。
+#
+# 如果在 build_graph() 内部写 checkpointer=MemorySaver()：
+#   第1次 _init_registry() → build_graph() → 创建 MemorySaver_A → graph_A
+#   第2次 _init_registry() → build_graph() → 创建 MemorySaver_B → graph_B
+#   MemorySaver_A 里保存的所有用户对话历史全部消失！
+#
+# 正确做法：
+#   在模块加载时创建一个 _checkpointer，它的生命周期 = 进程生命周期。
+#   每次 build_graph() 都把这同一个 _checkpointer 传进去。
+#   无论 graph 重建多少次，存储的数据始终在这一个 _checkpointer 里。
+#
+# 类比：
+#   MemorySaver 就像一个"笔记本"，里面按 thread_id 分页记录每个用户的对话。
+#   如果每次重建 graph 都换一本新笔记本，之前写的内容全丢了。
+#   正确做法是始终用同一本笔记本，graph 重建只是换了"读笔记本的方式"，笔记本本身不变。
+_checkpointer = MemorySaver()   # ← 新增：进程级单例，永不重建
 
 
 async def _ensure_registry() -> None:
@@ -463,10 +542,26 @@ async def load_tools(session: ClientSession) -> list[StructuredTool]:
     return lc_tools
 
 
+# ★ CHECKPOINT 改动5/6：_init_registry 复用 _checkpointer
+#
+# 改动前：
+#   def _init_registry(tools):
+#       global _registry, graph
+#       _registry = ToolRegistry.build(tools) if tools else ToolRegistry()
+#       graph = build_graph()   ← build_graph 内部创建新的 MemorySaver，每次重建都丢数据
+#
+# 改动后：
+#   graph = build_graph(checkpointer=_checkpointer)  ← 传入模块级单例，数据不丢
+#
+# 为什么 _init_registry 会被多次调用？
+#   场景1：__main__ 启动 → _start_mcp_sessions_stdio() → _init_registry()
+#   场景2：_stop_mcp_sessions() 也会调用 _init_registry([]) 清空 registry
+#   场景3：如果未来支持热更新工具，也会触发 _init_registry()
+#   每次都传同一个 _checkpointer，数据安全。
 def _init_registry(tools: list[StructuredTool]) -> None:
     global _registry, graph
     _registry = ToolRegistry.build(tools) if tools else ToolRegistry()
-    graph = build_graph()
+    graph = build_graph(checkpointer=_checkpointer)   # ← 改动：传入单例 checkpointer
 
 
 # ══════════════════════════════════════════════════════
@@ -673,7 +768,17 @@ async def planner_node(state: AgentState) -> AgentState:
     if not msgs:
         return {**state, "next_agent": "FINISH", "task_plan": []}
 
-    user_msg = _get_message_content(msgs[0])
+    # user_msg = _get_message_content(msgs[0])
+    # print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
+    
+    last_human_msg = next(
+        (m for m in reversed(msgs) if isinstance(m, HumanMessage)),
+        None
+    )
+    if not last_human_msg:
+        return {**state, "next_agent": "FINISH", "task_plan": []}
+
+    user_msg = _get_message_content(last_human_msg)   # ← 用这个替换原来的 user_msg
     print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
 
     max_retries = 3
@@ -681,8 +786,13 @@ async def planner_node(state: AgentState) -> AgentState:
 
     for attempt in range(max_retries):
         try:
+             # ★ 带上对话历史，让 planner 知道上下文
+            # 取历史里除最后一条之外的所有消息（最后一条是当前问题，已经单独处理）
+            history_msgs = msgs[:-1] if len(msgs) > 1 else []
+
             response = await llm.ainvoke([
                 SystemMessage(content=_planner_system()),
+                *history_msgs,           # ← 插入历史（Human/AI 交替的对话记录）
                 HumanMessage(content=user_msg),
             ])
             raw = _extract_json(_extract_llm_content(response))
@@ -711,8 +821,6 @@ async def planner_node(state: AgentState) -> AgentState:
                         fmt_errors.append(
                             f"task[{t['task_id']}].inputs[{key}] 缺少 from_task 字段：{val!r}"
                         )
-                # 单向检查：inputs 里声明的 from_task 必须都在 depends_on 中
-                # depends_on 允许有"只需保证执行顺序、不传值"的额外依赖，不强制要求 inputs 全覆盖
                 task_deps_set = set(t.get("depends_on", []))
                 input_deps = set(
                     v["from_task"] for v in t.get("inputs", {}).values()
@@ -758,25 +866,19 @@ def _topo_layers(tasks: list[Task]) -> list[list[Task]]:
     拓扑 BFS 分层。返回 [[layer0], [layer1], ...]：
     - 同层内任务互无依赖，可 asyncio.gather() 并行执行
     - 层与层之间严格串行（后层依赖前层全部完成）
-
-    修复了原版 deps_done bug：
-    - 只认 "done" 状态，不把 "in_progress" 视为满足
-    - 分层本身从结构上保证依赖顺序，无需运行时再判断
     """
     done_ids: set[int] = set()
     layers: list[list[Task]] = []
     remaining = list(tasks)
 
     while remaining:
-        # 当前批：depends_on 全部已在 done_ids 中的任务
         layer = [
             t for t in remaining
             if all(dep in done_ids for dep in t.get("depends_on", []))
         ]
         if not layer:
-            # 剩余任务全部有未满足的依赖 → 依赖环或任务 id 错误
             print(f"  ⚠️ [topo] 依赖无法满足，剩余任务强制入队：{[t['task_id'] for t in remaining]}")
-            layer = remaining  # 兜底：剩余全部作为最后一层
+            layer = remaining
         layers.append(layer)
         done_ids |= {t["task_id"] for t in layer}
         remaining = [t for t in remaining if t not in layer]
@@ -789,15 +891,7 @@ async def _spawn_session_for(
     stack: AsyncExitStack,
     use_sse: bool = False,
 ) -> ClientSession:
-    """
-    为单个任务独立 spawn 一个 MCP session。
-    - __main__ 场景（use_sse=False）：stdio_client spawn 子进程
-    - webapp 场景（use_sse=True）：sse_client 连接已有进程
-
-    session 的生命周期由调用方的 AsyncExitStack 管理，
-    函数返回时 session 已 initialize() 完毕，可直接 load_tools()。
-    """
-    # 按 agent 类型选择对应 server
+    """为单个任务独立 spawn 一个 MCP session。"""
     if agent_name in ("math_agent",):
         stdio_params = math_mcp_params
         sse_url      = _MATH_PROXY_SSE_URL
@@ -808,7 +902,6 @@ async def _spawn_session_for(
         stdio_params = db_mcp_params
         sse_url      = _DB_SERVER_SSE_URL
     else:
-        # math_agent / data_agent / http_agent / default_agent → server.py
         stdio_params = mcp_params
         sse_url      = _SERVER_SSE_URL
 
@@ -900,15 +993,21 @@ async def run_agent_isolated(
 # 9. direct_answer_node（不变）
 # ══════════════════════════════════════════════════════
 
-async def _run_direct_task(task: Task) -> str:
-    """direct 任务的独立执行单元（与 run_agent_isolated 对称）。"""
+
+async def _run_direct_task(task: Task, state: AgentState) -> str:
     intent = task.get("description", "")
     print(f"\n  💬 direct_answer 任务[{task['task_id']}]：{intent[:60]}")
+
+    # ★ 带上对话历史
+    msgs = state.get("messages", [])
+    history_msgs = msgs[:-1] if len(msgs) > 1 else []
+
     response = await llm.ainvoke([
         SystemMessage(content=(
             "你是一个友善的 AI 助手。请只回答当前分配给你的这一个子任务，"
             "不要回答用户原始消息中的其他问题。"
         )),
+        *history_msgs,           # ← 插入历史
         HumanMessage(content=intent),
     ])
     answer = _extract_llm_content(response)
@@ -920,26 +1019,18 @@ async def _run_direct_task(task: Task) -> str:
 # 10. parallel_executor_node（替代原 supervisor_node）
 # ══════════════════════════════════════════════════════
 
-# webapp.py 的 SSE 模式由此标志切换
 def _use_sse() -> bool:
     return os.environ.get("MCP_USE_SSE", "0") == "1"
 
 
 async def parallel_executor_node(state: AgentState) -> AgentState:
     """
-    核心并行调度节点，替代原来的 supervisor_node + agent 循环。
+    核心并行调度节点。
 
-    执行流程：
-    1. 对 task_plan 做拓扑 BFS 分层（_topo_layers）
-    2. 按层串行，每层内 asyncio.gather() 并行执行所有任务
-    3. 每个任务独立 spawn/close MCP session（run_agent_isolated）
-    4. 层执行完毕后，将结果回写 task_plan，供下一层解析 inputs
-    5. 所有层完成后返回更新后的 state，交给 final_answer_node 汇总
-
-    deps_done 修复：
-    - _topo_layers 只把 depends_on 全部在 done_ids 中的任务归入当前层
-    - done_ids 只在任务真正执行完（结果已写入）后才更新
-    - 彻底消除原版"把 in_progress 误判为已完成"的 bug
+    checkpoint 失败恢复机制：
+      task["status"] == "done" 的任务会被跳过，不重复执行。
+      如果上次执行中途失败（比如某个 MCP server 超时），
+      重新 invoke 同一个 thread_id 时，已完成的任务不会重跑。
     """
     task_plan: list[Task] = state.get("task_plan", [])
 
@@ -947,10 +1038,26 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
         print("\n🏁 [ParallelExecutor] task_plan 为空 → 跳过")
         return {**state, "next_agent": "FINISH"}
 
-    # 分拓扑层
-    layers = _topo_layers(task_plan)
-    total  = len(task_plan)
-    print(f"\n🚀 [ParallelExecutor] 共 {total} 个任务，分 {len(layers)} 层执行")
+    # ── checkpoint 失败恢复：过滤掉已完成的任务 ──────────────────────
+    # 什么时候会有 status=="done" 的任务？
+    #   场景：上次执行完成了任务0和任务1，但任务2失败了，整个 graph 报错退出。
+    #   下次用同一个 thread_id 重新 invoke，checkpoint 恢复了上次的 state，
+    #   task_plan 里任务0和任务1的 status 已经是 "done"。
+    #   这里过滤掉它们，只执行 pending/failed 的任务。
+    pending_tasks = [t for t in task_plan if t.get("status") != "done"]
+
+    if not pending_tasks:
+        print("\n🏁 [ParallelExecutor] 所有任务已完成（从 checkpoint 恢复）→ 直接汇总")
+        return {**state, "next_agent": "FINISH"}
+
+    skipped = len(task_plan) - len(pending_tasks)
+    if skipped > 0:
+        print(f"\n⏭️  [ParallelExecutor] 跳过 {skipped} 个已完成任务（checkpoint 恢复）")
+
+    # 分拓扑层（只对 pending 任务分层）
+    layers = _topo_layers(pending_tasks)
+    total  = len(pending_tasks)
+    print(f"\n🚀 [ParallelExecutor] 共 {total} 个待执行任务，分 {len(layers)} 层")
     for i, layer in enumerate(layers):
         print(f"   层 {i}: {[t['task_id'] for t in layer]}")
 
@@ -962,7 +1069,6 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
             inputs         = task.get("inputs", {})
             resolved_parts = []
 
-            # 1. 显式声明的 inputs：按 param_name 传入
             declared_src_ids: set = set()
             for param_name, task_input in inputs.items():
                 if isinstance(task_input, dict):
@@ -980,7 +1086,6 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
                 val = src.get(field, "") if src else ""
                 resolved_parts.append(f"【{param_name}】= {val}")
 
-            # 2. depends_on 里有但 inputs 未声明的依赖：自动补充上游结果作为上下文
             for dep_id in task.get("depends_on", []):
                 if dep_id not in declared_src_ids:
                     src = next((t for t in task_plan if t["task_id"] == dep_id), None)
@@ -1002,7 +1107,7 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
         async def _exec_one(task: Task) -> tuple[int, str]:
             agent = task.get("agent", "default_agent")
             if agent == "direct":
-                result = await _run_direct_task(task)
+                result = await _run_direct_task(task, state)
             else:
                 system_prompt = AGENT_SYSTEM_PROMPTS.get(agent, DEFAULT_AGENT_SYSTEM_PROMPT)
                 result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
@@ -1051,7 +1156,7 @@ async def final_answer_node(state: AgentState) -> AgentState:
             all_results_lines.append(
                 f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
             )
-            
+
     if tool_tasks:
         all_results_lines.append("【工具执行任务】")
         for t in tool_tasks:
@@ -1061,6 +1166,12 @@ async def final_answer_node(state: AgentState) -> AgentState:
 
     results_text = "\n".join(all_results_lines)
     print(f"\n  📝 汇总所有任务结果：\n{results_text}")
+    
+    msgs = state.get("messages", [])
+    last_human = next(
+        (m for m in reversed(msgs) if isinstance(m, HumanMessage)),
+        HumanMessage(content="")
+    )
 
     response = await llm.ainvoke([
         SystemMessage(content=(
@@ -1138,16 +1249,27 @@ DEFAULT_AGENT_SYSTEM_PROMPT = AGENT_SYSTEM_PROMPTS["default_agent"]
 
 
 # ══════════════════════════════════════════════════════
-# 13. 图构建（简化版：去掉循环边）
+# 13. 图构建
 # ══════════════════════════════════════════════════════
 
-def build_graph() -> Any:
+# ★ CHECKPOINT 改动6a/6：build_graph 接收 checkpointer 参数
+#
+# 改动前：def build_graph() -> Any:  ...  return g.compile()
+# 改动后：def build_graph(checkpointer=None) -> Any:  ...  return g.compile(checkpointer=checkpointer)
+#
+# 为什么用参数而不是直接写死 _checkpointer？
+#   1. webapp.py 阶段二会注入 SqliteSaver，参数形式方便替换
+#   2. 测试时可以传 None（不用 checkpoint），方便单元测试
+#   3. 遵循"依赖注入"原则：函数不依赖全局状态，更容易维护
+#
+# compile(checkpointer=...) 做了什么？
+#   - 告诉 LangGraph：每次节点执行完，把当前 state 快照存到 checkpointer
+#   - 每次 invoke 时如果传了 thread_id，先从 checkpointer 恢复上次的 state
+#   - 这就是"记忆"的来源
+def build_graph(checkpointer=None) -> Any:
     """
-    改造后的图结构（极简）：
+    图结构（极简）：
         planner → parallel_executor → final_answer → END
-
-    原版的 supervisor ⇄ agentX 循环边全部移除。
-    direct_answer_node 的逻辑已内联到 parallel_executor 的 _exec_one 中。
     """
 
     def planner_route(state: AgentState) -> str:
@@ -1163,20 +1285,26 @@ def build_graph() -> Any:
     g.set_entry_point("planner")
 
     g.add_conditional_edges("planner", planner_route, {
-        "END":              END,
+        "END":               END,
         "parallel_executor": "parallel_executor",
     })
 
     g.add_edge("parallel_executor", "final_answer")
     g.add_edge("final_answer",      END)
 
-    return g.compile()
+    # checkpointer=None 时行为与原来完全一致（不启用 checkpoint）
+    return g.compile(checkpointer=checkpointer)
 
 
 # ══════════════════════════════════════════════════════
 # 14. 图实例
 # ══════════════════════════════════════════════════════
-graph = build_graph()
+
+# ★ CHECKPOINT 改动6b/6：初始化时就传入 checkpointer
+#
+# 注意：这里的 graph 是初始的"空壳"，_init_registry() 会在 MCP 连接成功后重建它。
+# 重要的是两次 build_graph 都传的是同一个 _checkpointer 实例。
+graph = build_graph(checkpointer=_checkpointer)
 
 
 # ══════════════════════════════════════════════════════
@@ -1184,107 +1312,90 @@ graph = build_graph()
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
 
-    BATCH_MODE = True  # True → 自动跑完 QUESTIONS；False → 交互式 CLI
+    BATCH_MODE = False  # True → 自动跑完 QUESTIONS；False → 交互式 CLI
     QUESTIONS = [
-        # ── 纯 DB 查询测试 ──
-  
-
-
-        # "你好",
         "计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20",
         "列出 File_Agent 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！",
-        #  """计算 3+5，然后访问 https://api.github.com/zen，再计算 10×20,
-		# 查询所有来自 Toronto 的活跃用户,查询所有状态为 completed 的订单，并显示对应的用户名称,列出 File_Agent
-		# 目录下的所有文件，然后在其中创建一个名为 hello.txt 的文件，内容为：Hello from file_agent！""",
         "查询所有来自 Toronto 的活跃用户",
-        # "统计每个城市的用户数量，按数量降序排列",
-        # "找出销售额最高的前 5 个商品",
-        # "查询所有状态为 completed 的订单，并显示对应的用户名称",
-        # "哪些商品的库存为 0？",
-        # "查询平均评分低于 3 分的商品",
-
-        # ── 混合任务测试 ──
-        # "查询 Toronto 用户数量，然后计算这个数字的平方",
     ]
 
-    # QUESTIONS = [
-    # # ── math_agent: add / subtract / multiply / division ──
-    # "计算 (100 + 50 - 30) × 4 ÷ 6",
-
-    # # ── default_agent 数学工具: round / floor / ceiling ──
-    # "分别计算 3.7 的四舍五入、向下取整、向上取整",
-
-    # # ── default_agent 数学工具: sin / degreesToRadians ──
-    # "计算 sin(45度) 的值",
-
-    # # ── default_agent 数学工具: mean / median / mode / min / max / sum / modulo ──
-    # "对 [3, 7, 7, 2, 9, 5] 计算：总和、平均数、中位数、众数、最大值、最小值，以及 9 mod 4",
-
-    # # ── http_agent: fetch_url ──
-    # "访问 https://api.github.com/zen 获取一句格言",
-
-    # # ── http_agent: post_json ──
-    # "向 https://httpbin.org/post 发送 POST 请求，body 为 {\"name\": \"test\", \"value\": 42}",
-
-    # # ── default_agent: get_server_info + ping ──
-    # "获取服务器信息，同时 ping 数据库服务确认是否在线",
-
-    # # ── db_agent: get_schema ──
-    # "获取数据库的完整表结构",
-
-    # # ── db_agent: query_db ──
-    # "查询来自 Vancouver 的所有活跃用户",
-
-    # # ── db_agent: execute_db ──
-    # "把数据库中 id=13 的商品库存更新为 480",
-
-    # # ── file_agent: create_directory / write_file / read_file ──
-    # "在 File_Agent 下创建 demo 目录，写入 demo/note.txt 内容为'这是测试笔记'，然后读取确认",
-
-    # # ── file_agent: list_directory / get_file_info ──
-    # "列出 File_Agent 目录下所有文件，并获取 low_rating.txt 的详细信息",
-
-    # # ── file_agent: search_files ──
-    # "在 File_Agent 目录下搜索所有 .txt 文件",
-
-    # # ── file_agent: read_multiple_files ──
-    # "同时读取 File_Agent/low_rating.txt 和 File_Agent/report.txt 的内容",
-
-    # # ── file_agent: edit_file ──
-    # "在 File_Agent/demo/note.txt 末尾追加一行：'已于测试时编辑'",
-
-    # # ── file_agent: move_file ──
-    # "把 File_Agent/demo/note.txt 移动到 File_Agent/note_moved.txt",
-
-    # # ── 混合并行: db + math ──
-    # "查询数据库中价格最高的商品价格，同时计算这个价格的平方根",
-
-    # # ── 混合并行: http + file ──
-    # "访问 https://api.github.com/zen 获取格言，同时列出 File_Agent 目录，完成后把格言写入 File_Agent/zen.txt",
-    #  ]
-    async def _run_question(q: str) -> None:
+    # ★ CHECKPOINT 改动7/6（额外改动）：_run_question 加入 thread_id 和 config
+    #
+    # 这是让 checkpoint 真正生效的"最后一步"。
+    #
+    # thread_id 是什么？
+    #   就是一个字符串，用来区分不同的对话会话。
+    #   同一个 thread_id = 同一个用户的同一个对话，
+    #   checkpoint 会把这个对话的 state 存起来，下次接着用。
+    #
+    # config 是什么？
+    #   LangGraph 的运行配置字典。
+    #   {"configurable": {"thread_id": "xxx"}} 是固定格式，
+    #   "configurable" 是 LangGraph 规定的命名空间，
+    #   "thread_id" 是 MemorySaver/SqliteSaver 用来查找存档的 key。
+    #
+    # 不传 config 会怎样？
+    #   graph.ainvoke(...) 没有 config → 没有 thread_id → checkpoint 不生效
+    #   每次都是全新会话，和没加 MemorySaver 一样。
+    #
+    # thread_id 的命名建议：
+    #   CLI 开发测试：  "cli_user_1"（固定，重启进程前历史一直在）
+    #   多用户区分：    f"user_{user_id}"
+    #   每次问题隔离：  f"session_{int(time.time())}"（每次新建）
+    async def _run_question(q: str, thread_id: str = "cli_user_1") -> None:
         print(f"\n{'━' * 60}\n❓ {q}\n{'━' * 60}")
+        print(f"📌 thread_id: {thread_id}")   # 打印出来，方便确认 checkpoint 在哪个会话下
+
+        # config 是传给 graph.ainvoke 的运行时配置
+        # 有了这个，LangGraph 才知道要存/读哪个 thread_id 的 checkpoint
+        config = {"configurable": {"thread_id": thread_id}}
+
         try:
-            result = await graph.ainvoke({
-                "messages":        [HumanMessage(content=q)],
-                "task_plan":       [],
-                "current_task_id": 0,
-                "next_agent":      "",
-            })
+            result = await graph.ainvoke(
+                {
+                    "messages":        [HumanMessage(content=q)],
+                    "task_plan":       [],
+                    "current_task_id": 0,
+                    "next_agent":      "",
+                },
+                config=config,   # ← 关键：传入 config
+            )
             answer = _get_message_content(result["messages"][-1])
             print(f"\n{'═' * 60}")
             print(f"✨ 最终答案：\n{answer}")
             print(f"{'═' * 60}")
+
+            # ── 验证 checkpoint 是否生效：打印当前 thread 的消息数 ──────
+            # 如果 checkpoint 正常工作，第2次问题后 messages 数量应该 > 第1次
+            # （因为 add_messages 会追加，不会覆盖）
+            try:
+                saved_state = _checkpointer.get(config)
+                if saved_state:
+                    channel_values = saved_state.get("channel_values", {})
+                    msgs_in_cp = channel_values.get("messages", [])
+                    print(f"💾 [Checkpoint] thread '{thread_id}' 已存 {len(msgs_in_cp)} 条消息")
+                else:
+                    print(f"💾 [Checkpoint] thread '{thread_id}' 暂无存档")
+            except Exception as cp_err:
+                print(f"💾 [Checkpoint] 读取存档时出错：{cp_err}")
+
         except Exception as e:
             print(f"\n❌ 执行出错：{e}")
             traceback.print_exc()
 
     async def _interactive() -> None:
         print("\n" + "═" * 60)
-        print("🤖  MCP Multi-Agent 并行 CLI 就绪")
+        print("🤖  MCP Multi-Agent 并行 CLI 就绪（已启用 MemorySaver Checkpoint）")
         print("    输入问题后回车执行，输入 'quit' / 'exit' / 'q' 退出")
         print("    输入 'batch' 快速跑完 QUESTIONS 列表")
+        print("    输入 'new' 开始新会话（新 thread_id）")
         print("═" * 60)
+
+        # 交互式模式下，同一次运行里所有问题共享一个 thread_id
+        # 这样可以验证"同一个对话里的多轮记忆"
+        session_thread_id = f"interactive_{int(time.time())}"
+        print(f"📌 当前会话 thread_id: {session_thread_id}")
+
         while True:
             try:
                 q = input("\n❓ > ").strip()
@@ -1298,14 +1409,20 @@ if __name__ == "__main__":
                 break
             if q.lower() == "batch":
                 for bq in QUESTIONS:
-                    await _run_question(bq)
+                    await _run_question(bq, thread_id="batch_session")
                 continue
-            await _run_question(q)
+            if q.lower() == "new":
+                session_thread_id = f"interactive_{int(time.time())}"
+                print(f"📌 新会话已开始，thread_id: {session_thread_id}")
+                continue
+            await _run_question(q, thread_id=session_thread_id)
 
     async def _batch() -> None:
         print(f"\n🚀 批量测试模式，共 {len(QUESTIONS)} 个问题")
+        # 批量模式：所有问题用同一个 thread_id
+        # 可以验证：第2个问题执行时，checkpoint 里已有第1个问题的记录
         for q in QUESTIONS:
-            await _run_question(q)
+            await _run_question(q, thread_id="batch_session")
 
     async def main():
         await _start_mcp_sessions_stdio()
