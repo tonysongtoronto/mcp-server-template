@@ -424,6 +424,24 @@ _mcp_exit_stack: AsyncExitStack | None = None
 #   正确做法是始终用同一本笔记本，graph 重建只是换了"读笔记本的方式"，笔记本本身不变。
 _checkpointer = MemorySaver()   # ← 新增：进程级单例，永不重建
 
+# ══════════════════════════════════════════════════════
+# 流式输出队列（阶段二：SSE 端点专用）
+# ══════════════════════════════════════════════════════
+#
+# 设计：webapp.py 的 /chat/stream 端点在调用 graph.ainvoke() 之前，
+#       先把一个 asyncio.Queue 注入到这个模块级变量。
+#       final_answer_node 在流式生成 token 时，把每个 token 放进队列。
+#       SSE 端点从队列里读取 token，立即推送给前端（浏览器）。
+#
+# 为什么用模块级变量？
+#   LangGraph 节点函数只接收 state 参数，无法直接传入额外参数。
+#   用模块级变量是最简单、零改动图结构的方案。
+#
+# 线程安全：asyncio.Queue 是协程安全的（单线程事件循环内）。
+#           每次请求开始前设置，请求结束后清除，不会有并发冲突。
+#           （langgraph dev 默认单进程，一次处理一个请求）
+_stream_queue: asyncio.Queue | None = None
+
 
 async def _ensure_registry() -> None:
     global _lazy_init_lock
@@ -628,7 +646,25 @@ async def load_tools(session: ClientSession) -> list[StructuredTool]:
 def _init_registry(tools: list[StructuredTool]) -> None:
     global _registry, graph
     _registry = ToolRegistry.build(tools) if tools else ToolRegistry()
-    graph = build_graph(checkpointer=_checkpointer)   # ← 改动：传入单例 checkpointer
+
+    # ★ 修复（原 Bug 根因）：webapp 和 CLI 两种模式统一使用 _checkpointer（模块级单例）。
+    #
+    # 旧代码在 webapp 模式（MCP_USE_SSE=1）下调用 build_graph()（不传 checkpointer），
+    # 目的是让"平台"管持久化。但实际上：
+    #   1. lifespan 会在 _start_mcp_sessions 之后再调一次 build_graph(checkpointer=saver)
+    #      来覆盖——这一步是对的。
+    #   2. 但 _ensure_registry() 在每次请求时都可能触发懒初始化，
+    #      懒初始化会再次调用 _init_registry → 旧代码的 build_graph()（无 checkpointer），
+    #      把 lifespan 辛苦注入的 checkpointer 悄悄覆盖掉。
+    #   3. 结果：第二轮请求时 graph 已没有 checkpointer，checkpoint 失效，
+    #      msgs 只有 1 条（当前轮），多轮记忆全部丢失。
+    #
+    # 修复：_init_registry 始终传 _checkpointer（模块级单例），
+    #   webapp.py 的 lifespan 若想升级为 AsyncSqliteSaver，在 _start_mcp_sessions 之后
+    #   额外调一次 agent_module.graph = agent_module.build_graph(checkpointer=saver) 覆盖即可。
+    #   模块底部那行 graph = build_graph()（无 checkpointer）在平台扫描时仍然安全，
+    #   因为它在 lifespan 启动前执行，不影响运行时行为。
+    graph = build_graph(checkpointer=_checkpointer)
 
 
 # ══════════════════════════════════════════════════════
@@ -929,6 +965,13 @@ async def planner_node(state: AgentState) -> AgentState:
 
     user_msg = _get_message_content(last_human_msg)
     print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
+
+    # ── 调试：打印 msgs 全貌，确认跨轮历史是否被平台恢复 ────────────────
+    print(f"  🔍 [Planner-debug] msgs 共 {len(msgs)} 条：")
+    for i, m in enumerate(msgs):
+        mtype = type(m).__name__
+        content = _get_message_content(m)[:60].replace("\n", " ")
+        print(f"    [{i}] {mtype}: {content}")
 
     # ★ 修复X（升级版）：Planner 注入摘要 + 上一轮 AI 回复
     #
@@ -1504,13 +1547,38 @@ async def final_answer_node(state: AgentState) -> AgentState:
         "5. 对话摘要提供了用户的基础画像，近期对话历史中有更新时以最新为准。"
     )
 
-    response = await llm.ainvoke([
+    # ── 流式 vs 非流式：根据 _stream_queue 是否已注入来决定 ────────────
+    #
+    # 场景A（CLI / __main__）：_stream_queue 为 None
+    #   → 直接 ainvoke，一次性拿到完整回复，行为与改造前完全一致。
+    #
+    # 场景B（webapp SSE 端点）：webapp 在 invoke 前注入了 _stream_queue
+    #   → 用 astream() 逐 token 生成。
+    #   → 每个 token 立即放进队列，SSE 端点实时推送给浏览器。
+    #   → 生成结束后向队列发送哨兵值 None，通知 SSE 端点关闭流。
+    #
+    msgs_for_llm = [
         SystemMessage(content=system_content),
-        *recent_history,  # 最近几轮完整历史（Human+AI 交替），用于解析跨轮引用
-        last_human,       # 当前轮的问题
-    ])
+        *recent_history,
+        last_human,
+    ]
 
-    new_ai_msg = AIMessage(content=_extract_llm_content(response))
+    if _stream_queue is not None:
+        # ── 流式路径（SSE 模式）────────────────────────────────────────
+        full_content = ""
+        try:
+            async for chunk in llm.astream(msgs_for_llm):
+                token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                if token:
+                    full_content += token
+                    await _stream_queue.put(token)   # 推送 token 给 SSE 端点
+        finally:
+            await _stream_queue.put(None)            # 哨兵：通知流结束
+        new_ai_msg = AIMessage(content=full_content)
+    else:
+        # ── 非流式路径（CLI 模式，行为不变）────────────────────────────
+        response = await llm.ainvoke(msgs_for_llm)
+        new_ai_msg = AIMessage(content=_extract_llm_content(response))
 
     # ── 触发摘要更新（每5轮一次）────────────────────────────────────
     # 判断条件：当前消息数（包含本轮新的 Human）- 已摘要轮次×2 >= 10
@@ -1648,7 +1716,7 @@ def build_graph(checkpointer=None) -> Any:
     g.add_edge("parallel_executor", "final_answer")
     g.add_edge("final_answer",      END)
 
-    # checkpointer=None 时行为与原来完全一致（不启用 checkpoint）
+    # CLI 模式传入 MemorySaver，webapp 模式传入 AsyncSqliteSaver（或 None）
     return g.compile(checkpointer=checkpointer)
 
 
@@ -1656,11 +1724,10 @@ def build_graph(checkpointer=None) -> Any:
 # 14. 图实例
 # ══════════════════════════════════════════════════════
 
-# ★ CHECKPOINT 改动6b/6：初始化时就传入 checkpointer
-#
-# 注意：这里的 graph 是初始的"空壳"，_init_registry() 会在 MCP 连接成功后重建它。
-# 重要的是两次 build_graph 都传的是同一个 _checkpointer 实例。
-graph = build_graph(checkpointer=_checkpointer)
+# ★ 模块加载时（langgraph dev 扫描期）：不带 checkpointer
+# CLI 模式下，_init_registry 会重建成带 MemorySaver 的版本；
+# webapp 模式下，lifespan 会在 _start_mcp_sessions() 之后重建成带 AsyncSqliteSaver 的版本。
+graph = build_graph()
 
 
 # ══════════════════════════════════════════════════════

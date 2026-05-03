@@ -20,6 +20,8 @@ dependencies = [
     "nest-asyncio>=1.6.0",
     "langgraph-api>=0.8.5",
     "fastapi>=0.136.0",
+    "langgraph-checkpoint-sqlite>=3.0.3",
+    "aiosqlite>=0.22.1",
 ]
 
 [dependency-groups]
