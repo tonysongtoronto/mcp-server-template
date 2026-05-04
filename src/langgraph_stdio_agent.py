@@ -20,7 +20,7 @@ src/langgraph_stdio_agent.py
   【修复7】强化 Planner 工具感知
   【修复8】run_agent 工具调用强制兜底
   【修复9】全局兼容 llm.ainvoke() 返回 dict
-  【修复10】兼容 LangGraph Studio 下 messages 反序列化为 dict
+  【修复10】兼容 LangGraph Studio 下 messages    反序列化为 dict
   【修复11】彻底移除 asyncio.Event，改用 _registry.agents 判断就绪
   【修复12】_ensure_registry() 调用时机提前到 task_plan 判断之前
   【SSE改造】前端改用 SSE 传输，绕开 Windows ProactorLoop 限制
