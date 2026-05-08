@@ -16,7 +16,7 @@ PROJECT_NAME = "MCP_SERVER_TEMPLEATE"
 
 # 填 Thread ID（从 Studio 顶部复制）
 THREAD_IDS = [
-    "8cd92196-39b4-4d06-983e-2c4e68a4ffb6",
+    "f5f2e629-8d60-4d21-a021-f3dbd97ecdcb",
     # "另一个 thread_id",
 ]
 
