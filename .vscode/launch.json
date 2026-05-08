@@ -67,6 +67,19 @@
             "cwd": "${workspaceFolder}",
             "env": { "PYTHONPATH": "${workspaceFolder}" }
         },
+        {
+        "name": "LangGraph Dev (Debug)",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/.venv/Scripts/langgraph.exe",
+        "args": ["dev", "--no-browser", "--allow-blocking"],
+        "cwd": "${workspaceFolder}",
+        "env": {
+            "PYTHONPATH": "${workspaceFolder}/src"
+        },
+        "console": "integratedTerminal",
+        "justMyCode": true
+        },
 
         // ══════════════════════════════════════════════════════════
         // 🐳 Docker 操作
