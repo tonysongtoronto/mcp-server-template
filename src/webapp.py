@@ -28,7 +28,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 # ──────────────────────────────────────────
 # 配置
@@ -181,108 +181,136 @@ async def lifespan(app: FastAPI):
     #   覆盖掉 _init_registry 里用 _checkpointer（MemorySaver）建的那个版本，
     #   确保运行时的 graph 用的是 AsyncSqliteSaver。
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    # ★ STORE webapp改动1/4：导入 AsyncSqliteStore（持久化 Memory Store，进程重启数据不丢）
+    #
+    # AsyncSqliteStore vs InMemoryStore（在 langgraph_parallel_agent.py 里）：
+    #   InMemoryStore   → CLI 实验用，Python 字典，重启清空
+    #   AsyncSqliteStore → webapp 生产用，写入 SQLite，重启仍在
+    #
+    # 两个 Store 存储在不同的 SQLite 文件里，互不干扰：
+    #   checkpoints.db   → 对话历史 checkpoint（AsyncSqliteSaver）
+    #   memory_store.db  → 全局记忆 Memory Store（AsyncSqliteStore）
+    from langgraph.store.sqlite.aio import AsyncSqliteStore
     import src.langgraph_parallel_agent as agent_module
 
     _CHECKPOINT_DB = Path(__file__).parent.parent / "data" / "checkpoints.db"
     _CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
     print(f"  💾 [Checkpoint] SQLite 路径：{_CHECKPOINT_DB}", file=sys.stderr)
 
+    # ★ STORE webapp改动2/4：Memory Store 独立 SQLite 文件
+    _STORE_DB = Path(__file__).parent.parent / "data" / "memory_store.db"
+    _STORE_DB.parent.mkdir(parents=True, exist_ok=True)
+    print(f"  🗄️  [MemoryStore] SQLite 路径：{_STORE_DB}", file=sys.stderr)
+
     async with AsyncSqliteSaver.from_conn_string(str(_CHECKPOINT_DB)) as saver:
         app.state.checkpointer = saver
         print("  ✅ [Checkpoint] AsyncSqliteSaver 就绪", file=sys.stderr)
 
-        # ── 1. 启动 server.py（SSE @ 8001）──────────────────────────────
-        server_proc = await _launch_subprocess(
-            tag="server.py",
-            cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
-            env={
-                "PYTHONUNBUFFERED": "1",
-                "PYTHONIOENCODING": "utf-8",
-                "PORT": str(_SERVER_PORT),
-                "MCP_FS_BASE_DIR": str(_FS_BASE_DIR),
-            },
-            port=_SERVER_PORT,
-        )
-        if server_proc:
-            _subprocesses.append(server_proc)
-            ok = await _wait_for_sse(f"http://127.0.0.1:{_SERVER_PORT}/sse")
-            print(f"  {'✅' if ok else '❌'} [server.py] SSE {'就绪' if ok else '超时'}",
-                  file=sys.stderr)
-
-        # ── 2. 启动 mcp-proxy（SSE @ 8002：filesystem）──────────────────
-        _fs_sub_cmd = f"npx -y @modelcontextprotocol/server-filesystem {_FS_BASE_DIR}"
-        fs_proc = await _launch_subprocess(
-            tag="mcp-proxy(fs)",
-            cmd=[_NPX, "mcp-proxy", "--port", str(_FS_PROXY_PORT),
-                 "--server", "sse", "--shell", "--", _fs_sub_cmd],
-            port=_FS_PROXY_PORT,
-        )
-        if fs_proc:
-            _subprocesses.append(fs_proc)
-            ok = await _wait_for_sse(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse")
-            print(f"  {'✅' if ok else '❌'} [mcp-proxy(fs)] SSE {'就绪' if ok else '超时'}",
-                  file=sys.stderr)
-
-        # ── 3. 启动 db_server.py（SSE @ 8003）───────────────────────────
-        db_proc = await _launch_subprocess(
-            tag="db_server.py",
-            cmd=[sys.executable, "-u", str(_DB_SERVER_PY), "--sse"],
-            env={
-                "PYTHONUNBUFFERED": "1",
-                "PYTHONIOENCODING": "utf-8",
-                "PORT": str(_DB_SERVER_PORT),
-            },
-            port=_DB_SERVER_PORT,
-        )
-        if db_proc:
-            _subprocesses.append(db_proc)
-            ok = await _wait_for_sse(f"http://127.0.0.1:{_DB_SERVER_PORT}/sse")
-            print(f"  {'✅' if ok else '❌'} [db_server.py] SSE {'就绪' if ok else '超时'}",
-                  file=sys.stderr)
-
-        # ── 4. 启动 mcp-proxy（SSE @ 8004：math-mcp）────────────────────
-        _math_sub_cmd = f"{_NODE} {_MATH_MCP_JS}"
-        math_proc = await _launch_subprocess(
-            tag="mcp-proxy(math)",
-            cmd=[_NPX, "mcp-proxy", "--port", str(_MATH_PROXY_PORT),
-                 "--server", "sse", "--shell", "--", _math_sub_cmd],
-            port=_MATH_PROXY_PORT,
-        )
-        if math_proc:
-            _subprocesses.append(math_proc)
-            ok = await _wait_for_sse(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse")
-            print(f"  {'✅' if ok else '❌'} [mcp-proxy(math)] SSE {'就绪' if ok else '超时'}",
-                  file=sys.stderr)
-
-        # ── 5. 初始化 MCP sessions ───────────────────────────────────────
-        # 注意：_start_mcp_sessions() 内部会调用 _init_registry()，
-        # _init_registry 在 webapp 模式下会调用 build_graph()（不带 checkpointer）。
-        # 因此 graph 必须在这一步之后重建，才不会被覆盖。
-        await agent_module._start_mcp_sessions()
-
-        # ── 6. 用 AsyncSqliteSaver 重建 graph（必须在 _start_mcp_sessions 之后）──
+        # ★ STORE webapp改动3/4：打开 AsyncSqliteStore，嵌套在 AsyncSqliteSaver 里
         #
-        # _start_mcp_sessions() → _init_registry() 会用模块级 _checkpointer（MemorySaver）
-        # 建一个 graph。这里再用 AsyncSqliteSaver 覆盖，确保运行时持久化到 SQLite。
-        # 平台在模块加载时只扫描模块底部那行 graph = build_graph()（无 checkpointer），
-        # lifespan 启动后平台不再扫描，所以这里覆盖是安全的。
-        agent_module.graph = agent_module.build_graph(checkpointer=saver)
-        print("  ✅ [Checkpoint] graph 已用 AsyncSqliteSaver 重新编译（持久化到 SQLite）",
-              file=sys.stderr)
-        print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
+        # 为什么嵌套？
+        #   两者都是 async context manager，同时需要保持连接到 yield（服务期间）。
+        #   嵌套写法确保两个 SQLite 连接在整个 lifespan 期间都是打开状态。
+        #   yield 之后两者按相反顺序自动关闭，安全落盘。
+        async with AsyncSqliteStore.from_conn_string(str(_STORE_DB)) as store:
+            app.state.store = store
+            print("  ✅ [MemoryStore] AsyncSqliteStore 就绪", file=sys.stderr)
 
-        try:
-            yield
+            # ── 1. 启动 server.py（SSE @ 8001）──────────────────────────────
+            server_proc = await _launch_subprocess(
+                tag="server.py",
+                cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
+                env={
+                    "PYTHONUNBUFFERED": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                    "PORT": str(_SERVER_PORT),
+                    "MCP_FS_BASE_DIR": str(_FS_BASE_DIR),
+                },
+                port=_SERVER_PORT,
+            )
+            if server_proc:
+                _subprocesses.append(server_proc)
+                ok = await _wait_for_sse(f"http://127.0.0.1:{_SERVER_PORT}/sse")
+                print(f"  {'✅' if ok else '❌'} [server.py] SSE {'就绪' if ok else '超时'}",
+                      file=sys.stderr)
 
-        finally:
-            await agent_module._stop_mcp_sessions()
-            print("\n🛑 [lifespan] 关闭子进程...", file=sys.stderr)
-            for proc in reversed(_subprocesses):
-                await _terminate_subprocess("subprocess", proc)
-            _subprocesses.clear()
-            print("🛑 [lifespan] 全部已关闭\n", file=sys.stderr)
+            # ── 2. 启动 mcp-proxy（SSE @ 8002：filesystem）──────────────────
+            _fs_sub_cmd = f"npx -y @modelcontextprotocol/server-filesystem {_FS_BASE_DIR}"
+            fs_proc = await _launch_subprocess(
+                tag="mcp-proxy(fs)",
+                cmd=[_NPX, "mcp-proxy", "--port", str(_FS_PROXY_PORT),
+                     "--server", "sse", "--shell", "--", _fs_sub_cmd],
+                port=_FS_PROXY_PORT,
+            )
+            if fs_proc:
+                _subprocesses.append(fs_proc)
+                ok = await _wait_for_sse(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse")
+                print(f"  {'✅' if ok else '❌'} [mcp-proxy(fs)] SSE {'就绪' if ok else '超时'}",
+                      file=sys.stderr)
 
-    # async with AsyncSqliteSaver 在这里自动关闭数据库连接，checkpoints.db 安全落盘
+            # ── 3. 启动 db_server.py（SSE @ 8003）───────────────────────────
+            db_proc = await _launch_subprocess(
+                tag="db_server.py",
+                cmd=[sys.executable, "-u", str(_DB_SERVER_PY), "--sse"],
+                env={
+                    "PYTHONUNBUFFERED": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                    "PORT": str(_DB_SERVER_PORT),
+                },
+                port=_DB_SERVER_PORT,
+            )
+            if db_proc:
+                _subprocesses.append(db_proc)
+                ok = await _wait_for_sse(f"http://127.0.0.1:{_DB_SERVER_PORT}/sse")
+                print(f"  {'✅' if ok else '❌'} [db_server.py] SSE {'就绪' if ok else '超时'}",
+                      file=sys.stderr)
+
+            # ── 4. 启动 mcp-proxy（SSE @ 8004：math-mcp）────────────────────
+            _math_sub_cmd = f"{_NODE} {_MATH_MCP_JS}"
+            math_proc = await _launch_subprocess(
+                tag="mcp-proxy(math)",
+                cmd=[_NPX, "mcp-proxy", "--port", str(_MATH_PROXY_PORT),
+                     "--server", "sse", "--shell", "--", _math_sub_cmd],
+                port=_MATH_PROXY_PORT,
+            )
+            if math_proc:
+                _subprocesses.append(math_proc)
+                ok = await _wait_for_sse(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse")
+                print(f"  {'✅' if ok else '❌'} [mcp-proxy(math)] SSE {'就绪' if ok else '超时'}",
+                      file=sys.stderr)
+
+            # ── 5. 初始化 MCP sessions ───────────────────────────────────────
+            await agent_module._start_mcp_sessions()
+
+            # ── 6. 用 AsyncSqliteSaver + AsyncSqliteStore 重建 graph ─────────
+            #
+            # ★ STORE webapp改动4/4：build_graph 同时传入 checkpointer 和 store
+            #
+            # 之前：build_graph(checkpointer=saver)
+            # 现在：build_graph(checkpointer=saver, store=store)
+            #
+            # 效果：
+            #   - 对话历史 checkpoint → 写入 checkpoints.db（AsyncSqliteSaver）
+            #   - 全局记忆 Memory Store → 写入 memory_store.db（AsyncSqliteStore）
+            #   - planner_node 会自动收到 store 对象，读取全局记忆注入到 system prompt
+            agent_module.graph = agent_module.build_graph(checkpointer=saver, store=store)
+            print("  ✅ [Graph] 已用 AsyncSqliteSaver + AsyncSqliteStore 重新编译",
+                  file=sys.stderr)
+            print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
+
+            try:
+                yield
+
+            finally:
+                await agent_module._stop_mcp_sessions()
+                print("\n🛑 [lifespan] 关闭子进程...", file=sys.stderr)
+                for proc in reversed(_subprocesses):
+                    await _terminate_subprocess("subprocess", proc)
+                _subprocesses.clear()
+                print("🛑 [lifespan] 全部已关闭\n", file=sys.stderr)
+
+    # async with 结束时，AsyncSqliteStore 和 AsyncSqliteSaver 按相反顺序自动关闭，
+    # memory_store.db 和 checkpoints.db 均安全落盘。
 
 
 # ──────────────────────────────────────────
@@ -387,3 +415,93 @@ async def chat_stream(request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ──────────────────────────────────────────
+# Memory Store 管理端点（实验 & 运维用）
+# ──────────────────────────────────────────
+#
+# 这三个端点让你不用重启服务就能动态管理全局记忆。
+# 典型用途：
+#   预置业务规则   → PUT /memory/put  {"key":"discount","value":"所有用户享受10%折扣"}
+#   查看当前记忆   → GET /memory/list
+#   删除过期记忆   → DELETE /memory/delete?key=discount
+#
+# 默认使用 ("system",) 命名空间（全体用户可见）。
+# 如需用户级命名空间，传 namespace 参数：?namespace=user:u001
+
+def _parse_namespace(ns_str: str | None) -> tuple:
+    """把 'system' 或 'user:uid123' 这样的字符串转成 tuple('system',) 或 ('user','uid123')"""
+    if not ns_str or ns_str == "system":
+        return ("system",)
+    parts = ns_str.split(":", 1)
+    return tuple(parts)
+
+
+@app.post("/memory/put")
+async def memory_put(request: Request) -> JSONResponse:
+    """
+    写入一条全局记忆。
+    Body: {"key": "city", "value": "Toronto", "namespace": "system"}
+    """
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        return JSONResponse({"error": "Memory Store 未初始化"}, status_code=503)
+
+    body = await request.json()
+    key       = body.get("key", "").strip()
+    value     = body.get("value")
+    namespace = _parse_namespace(body.get("namespace", "system"))
+
+    if not key:
+        return JSONResponse({"error": "key 不能为空"}, status_code=400)
+    if value is None:
+        return JSONResponse({"error": "value 不能为 null"}, status_code=400)
+
+    # value 若是字符串，包装成 dict 存储（Store 要求 value 为 dict）
+    stored_val = value if isinstance(value, dict) else {"value": value}
+
+    try:
+        await store.aput(namespace, key, stored_val)
+        print(f"  💾 [/memory/put] {namespace}/{key} = {str(value)[:60]}", file=sys.stderr)
+        return JSONResponse({"ok": True, "namespace": list(namespace), "key": key})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/memory/list")
+async def memory_list(request: Request, namespace: str = "system") -> JSONResponse:
+    """
+    列出命名空间下所有全局记忆。
+    Query: ?namespace=system（默认）
+    """
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        return JSONResponse({"error": "Memory Store 未初始化"}, status_code=503)
+
+    ns = _parse_namespace(namespace)
+    try:
+        results = await store.asearch(ns)
+        items   = {r.key: r.value for r in results}
+        return JSONResponse({"namespace": list(ns), "count": len(items), "items": items})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.delete("/memory/delete")
+async def memory_delete(request: Request, key: str, namespace: str = "system") -> JSONResponse:
+    """
+    删除一条全局记忆。
+    Query: ?key=city&namespace=system
+    """
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        return JSONResponse({"error": "Memory Store 未初始化"}, status_code=503)
+
+    ns = _parse_namespace(namespace)
+    try:
+        await store.adelete(ns, key)
+        print(f"  🗑️  [/memory/delete] {ns}/{key}", file=sys.stderr)
+        return JSONResponse({"ok": True, "namespace": list(ns), "key": key})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)

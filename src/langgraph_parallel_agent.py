@@ -133,6 +133,17 @@ from langgraph.graph import StateGraph, END
 # 缺点：进程重启后数据全部清空（阶段二换 SqliteSaver 解决）。
 from langgraph.checkpoint.memory import MemorySaver   # ← 新增
 
+# ★ STORE 改动1/5：InMemoryStore 导入（CLI 模式用；webapp 模式由 lifespan 注入 AsyncSqliteStore）
+#
+# 两种 Store 对比：
+#   InMemoryStore   → Python 字典，进程重启清空，CLI 实验专用
+#   AsyncSqliteStore → 写入磁盘，进程重启后数据仍在，webapp 生产使用
+#
+# Store 和 Checkpointer 的区别：
+#   Checkpointer  → 存每个 thread_id 的对话历史（per-user、per-session）
+#   Store         → 存跨 thread_id 共享的全局记忆（系统配置、管理员预置知识库等）
+from langgraph.store.memory import InMemoryStore   # ← 新增
+
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
@@ -424,6 +435,19 @@ _mcp_exit_stack: AsyncExitStack | None = None
 #   正确做法是始终用同一本笔记本，graph 重建只是换了"读笔记本的方式"，笔记本本身不变。
 _checkpointer = MemorySaver()   # ← 新增：进程级单例，永不重建
 
+# ★ STORE 改动2/5：_store 模块级单例（CLI 模式用 InMemoryStore）
+#
+# 设计说明：
+#   - CLI 模式（__main__）：直接用这个 InMemoryStore，进程内持久，重启清空
+#   - webapp 模式（lifespan）：lifespan 会创建 AsyncSqliteStore 并覆盖 agent_module.graph，
+#     但 _store 这个变量本身不需要被覆盖，因为 graph 是 lifespan 重建的，
+#     store 作为参数传进去了，和 _store 变量解耦
+#
+# 命名空间设计建议：
+#   ("system",)      → 管理员预置的全局知识（所有用户、所有会话都能读到）
+#   ("user", uid)    → 跨 thread_id 的用户级持久信息（如 VIP 标签、偏好设置）
+_store = InMemoryStore()   # ← 新增：CLI 模式的 store 单例
+
 # ══════════════════════════════════════════════════════
 # 流式输出队列（阶段二：SSE 端点专用）
 # ══════════════════════════════════════════════════════
@@ -659,12 +683,17 @@ def _init_registry(tools: list[StructuredTool]) -> None:
     #   3. 结果：第二轮请求时 graph 已没有 checkpointer，checkpoint 失效，
     #      msgs 只有 1 条（当前轮），多轮记忆全部丢失。
     #
-    # 修复：_init_registry 始终传 _checkpointer（模块级单例），
-    #   webapp.py 的 lifespan 若想升级为 AsyncSqliteSaver，在 _start_mcp_sessions 之后
-    #   额外调一次 agent_module.graph = agent_module.build_graph(checkpointer=saver) 覆盖即可。
-    #   模块底部那行 graph = build_graph()（无 checkpointer）在平台扫描时仍然安全，
-    #   因为它在 lifespan 启动前执行，不影响运行时行为。
-    graph = build_graph(checkpointer=_checkpointer)
+    # ★ STORE 改动3/5：_init_registry 把 _store 一并传给 build_graph
+    #
+    # 为什么需要传 store？
+    #   build_graph 的 g.compile(store=store) 会让 LangGraph 在调用每个节点时，
+    #   自动把 store 以关键字参数方式注入给声明了 `store=None` 参数的节点函数。
+    #   只有 compile 时传了 store，planner_node(state, *, store=None) 才能收到它。
+    #
+    # webapp 模式下：
+    #   lifespan 会在这一步之后用 AsyncSqliteStore 重建 graph，
+    #   所以这里传 _store（InMemoryStore）只是过渡状态，不影响最终运行。
+    graph = build_graph(checkpointer=_checkpointer, store=_store)
 
 
 # ══════════════════════════════════════════════════════
@@ -723,6 +752,49 @@ def _get_message_content(msg: Any) -> str:
     if isinstance(msg, dict):
         return msg.get("content") or msg.get("text") or str(msg)
     return str(msg)
+
+
+# ══════════════════════════════════════════════════════
+# 6b. Memory Store 辅助函数（实验 & 管理用）
+# ══════════════════════════════════════════════════════
+#
+# 这三个函数包装了 _store 的 put / get / list 操作，
+# 供 CLI 交互模式（!memory 命令）和 webapp 端点调用。
+# 对 InMemoryStore 用同步 API，对 AsyncSqliteStore 在外层 async 里用 await。
+
+def store_put(key: str, value: Any, namespace: tuple = ("system",)) -> None:
+    """写入一条全局记忆。value 可以是任意 JSON-serializable 对象。"""
+    _store.put(namespace, key, value if isinstance(value, dict) else {"value": value})
+    print(f"  💾 [Store] 写入 {namespace}/{key} = {str(value)[:60]}")
+
+
+def store_get(key: str, namespace: tuple = ("system",)) -> Any | None:
+    """读取一条全局记忆。不存在时返回 None。"""
+    try:
+        item = _store.get(namespace, key)
+        return item.value if item else None
+    except Exception:
+        return None
+
+
+def store_list(namespace: tuple = ("system",)) -> dict:
+    """列出命名空间下所有记忆，返回 {key: value} 字典。"""
+    try:
+        results = _store.search(namespace)
+        return {r.key: r.value for r in results}
+    except Exception:
+        return {}
+
+
+def store_delete(key: str, namespace: tuple = ("system",)) -> bool:
+    """删除一条全局记忆。成功返回 True。"""
+    try:
+        _store.delete(namespace, key)
+        print(f"  🗑️  [Store] 删除 {namespace}/{key}")
+        return True
+    except Exception as e:
+        print(f"  ⚠️  [Store] 删除失败：{e}")
+        return False
 
 
 # ══════════════════════════════════════════════════════
@@ -866,6 +938,14 @@ depends_on 必须与 inputs 中所有 from_task 的值完全一致。
 2. 如果用户当前消息是闲聊/问候/自我介绍（如我是程序员、你好、对）→ 只规划 1 个 direct 任务。
 3. 如果用户当前消息只问一件事 → 只规划完成那一件事所需的最少任务。
 4. description 只写任务意图，不提前计算数值或给出答案。
+   ★ 唯一例外（Memory Store / 用户画像摘要中的已知事实）：
+     如果答案已经在【Memory Store 全局记忆】或【用户画像摘要】中明确存在，
+     则 description 必须把相关内容直接写入，供执行器使用，而不能只写意图。
+     示例（正确）：store 里有 discount_policy="所有用户享受九折优惠，VIP用户享受八折"
+       用户问"折扣政策是什么" → description 必须写：
+       "回答折扣政策：所有用户享受九折优惠，VIP用户享受八折"
+     示例（错误）：description 只写 "回答公司的折扣政策"
+       → 执行器看不到实际内容，会反问用户，这是严重错误。
 5. 同一个 agent 可出现多次。
 6. 任务按拓扑顺序排列（被依赖的任务排在前面）。
 
@@ -948,7 +1028,13 @@ depends_on 必须与 inputs 中所有 from_task 的值完全一致。
 """
 
 
-async def planner_node(state: AgentState) -> AgentState:
+async def planner_node(state: AgentState, *, store=None) -> AgentState:
+    # ★ STORE 改动5/5：planner_node 新增 store=None 参数
+    #
+    # LangGraph 的 store 注入机制：
+    #   compile(store=store) 后，LangGraph 在调用节点前会检查函数签名。
+    #   如果有 `*, store=None` 关键字参数，自动把 store 对象注入进来。
+    #   这是 LangGraph 原生支持的特性，不需要修改图结构。
     await _ensure_registry()
 
     msgs = state.get("messages", [])
@@ -1019,10 +1105,56 @@ async def planner_node(state: AgentState) -> AgentState:
     retry_feedback:  str = ""
     last_raw_output: str = ""
 
+    # ★ STORE 改动5/5（续）：从 Memory Store 读取全局记忆
+    #
+    # 读取逻辑：
+    #   - 命名空间 ("system",)：管理员预置的全局知识（公司信息、业务规则等）
+    #   - 命名空间 ("user", thread_id)：跨会话的用户级持久信息（VIP标签、偏好等）
+    #
+    # 与 conversation_summary 的区别：
+    #   conversation_summary → 从本会话对话历史提取，thread 隔离
+    #   store_context        → 来自 Memory Store，跨所有 thread 共享
+    #
+    # 异步兼容：InMemoryStore 用 .search()，AsyncSqliteStore 用 await .asearch()
+    store_context = ""
+    if store:
+        try:
+            # 读取系统全局记忆（("system",) 命名空间）
+            if hasattr(store, "asearch"):
+                system_results = await store.asearch(("system",))
+            else:
+                system_results = store.search(("system",))
+
+            # 读取当前用户的跨会话记忆（("user", thread_id) 命名空间）
+            thread_id = ""
+            # thread_id 在 config 里，这里从 state 无法直接取到，用空串兜底
+            user_results = []
+
+            all_items: dict = {}
+            for r in (system_results or []):
+                all_items[r.key] = r.value
+            for r in (user_results or []):
+                all_items[r.key] = r.value
+
+            if all_items:
+                store_context = (
+                    f"\n\n【Memory Store 全局记忆（跨会话持久，管理员预置）】\n"
+                    f"{json.dumps(all_items, ensure_ascii=False, indent=2)}\n"
+                    "以上是系统预置的全局记忆。如果用户问题涉及其中的信息：\n"
+                    "  1. 使用 direct agent 直接回答，不要查数据库或调用其他工具。\n"
+                    "  2. ★ 关键：必须在 description 字段中把相关记忆的实际内容写进去。\n"
+                    "     例如 store 里有 discount_policy 的值，用户问折扣政策，\n"
+                    "     description 必须写：'回答折扣政策：<discount_policy的实际内容>'\n"
+                    "     而不能只写：'回答公司的折扣政策'（执行器没有 store 访问权，会反问用户）。"
+                )
+                print(f"  🗄️  [Store] 读取到 {len(all_items)} 条全局记忆：{list(all_items.keys())}")
+        except Exception as e:
+            print(f"  ⚠️  [Store] 读取失败（忽略）：{e}")
+
     for attempt in range(max_retries):
         try:
-            # Planner system prompt 注入上一轮 AI 回复（如果有）
-            planner_system_with_context = _planner_system() + last_ai_context
+            # Planner system prompt = 基础 + 摘要/上轮上下文 + Store 全局记忆
+            planner_system_with_context = _planner_system() + last_ai_context + store_context
 
             invoke_msgs: list = [
                 SystemMessage(content=planner_system_with_context),
@@ -1676,21 +1808,20 @@ DEFAULT_AGENT_SYSTEM_PROMPT = AGENT_SYSTEM_PROMPTS["default_agent"]
 # 13. 图构建
 # ══════════════════════════════════════════════════════
 
-# ★ CHECKPOINT 改动6a/6：build_graph 接收 checkpointer 参数
+# ★ STORE 改动4/5：build_graph 新增 store 参数
 #
-# 改动前：def build_graph() -> Any:  ...  return g.compile()
-# 改动后：def build_graph(checkpointer=None) -> Any:  ...  return g.compile(checkpointer=checkpointer)
+# 改动前：def build_graph(checkpointer=None) -> Any:
+#           return g.compile(checkpointer=checkpointer)
 #
-# 为什么用参数而不是直接写死 _checkpointer？
-#   1. webapp.py 阶段二会注入 SqliteSaver，参数形式方便替换
-#   2. 测试时可以传 None（不用 checkpoint），方便单元测试
-#   3. 遵循"依赖注入"原则：函数不依赖全局状态，更容易维护
+# 改动后：def build_graph(checkpointer=None, store=None) -> Any:
+#           return g.compile(checkpointer=checkpointer, store=store)
 #
-# compile(checkpointer=...) 做了什么？
-#   - 告诉 LangGraph：每次节点执行完，把当前 state 快照存到 checkpointer
-#   - 每次 invoke 时如果传了 thread_id，先从 checkpointer 恢复上次的 state
-#   - 这就是"记忆"的来源
-def build_graph(checkpointer=None) -> Any:
+# compile(store=...) 做了什么？
+#   - LangGraph 在调用每个 node 时，会检查函数签名
+#   - 如果节点函数有 `store=None` 关键字参数，自动把 store 注入进去
+#   - 这样 planner_node(state, *, store=None) 就能收到 store 对象
+#   - 不需要修改任何图结构，完全透明
+def build_graph(checkpointer=None, store=None) -> Any:
     """
     图结构（极简）：
         planner → parallel_executor → final_answer → END
@@ -1716,8 +1847,9 @@ def build_graph(checkpointer=None) -> Any:
     g.add_edge("parallel_executor", "final_answer")
     g.add_edge("final_answer",      END)
 
-    # CLI 模式传入 MemorySaver，webapp 模式传入 AsyncSqliteSaver（或 None）
-    return g.compile(checkpointer=checkpointer)
+    # CLI 模式：checkpointer=MemorySaver, store=InMemoryStore
+    # webapp 模式：checkpointer=AsyncSqliteSaver, store=AsyncSqliteStore
+    return g.compile(checkpointer=checkpointer, store=store)
 
 
 # ══════════════════════════════════════════════════════
@@ -1989,10 +2121,16 @@ if __name__ == "__main__":
 
     async def _interactive() -> None:
         print("\n" + "═" * 60)
-        print("🤖  MCP Multi-Agent 并行 CLI 就绪（已启用 MemorySaver Checkpoint）")
+        print("🤖  MCP Multi-Agent 并行 CLI 就绪（已启用 MemorySaver Checkpoint + InMemoryStore）")
         print("    输入问题后回车执行，输入 'quit' / 'exit' / 'q' 退出")
         print("    输入 'batch' 快速跑完 QUESTIONS 列表")
         print("    输入 'new' 开始新会话（新 thread_id）")
+        print("─── Memory Store 命令（实验用）───────────────────────────")
+        print("    !memory list              → 列出所有全局记忆")
+        print("    !memory put <key> <value> → 写入一条全局记忆")
+        print("    !memory get <key>         → 读取一条全局记忆")
+        print("    !memory del <key>         → 删除一条全局记忆")
+        print("    !memory clear             → 清空所有全局记忆")
         print("═" * 60)
 
         # 交互式模式下，同一次运行里所有问题共享一个 thread_id
@@ -2019,6 +2157,44 @@ if __name__ == "__main__":
                 session_thread_id = f"interactive_{int(time.time())}"
                 print(f"📌 新会话已开始，thread_id: {session_thread_id}")
                 continue
+
+            # ── Memory Store 命令解析 ──────────────────────────────────
+            if q.startswith("!memory"):
+                parts = q.split(maxsplit=3)
+                cmd   = parts[1].lower() if len(parts) > 1 else "list"
+
+                if cmd == "list":
+                    items = store_list()
+                    if items:
+                        print("🗄️  [Store] 当前全局记忆：")
+                        for k, v in items.items():
+                            print(f"   {k}: {json.dumps(v, ensure_ascii=False)}")
+                    else:
+                        print("🗄️  [Store] 暂无全局记忆（store 为空）")
+
+                elif cmd == "put" and len(parts) >= 4:
+                    key, val = parts[2], parts[3]
+                    store_put(key, val)
+                    print(f"✅ 已写入：{key} = {val}")
+
+                elif cmd == "get" and len(parts) >= 3:
+                    key = parts[2]
+                    val = store_get(key)
+                    print(f"📖 {key} = {json.dumps(val, ensure_ascii=False) if val else '（不存在）'}")
+
+                elif cmd == "del" and len(parts) >= 3:
+                    store_delete(parts[2])
+
+                elif cmd == "clear":
+                    items = store_list()
+                    for k in list(items.keys()):
+                        store_delete(k)
+                    print(f"🗑️  已清空 {len(items)} 条全局记忆")
+
+                else:
+                    print("⚠️  用法：!memory list / put <key> <value> / get <key> / del <key> / clear")
+                continue
+
             await _run_question(q, thread_id=session_thread_id)
 
     async def _batch() -> None:
@@ -2046,3 +2222,5 @@ if __name__ == "__main__":
             await _stop_mcp_sessions()
 
     asyncio.run(main())
+    
+      # uv run python src/langgraph_parallel_agent.py
