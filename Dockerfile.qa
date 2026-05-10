@@ -1,0 +1,49 @@
+# Dockerfile.qa  —— 专为 langgraph dev 开发/QA 模式设计
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+# 装 Node.js（math-mcp 和 filesystem-mcp 需要 npx）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nodejs npm curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# UV 优化
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+
+WORKDIR /app
+
+# ── Python 依赖（利用缓存层）──────────────────────────────────────────
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen
+
+# ── 源码 ──────────────────────────────────────────────────────────────
+COPY src/ ./src/
+COPY langgraph.json ./
+
+# 复制 File_Agent 目录
+COPY File_Agent/ ./File_Agent/
+
+# ── mcp-proxy 通过 pyproject.toml 由 uv sync 安装，无需 npm 安装 ────
+
+# ── 修复2：预 build math-mcp（JS 工具包）───────────────────────────────
+#
+# 问题：webapp.py 启动 math-mcp 用的是 `node /app/src/math-mcp/build/index.js`，
+#       但原 Dockerfile 只 COPY 了 src/，没有执行 npm install + npm run build，
+#       导致 build/index.js 根本不存在，math_agent 没有工具可用。
+# 修复：在 build 阶段进入 math-mcp 目录，安装依赖并编译 TypeScript → JavaScript。
+RUN cd /app/src/math-mcp \
+    && npm install \
+    && npm run build:stdio
+
+# ── 暴露端口 ──────────────────────────────────────────────────────────
+# 2024: langgraph dev UI
+# 8001: mcp_server_template SSE
+# 8002: filesystem-mcp SSE (mcp-proxy)
+# 8003: mcp_db_server SSE
+# 8004: math-mcp SSE (mcp-proxy)
+EXPOSE 2024 8001 8002 8003 8004
+
+# 启动命令：langgraph dev，监听所有网络接口
+CMD ["uv", "run", "langgraph", "dev", "--host", "0.0.0.0", "--port", "2024"]

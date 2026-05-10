@@ -564,6 +564,18 @@ wheels = [
 ]
 
 [[package]]
+name = "httpx-auth"
+version = "0.23.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a8/d4/6bd616f89d1ce43f602b62ec274e33beee6c2bce3d68396e692daafdb57d/httpx_auth-0.23.1.tar.gz", hash = "sha256:27b5a6022ad1b41a303b8737fa2e3e4bce6bbbe7ab67fed0b261359be62e0434", size = 121418, upload-time = "2025-01-07T18:47:20.05Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/23/a72f91bea596b522ac297b948ffee6decdedb535c034fca8062bd72981ce/httpx_auth-0.23.1-py3-none-any.whl", hash = "sha256:04f8bd0824efe3d9fb79690cc670b0da98ea809babb7aea04a72f334d4fd5ec5", size = 45328, upload-time = "2025-01-07T18:47:18.694Z" },
+]
+
+[[package]]
 name = "httpx-sse"
 version = "0.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1030,6 +1042,20 @@ cli = [
 ]
 
 [[package]]
+name = "mcp-proxy"
+version = "0.11.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx-auth" },
+    { name = "mcp" },
+    { name = "uvicorn" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/2b/06a58f04b102b424ec2f96fba3bf0f7a7cdd498bf8710ba38d0f5757046f/mcp_proxy-0.11.0.tar.gz", hash = "sha256:3424ecb1f57f8174625ddff0df15b534a08719d87cf5f9d6a2b1e038de6969f1", size = 33975, upload-time = "2026-01-15T18:24:46.472Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/19/af172c3f1c31dc197ce176af62e614b9746b08669538bff570b0eade22a9/mcp_proxy-0.11.0-py3-none-any.whl", hash = "sha256:96e3231eb24b2f37cfdd1077dc259b0e0f339b9d904424e76ae5175410737fc9", size = 22614, upload-time = "2026-01-15T18:24:44.811Z" },
+]
+
+[[package]]
 name = "mcp-server-template"
 version = "0.1.0"
 source = { editable = "." }
@@ -1046,6 +1072,7 @@ dependencies = [
     { name = "langgraph-cli", extra = ["inmem"] },
     { name = "langsmith" },
     { name = "mcp", extra = ["cli"] },
+    { name = "mcp-proxy" },
     { name = "nest-asyncio" },
     { name = "openai" },
     { name = "pandas" },
@@ -1077,6 +1104,7 @@ requires-dist = [
     { name = "langgraph-cli", extras = ["inmem"], specifier = ">=0.4.22" },
     { name = "langsmith", specifier = ">=0.7.30" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.2.0" },
+    { name = "mcp-proxy", specifier = ">=0.11.0" },
     { name = "nest-asyncio", specifier = ">=1.6.0" },
     { name = "openai", specifier = ">=2.31.0" },
     { name = "pandas", specifier = ">=3.0.2" },

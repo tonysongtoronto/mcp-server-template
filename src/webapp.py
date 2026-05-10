@@ -235,11 +235,10 @@ async def lifespan(app: FastAPI):
                       file=sys.stderr)
 
             # ── 2. 启动 mcp-proxy（SSE @ 8002：filesystem）──────────────────
-            _fs_sub_cmd = f"npx -y @modelcontextprotocol/server-filesystem {_FS_BASE_DIR}"
             fs_proc = await _launch_subprocess(
                 tag="mcp-proxy(fs)",
-                cmd=[_NPX, "mcp-proxy", "--port", str(_FS_PROXY_PORT),
-                     "--server", "sse", "--shell", "--", _fs_sub_cmd],
+                cmd=["mcp-proxy", "--port", str(_FS_PROXY_PORT), "--",
+                     "npx", "-y", "@modelcontextprotocol/server-filesystem", str(_FS_BASE_DIR)],
                 port=_FS_PROXY_PORT,
             )
             if fs_proc:
@@ -266,11 +265,10 @@ async def lifespan(app: FastAPI):
                       file=sys.stderr)
 
             # ── 4. 启动 mcp-proxy（SSE @ 8004：math-mcp）────────────────────
-            _math_sub_cmd = f"{_NODE} {_MATH_MCP_JS}"
             math_proc = await _launch_subprocess(
                 tag="mcp-proxy(math)",
-                cmd=[_NPX, "mcp-proxy", "--port", str(_MATH_PROXY_PORT),
-                     "--server", "sse", "--shell", "--", _math_sub_cmd],
+                cmd=["mcp-proxy", "--port", str(_MATH_PROXY_PORT), "--",
+                     _NODE, str(_MATH_MCP_JS)],
                 port=_MATH_PROXY_PORT,
             )
             if math_proc:

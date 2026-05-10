@@ -1,0 +1,23 @@
+services:
+  langgraph-qa:
+    build:
+      context: .
+      dockerfile: Dockerfile.qa
+    ports:
+      - "2024:2024"   # langgraph dev UI
+      - "8001:8001"   # mcp_server_template SSE
+      - "8002:8002"   # filesystem-mcp SSE
+      - "8003:8003"   # mcp_db_server SSE
+      - "8004:8004"   # math-mcp SSE
+    env_file:
+      - .env.qa
+    volumes:
+      # 把本地源码挂载进去，改代码不用重新 build
+      # - ./src:/app/src
+      # - ./File_Agent:/app/File_Agent
+      # SQLite 数据库持久化（对话历史不丢）
+      - qa_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  qa_data:
