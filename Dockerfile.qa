@@ -22,8 +22,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY src/ ./src/
 COPY langgraph.json ./
 
-# 复制 File_Agent 目录
-COPY File_Agent/ ./File_Agent/
+# File_Agent 是运行时存文件的目录，建空目录即可，不从代码复制
+RUN mkdir -p /app/File_Agent
 
 # ── mcp-proxy 通过 pyproject.toml 由 uv sync 安装，无需 npm 安装 ────
 
