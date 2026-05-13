@@ -16,7 +16,6 @@
 #   - thread_id 从请求头 X-Thread-Id 读取，缺省自动生成 UUID
 
 import asyncio
-import json
 import os
 import signal
 import socket
@@ -194,12 +193,12 @@ async def lifespan(app: FastAPI):
     import src.langgraph_parallel_agent as agent_module
 
     _CHECKPOINT_DB = Path(__file__).parent.parent / "data" / "checkpoints.db"
-    _CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(lambda: _CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True))
     print(f"  💾 [Checkpoint] SQLite 路径：{_CHECKPOINT_DB}", file=sys.stderr)
 
     # ★ STORE webapp改动2/4：Memory Store 独立 SQLite 文件
     _STORE_DB = Path(__file__).parent.parent / "data" / "memory_store.db"
-    _STORE_DB.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(lambda: _STORE_DB.parent.mkdir(parents=True, exist_ok=True))
     print(f"  🗄️  [MemoryStore] SQLite 路径：{_STORE_DB}", file=sys.stderr)
 
     async with AsyncSqliteSaver.from_conn_string(str(_CHECKPOINT_DB)) as saver:
@@ -215,6 +214,28 @@ async def lifespan(app: FastAPI):
         async with AsyncSqliteStore.from_conn_string(str(_STORE_DB)) as store:
             app.state.store = store
             print("  ✅ [MemoryStore] AsyncSqliteStore 就绪", file=sys.stderr)
+
+            # ── ★ 修复关键：先打开 agent_module 的 SQLite 后端 ──────────────
+            #
+            # 为什么必须在 _start_mcp_sessions() 之前？
+            #   _start_mcp_sessions() → _init_registry() → build_graph(_checkpointer)
+            #   如果 _checkpointer 还是 None，build_graph 拿到 None，
+            #   LangGraph 会用无持久化模式编译（可以接受，不崩）。
+            #   如果 _checkpointer 是未打开的上下文管理器，LangGraph 就会抛 TypeError。
+            #
+            # webapp 模式下 agent_module 的 _checkpointer 只作"过渡"：
+            #   _start_mcp_sessions 完成后（第6步），lifespan 立即用 webapp 自己的
+            #   saver/store 重建 graph，覆盖掉过渡版本，确保最终运行时用的是
+            #   webapp 管理的 AsyncSqliteSaver（生命周期由 async with 控制）。
+            #
+            # 两个 SQLite 连接（agent_module 的 + webapp 自己的）指向不同文件，互不干扰：
+            #   agent_module: checkpoints.db（项目根目录，CLI 复用同一份数据）
+            #   webapp:       data/checkpoints.db + data/memory_store.db
+            os.environ["CHECKPOINT_DB"] = str(
+                Path(__file__).parent.parent / "data" / "checkpoints.db"
+            )
+            await agent_module._open_sqlite_backends()
+            print("  ✅ [agent_module] SQLite 后端已就绪", file=sys.stderr)
 
             # ── 1. 启动 server.py（SSE @ 8001）──────────────────────────────
             server_proc = await _launch_subprocess(
@@ -359,36 +380,46 @@ async def chat_stream(request: Request) -> StreamingResponse:
     config = {"configurable": {"thread_id": thread_id}}
 
     # ── 创建流式队列，注入到 agent 模块 ──────────────────────────────────
-    # final_answer_node 检测到 _stream_queue 不为 None，就用 astream() 逐 token 推送
+    # ★ 修复1：用 request_id 作 key 存入 dict（_stream_queues），而非单一变量
+    #   final_answer_node 通过 state["_thread_id"] 查找对应 queue；
+    #   之前用 _stream_queue（单数）存，节点查 _stream_queues[key] 永远找不到，
+    #   导致 queues=[] → 不写哨兵 → _generate() 永久阻塞。
+    request_id = f"{thread_id}_{uuid.uuid4().hex[:8]}"
     queue: asyncio.Queue = asyncio.Queue()
-    agent_module._stream_queue = queue
+    agent_module._stream_queues[request_id] = queue
 
     async def _generate():
-        # 在后台启动 graph.ainvoke()，不阻塞 _generate()
-        # graph 处理到 final_answer_node 时，会往 queue 里放 token
+        # ★ 修复2：ainvoke 传入 _thread_id，节点才能找到自己的 queue
         invoke_task = asyncio.create_task(
             agent_module.graph.ainvoke(
-                {"messages": [HumanMessage(content=message)]},
+                {"messages": [HumanMessage(content=message)], "_thread_id": request_id},
                 config=config,
             )
         )
 
         try:
-            # 从队列里读 token，立即推送给浏览器
             while True:
-                token = await queue.get()
+                # ★ 修复3：加 120s 超时兜底，防止节点意外不写哨兵时永久卡死
+                try:
+                    token = await asyncio.wait_for(queue.get(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    yield "data: [ERROR] 等待超时（120s）\n\n"
+                    invoke_task.cancel()
+                    break
 
                 if token is None:
                     # 哨兵：final_answer_node 生成完毕
                     break
 
-                # SSE 格式要求：每条消息以 \n\n 结尾
-                # token 里的换行符要转义，否则会破坏 SSE 帧格式
+                # SSE 帧内不能有裸换行，转义后前端再还原
                 safe_token = token.replace("\n", "\\n")
                 yield f"data: {safe_token}\n\n"
 
             # 等待 invoke 完全结束（含摘要更新等后续操作）
-            await invoke_task
+            try:
+                await invoke_task
+            except Exception as e:
+                yield f"data: [ERROR] {str(e)}\n\n"
 
         except Exception as e:
             print(f"❌ [/chat/stream] 出错：{e}", file=sys.stderr)
@@ -397,12 +428,12 @@ async def chat_stream(request: Request) -> StreamingResponse:
                 invoke_task.cancel()
 
         finally:
-            # 清除队列引用（非常重要！否则下一个请求会用到旧队列）
-            agent_module._stream_queue = None
+            # ★ 修复4：从 dict 里移除，不影响其他并发请求
+            agent_module._stream_queues.pop(request_id, None)
 
-            # 结束标志 + thread_id（前端收到 [DONE] 后关闭连接）
-            yield "data: [DONE]\n\n"
-            yield f"data: {json.dumps({'thread_id': thread_id}, ensure_ascii=False)}\n\n"
+            # [DONE:thread_id] 格式与 api.py / client.js 保持一致
+            # 前端收到后直接解析 threadId，无需再读额外 JSON 帧
+            yield f"data: [DONE:{thread_id}]\n\n"
 
     return StreamingResponse(
         _generate(),

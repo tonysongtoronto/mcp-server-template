@@ -1079,6 +1079,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "requests" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -1111,6 +1112,7 @@ requires-dist = [
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "requests", specifier = ">=2.33.1" },
+    { name = "uvicorn", specifier = ">=0.46.0" },
 ]
 
 [package.metadata.requires-dev]

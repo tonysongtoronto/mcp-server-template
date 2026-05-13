@@ -6,5 +6,8 @@
     "app": "./src/webapp.py:app"
   },
   "env": ".env",
-  "dependencies": ["."]
+  "dependencies": ["."],
+  "dev": {
+    "allow_blocking": true
+  }
 }

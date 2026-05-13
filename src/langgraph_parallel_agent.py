@@ -125,13 +125,14 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 
-# ★ CHECKPOINT 改动2/6：新增 MemorySaver 导入
+# ★ CHECKPOINT 持久化升级：MemorySaver → AsyncSqliteSaver
 #
-# MemorySaver 是 LangGraph 内置的"内存版"存储后端。
-# 它把每个 thread_id 的 checkpoint（state 快照）存在 Python 字典里。
-# 优点：零配置，开发测试直接用。
-# 缺点：进程重启后数据全部清空（阶段二换 SqliteSaver 解决）。
-from langgraph.checkpoint.memory import MemorySaver   # ← 新增
+# AsyncSqliteSaver 把 checkpoint 写入本地 SQLite 文件（checkpoints.db）。
+# 优点：进程重启后对话历史完整保留，零额外依赖（SQLite 是 Python 内置）。
+# 安装：pip install langgraph-checkpoint-sqlite
+#
+# 数据库文件路径：项目根目录 / checkpoints.db（可通过环境变量 CHECKPOINT_DB 覆盖）
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver   # ← 持久化升级
 
 # ★ STORE 改动1/5：InMemoryStore 导入（CLI 模式用；webapp 模式由 lifespan 注入 AsyncSqliteStore）
 #
@@ -142,7 +143,7 @@ from langgraph.checkpoint.memory import MemorySaver   # ← 新增
 # Store 和 Checkpointer 的区别：
 #   Checkpointer  → 存每个 thread_id 的对话历史（per-user、per-session）
 #   Store         → 存跨 thread_id 共享的全局记忆（系统配置、管理员预置知识库等）
-from langgraph.store.memory import InMemoryStore   # ← 新增
+from langgraph.store.sqlite.aio import AsyncSqliteStore   # ← 持久化升级
 
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
@@ -400,6 +401,7 @@ class AgentState(TypedDict):
     #   防止每轮都重新生成摘要（摘要生成也消耗 token）。
     conversation_summary: str   # 对话摘要，初始为空字符串
     summary_turn_count: int     # 已摘要轮次，初始为 0
+    _thread_id: str             # SSE queue 路由用，存当前请求的 thread_id
 
 
 # ══════════════════════════════════════════════════════
@@ -433,20 +435,56 @@ _mcp_exit_stack: AsyncExitStack | None = None
 #   MemorySaver 就像一个"笔记本"，里面按 thread_id 分页记录每个用户的对话。
 #   如果每次重建 graph 都换一本新笔记本，之前写的内容全丢了。
 #   正确做法是始终用同一本笔记本，graph 重建只是换了"读笔记本的方式"，笔记本本身不变。
-_checkpointer = MemorySaver()   # ← 新增：进程级单例，永不重建
+_CHECKPOINT_DB = os.getenv(
+    "CHECKPOINT_DB",
+    str(Path(__file__).parent.parent / "checkpoints.db"),
+)
 
-# ★ STORE 改动2/5：_store 模块级单例（CLI 模式用 InMemoryStore）
+# ★ 修复根因：from_conn_string() 返回的是异步上下文管理器，不是实例本身。
+#   必须在 async 上下文里 __aenter__() 后才能得到真正可用的 saver/store。
+#   因此这里初始化为 None，由 _open_sqlite_backends() 在异步环境里完成赋值。
 #
-# 设计说明：
-#   - CLI 模式（__main__）：直接用这个 InMemoryStore，进程内持久，重启清空
-#   - webapp 模式（lifespan）：lifespan 会创建 AsyncSqliteStore 并覆盖 agent_module.graph，
-#     但 _store 这个变量本身不需要被覆盖，因为 graph 是 lifespan 重建的，
-#     store 作为参数传进去了，和 _store 变量解耦
-#
-# 命名空间设计建议：
-#   ("system",)      → 管理员预置的全局知识（所有用户、所有会话都能读到）
-#   ("user", uid)    → 跨 thread_id 的用户级持久信息（如 VIP 标签、偏好设置）
-_store = InMemoryStore()   # ← 新增：CLI 模式的 store 单例
+#   两种运行模式的调用时机：
+#     api.py 模式     → lifespan 最开头调 _open_sqlite_backends()，
+#                        MCP 初始化（_start_mcp_sessions_stdio）在其之后
+#     langgraph dev   → webapp.py lifespan 里先调 _open_sqlite_backends()，
+#                        再调 _start_mcp_sessions()，最后用 webapp 自己的
+#                        saver/store 重建 graph（两级 saver 互不干扰）
+#     __main__ CLI    → main() 开头调 _open_sqlite_backends()
+_checkpointer: AsyncSqliteSaver | None = None
+_store:        AsyncSqliteStore | None = None
+
+# 保存 context manager 引用，用于在 lifespan/main 结束时正确 __aexit__
+_checkpointer_cm = None
+_store_cm        = None
+
+
+async def _open_sqlite_backends() -> None:
+    """
+    在 async 上下文里打开 SQLite 连接，赋值给模块级 _checkpointer / _store。
+
+    调用约束：
+      - 必须在任何 _init_registry() / build_graph() 调用之前完成
+      - 幂等：重复调用直接跳过（已打开则不重新打开）
+      - webapp 模式下调用后，lifespan 会用自己的 saver 重建 graph，
+        这里的 _checkpointer 只作"过渡桥梁"，不影响最终运行时
+    """
+    global _checkpointer, _store, _checkpointer_cm, _store_cm
+    if _checkpointer is not None:
+        return  # 幂等：已初始化则跳过
+
+    # asyncio.to_thread 把同步 I/O 移到线程池，避免在 ASGI 事件循环里阻塞
+    # （langgraph dev 用 blockbuster 检测阻塞调用，直接调 os.mkdir 会被拦截）
+    _db_parent = Path(_CHECKPOINT_DB).parent
+    await asyncio.to_thread(lambda: _db_parent.mkdir(parents=True, exist_ok=True))
+
+    _checkpointer_cm = AsyncSqliteSaver.from_conn_string(_CHECKPOINT_DB)
+    _checkpointer    = await _checkpointer_cm.__aenter__()
+
+    _store_cm = AsyncSqliteStore.from_conn_string(_CHECKPOINT_DB)
+    _store    = await _store_cm.__aenter__()
+
+    print(f"✅ [SQLite] 持久化后端已就绪：{_CHECKPOINT_DB}")
 
 # ══════════════════════════════════════════════════════
 # 流式输出队列（阶段二：SSE 端点专用）
@@ -464,7 +502,7 @@ _store = InMemoryStore()   # ← 新增：CLI 模式的 store 单例
 # 线程安全：asyncio.Queue 是协程安全的（单线程事件循环内）。
 #           每次请求开始前设置，请求结束后清除，不会有并发冲突。
 #           （langgraph dev 默认单进程，一次处理一个请求）
-_stream_queue: asyncio.Queue | None = None
+_stream_queues: dict[str, asyncio.Queue] = {}   # thread_id → Queue，支持并发请求
 
 
 async def _ensure_registry() -> None:
@@ -692,7 +730,11 @@ def _init_registry(tools: list[StructuredTool]) -> None:
     #
     # webapp 模式下：
     #   lifespan 会在这一步之后用 AsyncSqliteStore 重建 graph，
-    #   所以这里传 _store（InMemoryStore）只是过渡状态，不影响最终运行。
+    #   所以这里传 _store 只是过渡状态，不影响最终运行。
+    #
+    # ★ None 兜底：模块 import 阶段（langgraph dev 扫描期）_checkpointer/_store
+    #   尚未打开，此时传 None 给 build_graph 完全合法（LangGraph 允许 None）。
+    #   api.py / webapp.py 的 lifespan 会在真正处理请求前重建带持久化的 graph。
     graph = build_graph(checkpointer=_checkpointer, store=_store)
 
 
@@ -762,34 +804,34 @@ def _get_message_content(msg: Any) -> str:
 # 供 CLI 交互模式（!memory 命令）和 webapp 端点调用。
 # 对 InMemoryStore 用同步 API，对 AsyncSqliteStore 在外层 async 里用 await。
 
-def store_put(key: str, value: Any, namespace: tuple = ("system",)) -> None:
-    """写入一条全局记忆。value 可以是任意 JSON-serializable 对象。"""
-    _store.put(namespace, key, value if isinstance(value, dict) else {"value": value})
+async def store_put(key: str, value: Any, namespace: tuple = ("system",)) -> None:
+    """写入一条全局记忆（async，适配 AsyncSqliteStore）。"""
+    await _store.aput(namespace, key, value if isinstance(value, dict) else {"value": value})
     print(f"  💾 [Store] 写入 {namespace}/{key} = {str(value)[:60]}")
 
 
-def store_get(key: str, namespace: tuple = ("system",)) -> Any | None:
-    """读取一条全局记忆。不存在时返回 None。"""
+async def store_get(key: str, namespace: tuple = ("system",)) -> Any | None:
+    """读取一条全局记忆（async）。不存在时返回 None。"""
     try:
-        item = _store.get(namespace, key)
+        item = await _store.aget(namespace, key)
         return item.value if item else None
     except Exception:
         return None
 
 
-def store_list(namespace: tuple = ("system",)) -> dict:
-    """列出命名空间下所有记忆，返回 {key: value} 字典。"""
+async def store_list(namespace: tuple = ("system",)) -> dict:
+    """列出命名空间下所有记忆（async），返回 {key: value} 字典。"""
     try:
-        results = _store.search(namespace)
+        results = await _store.asearch(namespace)
         return {r.key: r.value for r in results}
     except Exception:
         return {}
 
 
-def store_delete(key: str, namespace: tuple = ("system",)) -> bool:
-    """删除一条全局记忆。成功返回 True。"""
+async def store_delete(key: str, namespace: tuple = ("system",)) -> bool:
+    """删除一条全局记忆（async）。成功返回 True。"""
     try:
-        _store.delete(namespace, key)
+        await _store.adelete(namespace, key)
         print(f"  🗑️  [Store] 删除 {namespace}/{key}")
         return True
     except Exception as e:
@@ -1610,6 +1652,7 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
 # ══════════════════════════════════════════════════════
 
 async def final_answer_node(state: AgentState) -> AgentState:
+    print(f"  🔍 [final_answer] _thread_id={state.get('_thread_id')} queues={list(_stream_queues.keys())}")
     task_plan: list[Task] = state.get("task_plan", [])
 
     tool_tasks   = [t for t in task_plan if t.get("agent") != "direct"]
@@ -1695,7 +1738,10 @@ async def final_answer_node(state: AgentState) -> AgentState:
         last_human,
     ]
 
-    if _stream_queue is not None:
+    tid = state.get("_thread_id", "")
+    q = _stream_queues.get(tid) if tid else None
+
+    if q is not None:
         # ── 流式路径（SSE 模式）────────────────────────────────────────
         full_content = ""
         try:
@@ -1703,9 +1749,10 @@ async def final_answer_node(state: AgentState) -> AgentState:
                 token = chunk.content if hasattr(chunk, "content") else str(chunk)
                 if token:
                     full_content += token
-                    await _stream_queue.put(token)   # 推送 token 给 SSE 端点
+                    await q.put(token)               # 推送 token 给 SSE 端点
         finally:
-            await _stream_queue.put(None)            # 哨兵：通知流结束
+            await q.put(None)                        # 哨兵：通知流结束
+            _stream_queues.pop(tid, None)            # 用完清理，避免内存泄漏
         new_ai_msg = AIMessage(content=full_content)
     else:
         # ── 非流式路径（CLI 模式，行为不变）────────────────────────────
@@ -2103,10 +2150,12 @@ if __name__ == "__main__":
             # 第2轮：4条（Human + AI + Human + AI）
             # 以此类推...
             try:
-                saved_state = _checkpointer.get(config)
-                if saved_state:
-                    channel_values = saved_state.get("channel_values", {})
-                    msgs_in_cp = channel_values.get("messages", [])
+                saved_tuple = await _checkpointer.aget(config)
+                # aget() 返回 CheckpointTuple（不是 dict），需用属性访问
+                # CheckpointTuple.checkpoint → dict，含 channel_values 等
+                if saved_tuple is not None and saved_tuple.checkpoint:
+                    channel_values = saved_tuple.checkpoint.get("channel_values", {})
+                    msgs_in_cp    = channel_values.get("messages", [])
                     summary_in_cp = channel_values.get("conversation_summary", "")
                     summary_display = f"，摘要：{summary_in_cp[:40]}..." if summary_in_cp else "，摘要：（尚未生成）"
                     print(f"💾 [Checkpoint] thread '{thread_id}' 已存 {len(msgs_in_cp)} 条消息{summary_display}")
@@ -2121,7 +2170,7 @@ if __name__ == "__main__":
 
     async def _interactive() -> None:
         print("\n" + "═" * 60)
-        print("🤖  MCP Multi-Agent 并行 CLI 就绪（已启用 MemorySaver Checkpoint + InMemoryStore）")
+        print("🤖  MCP Multi-Agent 并行 CLI 就绪（已启用 AsyncSqliteSaver Checkpoint + AsyncSqliteStore）")
         print("    输入问题后回车执行，输入 'quit' / 'exit' / 'q' 退出")
         print("    输入 'batch' 快速跑完 QUESTIONS 列表")
         print("    输入 'new' 开始新会话（新 thread_id）")
@@ -2164,7 +2213,7 @@ if __name__ == "__main__":
                 cmd   = parts[1].lower() if len(parts) > 1 else "list"
 
                 if cmd == "list":
-                    items = store_list()
+                    items = await store_list()
                     if items:
                         print("🗄️  [Store] 当前全局记忆：")
                         for k, v in items.items():
@@ -2174,21 +2223,21 @@ if __name__ == "__main__":
 
                 elif cmd == "put" and len(parts) >= 4:
                     key, val = parts[2], parts[3]
-                    store_put(key, val)
+                    await store_put(key, val)
                     print(f"✅ 已写入：{key} = {val}")
 
                 elif cmd == "get" and len(parts) >= 3:
                     key = parts[2]
-                    val = store_get(key)
+                    val = await store_get(key)
                     print(f"📖 {key} = {json.dumps(val, ensure_ascii=False) if val else '（不存在）'}")
 
                 elif cmd == "del" and len(parts) >= 3:
-                    store_delete(parts[2])
+                    await store_delete(parts[2])
 
                 elif cmd == "clear":
-                    items = store_list()
+                    items = await store_list()
                     for k in list(items.keys()):
-                        store_delete(k)
+                        await store_delete(k)
                     print(f"🗑️  已清空 {len(items)} 条全局记忆")
 
                 else:
@@ -2212,6 +2261,8 @@ if __name__ == "__main__":
             await _run_question(q, thread_id=thread_id)
 
     async def main():
+        # ★ 持久化升级：先打开 SQLite 连接，再初始化 MCP sessions
+        await _open_sqlite_backends()
         await _start_mcp_sessions_stdio()
         try:
             if BATCH_MODE:
@@ -2220,6 +2271,15 @@ if __name__ == "__main__":
                 await _interactive()
         finally:
             await _stop_mcp_sessions()
+            # 关闭 SQLite 连接（通过 context manager 引用正确退出）
+            try:
+                if _store_cm is not None:
+                    await _store_cm.__aexit__(None, None, None)
+                if _checkpointer_cm is not None:
+                    await _checkpointer_cm.__aexit__(None, None, None)
+                print("✅ [SQLite] 连接已关闭")
+            except Exception:
+                pass
 
     asyncio.run(main())
     
