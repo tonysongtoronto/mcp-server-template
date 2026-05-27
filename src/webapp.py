@@ -377,22 +377,22 @@ async def chat_stream(request: Request) -> StreamingResponse:
     if not thread_id:
         thread_id = str(uuid.uuid4())
 
-    config = {"configurable": {"thread_id": thread_id}}
-
     # ── 创建流式队列，注入到 agent 模块 ──────────────────────────────────
     # ★ 修复1：用 request_id 作 key 存入 dict（_stream_queues），而非单一变量
-    #   final_answer_node 通过 state["_thread_id"] 查找对应 queue；
+    #   final_answer_node 通过 config["configurable"]["_stream_request_id"] 查找对应 queue；
     #   之前用 _stream_queue（单数）存，节点查 _stream_queues[key] 永远找不到，
     #   导致 queues=[] → 不写哨兵 → _generate() 永久阻塞。
     request_id = f"{thread_id}_{uuid.uuid4().hex[:8]}"
+
+    config = {"configurable": {"thread_id": thread_id, "_stream_request_id": request_id}}
     queue: asyncio.Queue = asyncio.Queue()
     agent_module._stream_queues[request_id] = queue
 
     async def _generate():
-        # ★ 修复2：ainvoke 传入 _thread_id，节点才能找到自己的 queue
+        # ★ 修复2：_stream_request_id 走 config["configurable"]，节点才能找到自己的 queue
         invoke_task = asyncio.create_task(
             agent_module.graph.ainvoke(
-                {"messages": [HumanMessage(content=message)], "_thread_id": request_id},
+                {"messages": [HumanMessage(content=message)]},
                 config=config,
             )
         )

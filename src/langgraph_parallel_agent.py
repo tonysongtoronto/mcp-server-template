@@ -122,6 +122,7 @@ from langgraph.graph.message import add_messages   # ← 新增
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 
@@ -401,7 +402,8 @@ class AgentState(TypedDict):
     #   防止每轮都重新生成摘要（摘要生成也消耗 token）。
     conversation_summary: str   # 对话摘要，初始为空字符串
     summary_turn_count: int     # 已摘要轮次，初始为 0
-    _thread_id: str             # SSE queue 路由用，存当前请求的 thread_id
+    # _thread_id 已移至 config["configurable"]["_stream_request_id"]
+    # 不再污染 state，LangSmith Input/Output 只显示 messages
 
 
 # ══════════════════════════════════════════════════════
@@ -1651,8 +1653,12 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
 # 11. final_answer_node（不变）
 # ══════════════════════════════════════════════════════
 
-async def final_answer_node(state: AgentState) -> AgentState:
-    print(f"  🔍 [final_answer] _thread_id={state.get('_thread_id')} queues={list(_stream_queues.keys())}")
+async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    # ★ 修复：从 config["configurable"] 读取 request_id，不再污染 state
+    #   旧：state.get("_thread_id") → 导致 LangSmith Input 显示 UUID 而非问题内容
+    #   新：config["configurable"].get("_stream_request_id") → state 干净，LangSmith 正常
+    tid = (config or {}).get("configurable", {}).get("_stream_request_id", "")
+    print(f"  🔍 [final_answer] _stream_request_id={tid} queues={list(_stream_queues.keys())}")
     task_plan: list[Task] = state.get("task_plan", [])
 
     tool_tasks   = [t for t in task_plan if t.get("agent") != "direct"]
@@ -1738,7 +1744,6 @@ async def final_answer_node(state: AgentState) -> AgentState:
         last_human,
     ]
 
-    tid = state.get("_thread_id", "")
     q = _stream_queues.get(tid) if tid else None
 
     if q is not None:
@@ -2284,3 +2289,4 @@ if __name__ == "__main__":
     asyncio.run(main())
     
       # uv run python src/langgraph_parallel_agent.py
+    #  uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1

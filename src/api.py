@@ -275,16 +275,21 @@ async def chat_stream(
         return StreamingResponse(_err(), media_type="text/event-stream")
 
     resolved_tid = _resolve_thread_id(thread_id)
-    config       = {"configurable": {"thread_id": resolved_tid}}
+    # ★ 修复1：request_id 在 config 之前生成，才能放进 configurable
+    request_id   = f"{resolved_tid}_{uuid.uuid4().hex[:8]}"  # 每次请求唯一，避免并发竞争
+    # ★ 修复2：_stream_request_id 走 configurable（侧信道），不污染 state
+    #   final_answer_node 从 config["configurable"]["_stream_request_id"] 读 queue key
+    #   state 只含 messages → LangSmith Input/Output 显示正常问题内容
+    config       = {"configurable": {"thread_id": resolved_tid, "_stream_request_id": request_id}}
 
     async def generate() -> AsyncGenerator[str, None]:
-        request_id = f"{resolved_tid}_{uuid.uuid4().hex[:8]}"  # 每次请求唯一，避免并发竞争
         q: asyncio.Queue = asyncio.Queue()
         agent_module._stream_queues[request_id] = q
 
         invoke_task = asyncio.create_task(
             agent_module.graph.ainvoke(
-                {"messages": [HumanMessage(content=question)], "_thread_id": request_id},
+                # ★ 修复3：state 只传 messages，去掉 _thread_id
+                {"messages": [HumanMessage(content=question)]},
                 config=config,
             )
         )
@@ -426,3 +431,5 @@ async def root() -> dict:
         "docs":          "/docs",
         "health":        "/health",
     }
+    
+    # uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1
