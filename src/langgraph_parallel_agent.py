@@ -439,7 +439,21 @@ _mcp_exit_stack: AsyncExitStack | None = None
 #   正确做法是始终用同一本笔记本，graph 重建只是换了"读笔记本的方式"，笔记本本身不变。
 _CHECKPOINT_DB = os.getenv(
     "CHECKPOINT_DB",
-    str(Path(__file__).parent.parent / "checkpoints.db"),
+    str(Path(__file__).parent.parent / "data" / "checkpoints.db"),
+)
+
+# ★ 统一修复：store 独立文件，不再和 checkpointer 混用同一个 SQLite。
+#
+# 旧做法：_store_cm = AsyncSqliteStore.from_conn_string(_CHECKPOINT_DB)
+#   → 对话历史和全局记忆混存在同一个文件，备份/清理/迁移不方便。
+#
+# 新做法：分两个文件，路径可通过环境变量覆盖。
+#   CLI / api.py 默认 → data/checkpoints.db + data/memory_store.db
+#   webapp.py 默认   → 同上（已删除 webapp lifespan 里的环境变量覆盖）
+#   三条路径路径完全一致，数据互通，切换运行方式不丢历史。
+_STORE_DB = os.getenv(
+    "STORE_DB",
+    str(Path(__file__).parent.parent / "data" / "memory_store.db"),
 )
 
 # ★ 修复根因：from_conn_string() 返回的是异步上下文管理器，不是实例本身。
@@ -468,8 +482,12 @@ async def _open_sqlite_backends() -> None:
     调用约束：
       - 必须在任何 _init_registry() / build_graph() 调用之前完成
       - 幂等：重复调用直接跳过（已打开则不重新打开）
-      - webapp 模式下调用后，lifespan 会用自己的 saver 重建 graph，
-        这里的 _checkpointer 只作"过渡桥梁"，不影响最终运行时
+      - webapp 模式下调用后，lifespan 会用自己的 saver/store 重建 graph，
+        这里的 _checkpointer/_store 只作"过渡桥梁"，不影响最终运行时
+
+    数据库文件（三条路径统一，默认均在 data/ 子目录）：
+      checkpointer → data/checkpoints.db  （对话历史）
+      store        → data/memory_store.db  （全局记忆，独立文件）
     """
     global _checkpointer, _store, _checkpointer_cm, _store_cm
     if _checkpointer is not None:
@@ -477,16 +495,16 @@ async def _open_sqlite_backends() -> None:
 
     # asyncio.to_thread 把同步 I/O 移到线程池，避免在 ASGI 事件循环里阻塞
     # （langgraph dev 用 blockbuster 检测阻塞调用，直接调 os.mkdir 会被拦截）
-    _db_parent = Path(_CHECKPOINT_DB).parent
-    await asyncio.to_thread(lambda: _db_parent.mkdir(parents=True, exist_ok=True))
+    for _p in [Path(_CHECKPOINT_DB).parent, Path(_STORE_DB).parent]:
+        await asyncio.to_thread(lambda p=_p: p.mkdir(parents=True, exist_ok=True))
 
     _checkpointer_cm = AsyncSqliteSaver.from_conn_string(_CHECKPOINT_DB)
     _checkpointer    = await _checkpointer_cm.__aenter__()
 
-    _store_cm = AsyncSqliteStore.from_conn_string(_CHECKPOINT_DB)
+    _store_cm = AsyncSqliteStore.from_conn_string(_STORE_DB)   # ← 独立文件
     _store    = await _store_cm.__aenter__()
 
-    print(f"✅ [SQLite] 持久化后端已就绪：{_CHECKPOINT_DB}")
+    print(f"✅ [SQLite] 持久化后端已就绪：checkpoint={_CHECKPOINT_DB}  store={_STORE_DB}")
 
 # ══════════════════════════════════════════════════════
 # 流式输出队列（阶段二：SSE 端点专用）
@@ -1988,10 +2006,10 @@ if __name__ == "__main__":
         #
         # 失败信号：description 出现"刚才的结果"而不是具体数值 → 修复X失效
         # ══════════════════════════════════════════════════════════════════
-        # "计算 42 × 42",                                      # 轮6  → math_agent，结果 1764
-        # "刚才的结果减去 100",                                 # 轮7  → math_agent，subtract(1764,100)=1664
-        # "再把上面的结果除以 4",                               # 轮8  → math_agent，division(1664,4)=416
-        # "计算 sin(30°) 和 cos(60°)，各是多少？",             # 轮9  → math_agent × 2 或 1（取决于拆分）
+        "计算 42 × 42",                                      # 轮6  → math_agent，结果 1764
+        "刚才的结果减去 100",                                 # 轮7  → math_agent，subtract(1764,100)=1664
+        "再把上面的结果除以 4",                               # 轮8  → math_agent，division(1664,4)=416
+        "计算 sin(30°) 和 cos(60°)，各是多少？",             # 轮9  → math_agent × 2 或 1（取决于拆分）
 
         # ══════════════════════════════════════════════════════════════════
         # 【组3】纯 DB 查询（5 题）
@@ -2001,11 +2019,11 @@ if __name__ == "__main__":
         # 预期：每题 1 个 db_agent，Planner 不拆成多个 DB 子任务
         # 失败信号：db_agent 调用 ask_db（被明确禁止）而不是 query_db
         # ══════════════════════════════════════════════════════════════════
-        # "查询所有来自 Vancouver 的活跃用户，显示姓名和邮箱",  # 轮10 → db_agent，WHERE city+status
-        # "统计每个城市的用户数量，按数量从高到低排列",          # 轮11 → db_agent，GROUP BY + ORDER BY
-        # "找出消费总额前 3 名的用户姓名和消费金额",             # 轮12 → db_agent，JOIN + SUM + LIMIT
-        # "查询库存数量为 0 的商品名称和分类",                   # 轮13 → db_agent，JOIN products+categories，WHERE stock=0
-        # "查询平均评分低于 3 分且评价数超过 1 条的商品",        # 轮14 → db_agent，HAVING
+        "查询所有来自 Vancouver 的活跃用户，显示姓名和邮箱",  # 轮10 → db_agent，WHERE city+status
+        "统计每个城市的用户数量，按数量从高到低排列",          # 轮11 → db_agent，GROUP BY + ORDER BY
+        "找出消费总额前 3 名的用户姓名和消费金额",             # 轮12 → db_agent，JOIN + SUM + LIMIT
+        "查询库存数量为 0 的商品名称和分类",                   # 轮13 → db_agent，JOIN products+categories，WHERE stock=0
+        "查询平均评分低于 3 分且评价数超过 1 条的商品",        # 轮14 → db_agent，HAVING
 
         # ══════════════════════════════════════════════════════════════════
         # 【组4】纯文件操作（3 题）
@@ -2013,12 +2031,12 @@ if __name__ == "__main__":
         # 预期：每题 1 个 file_agent
         # 注意：write 之后 read，验证内容确实写入
         # ══════════════════════════════════════════════════════════════════
-        # (                                                      # 轮15 → file_agent
-        #     "在 File_Agent/demo/ 目录下创建文件 test_note.txt，"
-        #     "内容为：今天是测试日，Hello World！"
-        # ),
-        # "读取刚才创建的 File_Agent/demo/test_note.txt 文件，告诉我内容",  # 轮16 → file_agent，应读到上面写的内容
-        # "列出 File_Agent/demo/ 目录下所有文件，显示文件名",    # 轮17 → file_agent，list_directory
+        (                                                      # 轮15 → file_agent
+            "在 File_Agent/demo/ 目录下创建文件 test_note.txt，"
+            "内容为：今天是测试日，Hello World！"
+        ),
+        "读取刚才创建的 File_Agent/demo/test_note.txt 文件，告诉我内容",  # 轮16 → file_agent，应读到上面写的内容
+        "列出 File_Agent/demo/ 目录下所有文件，显示文件名",    # 轮17 → file_agent，list_directory
 
         # ══════════════════════════════════════════════════════════════════
         # 【组5】HTTP 请求（1 题）
@@ -2026,7 +2044,7 @@ if __name__ == "__main__":
         # 使用 api.github.com/zen，这个接口稳定、无需 token、返回一句英文格言
         # 预期：1 个 http_agent，调用 fetch_url
         # ══════════════════════════════════════════════════════════════════
-        # "访问 https://api.github.com/zen，返回的是什么内容？",  # 轮18 → http_agent
+        "访问 https://api.github.com/zen，返回的是什么内容？",  # 轮18 → http_agent
 
         # ══════════════════════════════════════════════════════════════════
         # 【组6】串行依赖链（DB → Math → File）（1 题）
@@ -2040,12 +2058,12 @@ if __name__ == "__main__":
         #   - 层0→层1：math_agent 的 description 里应有具体数字（不是"查询结果"）
         #   - 层1→层2：file_agent 写入的是计算后的数值
         # ══════════════════════════════════════════════════════════════════
-        # (                                                      # 轮19 → 3层串行
-        #     "请依次完成三步："
-        #     "① 查询 Montreal 的活跃用户总数；"
-        #     "② 把这个数字乘以 500；"
-        #     "③ 把最终结果写入 File_Agent/demo/montreal_report.txt"
-        # ),
+        (                                                      # 轮19 → 3层串行
+            "请依次完成三步："
+            "① 查询 Montreal 的活跃用户总数；"
+            "② 把这个数字乘以 500；"
+            "③ 把最终结果写入 File_Agent/demo/montreal_report.txt"
+        ),
 
         # ══════════════════════════════════════════════════════════════════
         # 【组7】复杂拓扑：并行 + 扇出 + 扇入（2 题）
@@ -2064,17 +2082,17 @@ if __name__ == "__main__":
         #          任务2 math_agent：用户数 × 1000，depends_on=[0]
         #   验证：层1 两个 math_agent 真并行
         # ══════════════════════════════════════════════════════════════════
-        # (                                                      # 轮20 → 扇入，层0并行×2 + 层1×1
-        #     "同时帮我查两件事，然后合并写文件：\n"
-        #     "① 查询数据库中年龄最小的用户姓名和年龄；\n"
-        #     "② 查询价格最高的商品名称和价格；\n"
-        #     "③ 把两个结果合并写入 File_Agent/demo/extremes.txt，"
-        #     "格式：'最年轻用户：XXX(N岁)，最贵商品：YYY(¥ZZZ)'"
-        # ),
-        # (                                                      # 轮21 → 扇出，层0×1 + 层1并行×2
-        #     "先查询来自 Calgary 的活跃用户数量，"
-        #     "然后同时计算：① 这个数字的平方；② 这个数字乘以 1000"
-        # ),
+        (                                                      # 轮20 → 扇入，层0并行×2 + 层1×1
+            "同时帮我查两件事，然后合并写文件：\n"
+            "① 查询数据库中年龄最小的用户姓名和年龄；\n"
+            "② 查询价格最高的商品名称和价格；\n"
+            "③ 把两个结果合并写入 File_Agent/demo/extremes.txt，"
+            "格式：'最年轻用户：XXX(N岁)，最贵商品：YYY(¥ZZZ)'"
+        ),
+        (                                                      # 轮21 → 扇出，层0×1 + 层1并行×2
+            "先查询来自 Calgary 的活跃用户数量，"
+            "然后同时计算：① 这个数字的平方；② 这个数字乘以 1000"
+        ),
 
         # ══════════════════════════════════════════════════════════════════
         # 【组8】长对话记忆压力测试（3 题）
@@ -2093,14 +2111,14 @@ if __name__ == "__main__":
         # 题目3：全面身份回忆（4 项，压力最大）
         #   预期：direct × 1，答出组1所有字段
         # ══════════════════════════════════════════════════════════════════
-        # "我叫什么名字？我住在哪个城市？",                     # 轮22 → direct，应答 Lily / 温哥华
-        # (                                                      # 轮23 → math_agent + direct
-        #     "我的职业是什么？另外帮我计算一下：我的年龄（30岁）乘以 12 等于多少？"
-        # ),
-        # (                                                      # 轮24 → direct × 1，4 项全回忆
-        #     "现在综合告诉我：① 我叫什么名字？"
-        #     "② 我住在哪里？③ 我的职业是什么？④ 我在学什么技能？"
-        # ),
+        "我叫什么名字？我住在哪个城市？",                     # 轮22 → direct，应答 Lily / 温哥华
+        (                                                      # 轮23 → math_agent + direct
+            "我的职业是什么？另外帮我计算一下：我的年龄（30岁）乘以 12 等于多少？"
+        ),
+        (                                                      # 轮24 → direct × 1，4 项全回忆
+            "现在综合告诉我：① 我叫什么名字？"
+            "② 我住在哪里？③ 我的职业是什么？④ 我在学什么技能？"
+        ),
     ]
 
     # ★ 修复Z（核心 Checkpoint 修复）：invoke 时只传当前轮的新消息
@@ -2156,8 +2174,9 @@ if __name__ == "__main__":
             # 以此类推...
             try:
                 saved_tuple = await _checkpointer.aget_tuple(config)
-                # aget() 返回 CheckpointTuple（不是 dict），需用属性访问
+                # aget_tuple() 返回 CheckpointTuple | None，需用属性访问
                 # CheckpointTuple.checkpoint → dict，含 channel_values 等
+                # （注意：aget() 直接返回 dict，不是 CheckpointTuple，不能用属性访问）
                 if saved_tuple is not None and saved_tuple.checkpoint:
                     channel_values = saved_tuple.checkpoint.get("channel_values", {})
                     msgs_in_cp    = channel_values.get("messages", [])

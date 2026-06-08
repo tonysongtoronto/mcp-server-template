@@ -180,14 +180,14 @@ async def _get_checkpoint_message_count(config: dict) -> int:
     """
     读取 checkpoint 里已保存的消息条数。
 
-    AsyncSqliteSaver.aget() 返回 CheckpointTuple（不是 dict），结构：
-      CheckpointTuple.checkpoint  → dict，含 channel_values / channel_versions 等
-      CheckpointTuple.metadata    → dict，含 step / source 等
-    必须用 .checkpoint["channel_values"] 而非 .get("channel_values")。
+    必须用 aget_tuple()，不能用 aget()：
+      aget_tuple() → CheckpointTuple | None，有 .checkpoint 属性
+      aget()       → Checkpoint(dict) | None，直接是 dict，没有 .checkpoint 属性
+                     在 dict 上访问 .checkpoint 会抛 AttributeError
     """
     try:
-        saved = await agent_module._checkpointer.aget(config)
-        # saved 是 CheckpointTuple | None
+        saved = await agent_module._checkpointer.aget_tuple(config)
+        # saved 是 CheckpointTuple | None，用属性访问 .checkpoint
         if saved is not None and saved.checkpoint:
             msgs = saved.checkpoint.get("channel_values", {}).get("messages", [])
             return len(msgs)

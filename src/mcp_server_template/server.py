@@ -175,3 +175,8 @@ if __name__ == "__main__":
         #   langgraph_stdio_agent.py 的 __main__ 直接用 stdio_client spawn 本进程
         print("🚀 stdio 模式启动（后端测试 / MCP 客户端）", file=sys.stderr)
         mcp.run(transport="stdio")
+        
+        
+# npx @modelcontextprotocol/inspector uv run python src/mcp_server_template/server.py --dev
+
+# npx @modelcontextprotocol/inspector uv run python src/mcp_server_template/server.py 

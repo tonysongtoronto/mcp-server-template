@@ -215,25 +215,21 @@ async def lifespan(app: FastAPI):
             app.state.store = store
             print("  ✅ [MemoryStore] AsyncSqliteStore 就绪", file=sys.stderr)
 
-            # ── ★ 修复关键：先打开 agent_module 的 SQLite 后端 ──────────────
+            # ── ★ 打开 agent_module 的 SQLite 后端（过渡桥梁） ──────────────
             #
-            # 为什么必须在 _start_mcp_sessions() 之前？
-            #   _start_mcp_sessions() → _init_registry() → build_graph(_checkpointer)
-            #   如果 _checkpointer 还是 None，build_graph 拿到 None，
+            # 调用时机：必须在 _start_mcp_sessions() 之前。
+            #   _start_mcp_sessions() → _init_registry() → build_graph(_checkpointer, _store)
+            #   如果此时 _checkpointer/_store 还是 None，build_graph 拿到 None，
             #   LangGraph 会用无持久化模式编译（可以接受，不崩）。
-            #   如果 _checkpointer 是未打开的上下文管理器，LangGraph 就会抛 TypeError。
             #
-            # webapp 模式下 agent_module 的 _checkpointer 只作"过渡"：
-            #   _start_mcp_sessions 完成后（第6步），lifespan 立即用 webapp 自己的
-            #   saver/store 重建 graph，覆盖掉过渡版本，确保最终运行时用的是
-            #   webapp 管理的 AsyncSqliteSaver（生命周期由 async with 控制）。
+            # 路径已在 langgraph_parallel_agent.py 里统一：
+            #   checkpointer → data/checkpoints.db
+            #   store        → data/memory_store.db
+            # 三条路径（CLI / api.py / webapp.py）默认值完全一致，无需再设环境变量。
             #
-            # 两个 SQLite 连接（agent_module 的 + webapp 自己的）指向不同文件，互不干扰：
-            #   agent_module: checkpoints.db（项目根目录，CLI 复用同一份数据）
-            #   webapp:       data/checkpoints.db + data/memory_store.db
-            os.environ["CHECKPOINT_DB"] = str(
-                Path(__file__).parent.parent / "data" / "checkpoints.db"
-            )
+            # webapp 模式下这两个连接只是"过渡"：
+            #   _start_mcp_sessions 完成后，lifespan 立即用 webapp 自己的
+            #   saver/store 重建 graph（第③次赋值），覆盖过渡版本。
             await agent_module._open_sqlite_backends()
             print("  ✅ [agent_module] SQLite 后端已就绪", file=sys.stderr)
 

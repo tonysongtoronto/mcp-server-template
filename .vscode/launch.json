@@ -141,6 +141,13 @@
             "request": "launch",
             "command": "docker stop mcp-server-container; docker rm mcp-server-container; docker build -t mcp-server .; docker run -d -p 8000:8000 --name mcp-server-container --env-file .env mcp-server; docker logs -f mcp-server-container",
             "cwd": "${workspaceFolder}"
+        },
+        {
+        "name": "Attach MCP Server",
+        "type": "debugpy",
+        "request": "attach",
+        "connect": { "host": "localhost", "port": 5678 },
+        "justMyCode": true
         }
 
     ],
