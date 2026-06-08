@@ -530,3 +530,22 @@ async def memory_delete(request: Request, key: str, namespace: str = "system") -
         return JSONResponse({"ok": True, "namespace": list(ns), "key": key})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # npx @modelcontextprotocol/inspector npx -y @modelcontextprotocol/server-filesystem "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/File_Agent"
+    
+    # C:\Users\tonysong\Desktop\AI_Python\mcp-server-template\File_Agent\memory.txt
+    
+    # npx -y supergateway --port 8002 --stdio 'npx -y @modelcontextprotocol/server-filesystem "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/File_Agent"'
+    
+    # npx @modelcontextprotocol/inspector
+    
+    # http://localhost:8002/sse
+    
+    # npx -y supergateway --port 8004 --stdio 'node "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/src/math-mcp/build/index.js"'
+    # npx @modelcontextprotocol/inspector
+    
+    # http://localhost:8004/sse
+    
+    # --stdio 
+    
+    # npx @modelcontextprotocol/inspector node "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/src/math-mcp/build/index.js"

@@ -237,11 +237,13 @@ if __name__ == "__main__":
         # npx @modelcontextprotocol/inspector uv run python src/mcp_db_server/server.py 
         
         # uv run python -m debugpy --listen 5678 --wait-for-client src/mcp_db_server/server.py --sse
-                
-        #         操作流程（STDIO 模式）
+        
+        # F5      "name": "Attach MCP Server",
+        
+        
         # 第一步：server.py 里设好断点
         # 第二步：启动 Inspector
-        # bashnpx @modelcontextprotocol/inspector
+        # bash  npx @modelcontextprotocol/inspector
         # 第三步：Inspector UI 里填
 
         # Transport Type → STDIO
