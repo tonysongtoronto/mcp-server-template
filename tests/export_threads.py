@@ -25,7 +25,7 @@ PROJECT_NAME = PROJECT_NAMES.get(CURRENT_ENV, PROJECT_NAMES["qa"])
 # （从 LangSmith Studio -> Threads 视图顶部复制）
 THREAD_IDS = [
     # "aa5d5ea2-c120-40f3-9d53-fc5faef3b81a",
-    "019eb15e-28f5-7e43-95d2-546f8e99c6a3",
+    "019eb31c-fcfe-7193-9507-18695eb878e8",
     # "019e0161-1a89-73b3-b332-44923aecc199",
     # 继续添加更多 Thread ID...
 ]

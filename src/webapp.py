@@ -253,15 +253,31 @@ async def lifespan(app: FastAPI):
                       file=sys.stderr)
 
             # ── 2. 启动 mcp-proxy（Streamable HTTP @ 8002：filesystem）──────────────────
+            # ★ 超时修复：npx 首次运行需要从 npm 下载包，网络慢时耗时长。
+            # pre-warm：先让 npx 把包下载到本地缓存，再启动 mcp-proxy 时就走缓存秒起。
+            print("  ⏳ [mcp-proxy(fs)] 预热 npm 包（首次约 30-60s）...", file=sys.stderr)
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["npx", "--yes", "@modelcontextprotocol/server-filesystem", "--help"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=90,
+                )
+            except Exception:
+                pass  # pre-warm 失败不阻断，继续尝试启动
+
             fs_proc = await _launch_subprocess(
                 tag="mcp-proxy(fs)",
                 cmd=["mcp-proxy", "--port", str(_FS_PROXY_PORT), "--",
-                     "npx", "-y", "@modelcontextprotocol/server-filesystem", str(_FS_BASE_DIR)],
+                     "npx", "--yes", "@modelcontextprotocol/server-filesystem", str(_FS_BASE_DIR)],
                 port=_FS_PROXY_PORT,
             )
             if fs_proc:
                 _subprocesses.append(fs_proc)
-                ok = await _wait_for_http(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse")
+                # timeout 提高到 90s，覆盖网络慢的场景
+                ok = await _wait_for_http(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse",
+                                          timeout=90.0)
                 print(f"  {'✅' if ok else '❌'} [mcp-proxy(fs)] SSE {'就绪' if ok else '超时'}",
                       file=sys.stderr)
 

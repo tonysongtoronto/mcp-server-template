@@ -79,6 +79,7 @@ async def post_json(url: str, payload: dict) -> str:
 def dataframe_summary(records_json: str) -> str:
     """
     对一组 JSON 记录做统计摘要（行数、列名、数值列的 describe）。
+    ★ 数据直接从用户消息中提取，不需要访问任何 URL 或文件！
     参数:
         records_json - JSON 字符串，格式为 list[dict]，
                        例如 '[{"name":"Alice","score":90},{"name":"Bob","score":75}]'
