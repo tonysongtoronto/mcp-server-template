@@ -157,17 +157,23 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-    # ★ --sse 模式：给 langgraph dev（通过 webapp.py lifespan）调用
+    # ★ --sse / --dev 模式：给 langgraph dev（通过 webapp.py lifespan）调用
     if "--sse" in sys.argv or "--dev" in sys.argv:
         port = int(os.environ.get("PORT", "8001"))
-        print(f"🚀 SSE 模式启动，监听 http://0.0.0.0:{port}", file=sys.stderr)
-        # FastMCP.run() 不支持 port 参数，通过 settings 注入端口
-        try:
-            mcp.settings.port = port
-            mcp.settings.host = "0.0.0.0"
-        except Exception:
-            pass
-        mcp.run(transport="sse")
+        print(f"🚀 Streamable HTTP 模式启动，监听 http://0.0.0.0:{port}", file=sys.stderr)
+        print(f"🚀 Endpoint: http://localhost:{port}/mcp", file=sys.stderr)
+
+        from starlette.middleware.cors import CORSMiddleware
+        import uvicorn
+
+        app = mcp.streamable_http_app()
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        uvicorn.run(app, host="0.0.0.0", port=port)
 
     else:
         # ★ 默认 stdio 模式：给后端测试（__main__）和 Claude Desktop 等 MCP 客户端用

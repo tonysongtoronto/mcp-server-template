@@ -5,10 +5,10 @@
 #   "http": { "app": "./src/webapp.py:app" }
 #
 # ★ 子进程清单（lifespan 负责拉起 + 关闭）：
-#   1. mcp_server_template/server.py  → SSE @ 8001  data / http 工具
-#   2. mcp-proxy (filesystem)         → SSE @ 8002  文件系统工具
-#   3. mcp_db_server/server.py        → SSE @ 8003  数据库工具
-#   4. mcp-proxy (math-mcp)           → SSE @ 8004  数学工具
+#   1. mcp_server_template/server.py  → Streamable HTTP @ 8001  data / http 工具
+#   2. mcp-proxy (filesystem)         → SSE              @ 8002  文件系统工具
+#   3. mcp_db_server/server.py        → Streamable HTTP  @ 8003  数据库工具
+#   4. mcp-proxy (math-mcp)           → SSE              @ 8004  数学工具
 #
 # ★ 阶段二新增：
 #   - AsyncSqliteSaver 替换 MemorySaver，对话历史持久化到 SQLite
@@ -79,14 +79,15 @@ async def _kill_port(port: int) -> None:
     await asyncio.sleep(0.8)
 
 
-async def _wait_for_sse(url: str, timeout: float = 30.0, interval: float = 1.0) -> bool:
+async def _wait_for_http(url: str, timeout: float = 40.0, interval: float = 1.0) -> bool:
+    """等待 HTTP 端点可用（GET 或 POST 均接受，适用于 Streamable HTTP /mcp）"""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
-                async with client.stream("GET", url) as resp:
-                    if resp.status_code in (200, 405):
-                        return True
+                resp = await client.get(url)
+                if resp.status_code in (200, 405, 406):
+                    return True
         except Exception:
             pass
         await asyncio.sleep(interval)
@@ -233,7 +234,7 @@ async def lifespan(app: FastAPI):
             await agent_module._open_sqlite_backends()
             print("  ✅ [agent_module] SQLite 后端已就绪", file=sys.stderr)
 
-            # ── 1. 启动 server.py（SSE @ 8001）──────────────────────────────
+            # ── 1. 启动 server.py（Streamable HTTP @ 8001）──────────────────────────────
             server_proc = await _launch_subprocess(
                 tag="server.py",
                 cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
@@ -247,11 +248,11 @@ async def lifespan(app: FastAPI):
             )
             if server_proc:
                 _subprocesses.append(server_proc)
-                ok = await _wait_for_sse(f"http://127.0.0.1:{_SERVER_PORT}/sse")
-                print(f"  {'✅' if ok else '❌'} [server.py] SSE {'就绪' if ok else '超时'}",
+                ok = await _wait_for_http(f"http://127.0.0.1:{_SERVER_PORT}/mcp")
+                print(f"  {'✅' if ok else '❌'} [server.py] HTTP {'就绪' if ok else '超时'}",
                       file=sys.stderr)
 
-            # ── 2. 启动 mcp-proxy（SSE @ 8002：filesystem）──────────────────
+            # ── 2. 启动 mcp-proxy（Streamable HTTP @ 8002：filesystem）──────────────────
             fs_proc = await _launch_subprocess(
                 tag="mcp-proxy(fs)",
                 cmd=["mcp-proxy", "--port", str(_FS_PROXY_PORT), "--",
@@ -260,11 +261,11 @@ async def lifespan(app: FastAPI):
             )
             if fs_proc:
                 _subprocesses.append(fs_proc)
-                ok = await _wait_for_sse(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse")
+                ok = await _wait_for_http(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse")
                 print(f"  {'✅' if ok else '❌'} [mcp-proxy(fs)] SSE {'就绪' if ok else '超时'}",
                       file=sys.stderr)
 
-            # ── 3. 启动 db_server.py（SSE @ 8003）───────────────────────────
+            # ── 3. 启动 db_server.py（Streamable HTTP @ 8003）───────────────────────────
             db_proc = await _launch_subprocess(
                 tag="db_server.py",
                 cmd=[sys.executable, "-u", str(_DB_SERVER_PY), "--sse"],
@@ -277,11 +278,11 @@ async def lifespan(app: FastAPI):
             )
             if db_proc:
                 _subprocesses.append(db_proc)
-                ok = await _wait_for_sse(f"http://127.0.0.1:{_DB_SERVER_PORT}/sse")
-                print(f"  {'✅' if ok else '❌'} [db_server.py] SSE {'就绪' if ok else '超时'}",
+                ok = await _wait_for_http(f"http://127.0.0.1:{_DB_SERVER_PORT}/mcp")
+                print(f"  {'✅' if ok else '❌'} [db_server.py] HTTP {'就绪' if ok else '超时'}",
                       file=sys.stderr)
 
-            # ── 4. 启动 mcp-proxy（SSE @ 8004：math-mcp）────────────────────
+            # ── 4. 启动 mcp-proxy（Streamable HTTP @ 8004：math-mcp）────────────────────
             math_proc = await _launch_subprocess(
                 tag="mcp-proxy(math)",
                 cmd=["mcp-proxy", "--port", str(_MATH_PROXY_PORT), "--",
@@ -290,7 +291,7 @@ async def lifespan(app: FastAPI):
             )
             if math_proc:
                 _subprocesses.append(math_proc)
-                ok = await _wait_for_sse(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse")
+                ok = await _wait_for_http(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse")
                 print(f"  {'✅' if ok else '❌'} [mcp-proxy(math)] SSE {'就绪' if ok else '超时'}",
                       file=sys.stderr)
 

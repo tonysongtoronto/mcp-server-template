@@ -148,6 +148,7 @@ from langgraph.store.sqlite.aio import AsyncSqliteStore   # ← 持久化升级
 
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.client.sse import sse_client
 from mcp import StdioServerParameters
 from pathlib import Path
@@ -184,9 +185,11 @@ _FS_PROXY_PORT   = int(os.getenv("MCP_FS_PROXY_PORT",   "8002"))
 _DB_SERVER_PORT  = int(os.getenv("MCP_DB_SERVER_PORT",  "8003"))
 _MATH_PROXY_PORT = int(os.getenv("MCP_MATH_PROXY_PORT", "8004"))
 
-_SERVER_SSE_URL     = f"http://127.0.0.1:{_SERVER_PORT}/sse"
+# 8001/8003: 直接 Python server → Streamable HTTP /mcp
+_SERVER_MCP_URL    = f"http://127.0.0.1:{_SERVER_PORT}/mcp"
+_DB_SERVER_MCP_URL = f"http://127.0.0.1:{_DB_SERVER_PORT}/mcp"
+# 8002/8004: mcp-proxy 暴露固定 SSE，无法改为 Streamable HTTP
 _FS_PROXY_SSE_URL   = f"http://127.0.0.1:{_FS_PROXY_PORT}/sse"
-_DB_SERVER_SSE_URL  = f"http://127.0.0.1:{_DB_SERVER_PORT}/sse"
 _MATH_PROXY_SSE_URL = f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse"
 
 
@@ -554,21 +557,26 @@ async def _start_mcp_sessions() -> None:
     stack = AsyncExitStack()
     all_tools: list[StructuredTool] = []
 
-    for tag, url in [
-        ("server.py",     _SERVER_SSE_URL),
-        ("filesystem",    _FS_PROXY_SSE_URL),
-        ("db_server",     _DB_SERVER_SSE_URL),
-        ("math-mcp",      _MATH_PROXY_SSE_URL),
+    for tag, url, transport in [
+        ("server.py",  _SERVER_MCP_URL,    "streamable_http"),
+        ("filesystem", _FS_PROXY_SSE_URL,  "sse"),
+        ("db_server",  _DB_SERVER_MCP_URL, "streamable_http"),
+        ("math-mcp",   _MATH_PROXY_SSE_URL, "sse"),
     ]:
         try:
-            r, w = await stack.enter_async_context(sse_client(url))
+            client_ctx = (
+                streamable_http_client(url) if transport == "streamable_http"
+                else sse_client(url)
+            )
+            conn = await stack.enter_async_context(client_ctx)
+            r, w = conn[0], conn[1]   # streamable_http returns (r, w, get_session_id); sse returns (r, w)
             s    = await stack.enter_async_context(ClientSession(r, w))
             await s.initialize()
             tools = await load_tools(s)
             print(f"✅ [MCP] {tag} 工具：{[t.name for t in tools]}")
             all_tools.extend(tools)
         except Exception as exc:
-            print(f"❌ [MCP] {tag} SSE 连接失败（{url}）：{exc}", file=sys.stderr)
+            print(f"❌ [MCP] {tag} Streamable HTTP 连接失败（{url}）：{exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
     if not all_tools:
@@ -1340,19 +1348,28 @@ async def _spawn_session_for(
     """为单个任务独立 spawn 一个 MCP session。"""
     if agent_name in ("math_agent",):
         stdio_params = math_mcp_params
-        sse_url      = _MATH_PROXY_SSE_URL
+        http_url     = _MATH_PROXY_SSE_URL
+        use_streamable = False
     elif agent_name in ("file_agent",):
         stdio_params = filesystem_mcp_params
-        sse_url      = _FS_PROXY_SSE_URL
+        http_url     = _FS_PROXY_SSE_URL
+        use_streamable = False
     elif agent_name in ("db_agent",):
         stdio_params = db_mcp_params
-        sse_url      = _DB_SERVER_SSE_URL
+        http_url     = _DB_SERVER_MCP_URL
+        use_streamable = True
     else:
         stdio_params = mcp_params
-        sse_url      = _SERVER_SSE_URL
+        http_url     = _SERVER_MCP_URL
+        use_streamable = True
 
     if use_sse:
-        r, w = await stack.enter_async_context(sse_client(sse_url))
+        client_ctx = (
+            streamable_http_client(http_url) if use_streamable
+            else sse_client(http_url)
+        )
+        conn = await stack.enter_async_context(client_ctx)
+        r, w = conn[0], conn[1]   # streamable_http returns (r, w, get_session_id); sse returns (r, w)
     else:
         r, w = await stack.enter_async_context(stdio_client(stdio_params()))
 

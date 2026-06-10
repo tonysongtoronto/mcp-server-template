@@ -213,13 +213,13 @@ if __name__ == "__main__":
 
     if "--sse" in sys.argv or "--dev" in sys.argv:
         port = int(os.environ.get("PORT", "8003"))
-        _log(f"SSE mode, listening on http://0.0.0.0:{port}")
-        _log(f"SSE endpoint: http://localhost:{port}/sse")
+        _log(f"Streamable HTTP mode, listening on http://0.0.0.0:{port}")
+        _log(f"Streamable HTTP endpoint: http://localhost:{port}/mcp")
 
         from starlette.middleware.cors import CORSMiddleware
         import uvicorn
 
-        app = mcp.sse_app()
+        app = mcp.streamable_http_app()
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
