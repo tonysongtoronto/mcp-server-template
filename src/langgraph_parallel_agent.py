@@ -1098,7 +1098,7 @@ depends_on 必须与 inputs 中所有 from_task 的值完全一致。
 """
 
 
-async def planner_node(state: AgentState, *, store=None) -> AgentState:
+async def planner_node(state: AgentState, *, store=None, config: RunnableConfig = None) -> AgentState:
     # ★ STORE 改动5/5：planner_node 新增 store=None 参数
     #
     # LangGraph 的 store 注入机制：
@@ -1194,11 +1194,15 @@ async def planner_node(state: AgentState, *, store=None) -> AgentState:
                 system_results = await store.asearch(("system",))
             else:
                 system_results = store.search(("system",))
-
-            # 读取当前用户的跨会话记忆（("user", thread_id) 命名空间）
-            thread_id = ""
-            # thread_id 在 config 里，这里从 state 无法直接取到，用空串兜底
-            user_results = []
+    
+            thread_id = (config or {}).get("configurable", {}).get("thread_id", "")
+            if thread_id :
+                 if hasattr(store, "asearch"):
+                    user_results = await store.asearch(("user", thread_id))
+                 else:
+                    user_results = store.search(("user", thread_id))
+            else:
+                 user_results = []
 
             all_items: dict = {}
             for r in (system_results or []):
@@ -1284,41 +1288,98 @@ async def planner_node(state: AgentState, *, store=None) -> AgentState:
                       "\n    ".join(fmt_errors))
                 raise ValueError(retry_feedback)
 
-            # ★ 数据注入：从用户消息里提取 JSON 数组，注入到 data_agent 任务的描述里
-            # 问题根因：Planner 生成的 description 只有文字（"对销售数据做统计摘要"），
-            # 没有携带原始 JSON。data_agent 执行时 HumanMessage = description，
-            # 根本找不到 JSON 数组，即使 system prompt 说"数据在消息里"也没用。
-            # 解法：在 planner_node 里把原始 JSON 直接拼进 _resolved_description，
-            # 这样 data_agent 执行时就能在 intent 里直接看到数据。
-            import re as _re
-            _json_array_match = _re.search(
-                r'(\[[\s\S]*?\])',   # 匹配第一个 JSON 数组
-                user_msg,
-                _re.DOTALL,
-            )
-            _extracted_json: str = ""
-            if _json_array_match:
-                _candidate = _json_array_match.group(1).strip()
-                try:
-                    import json as _j
-                    _parsed = _j.loads(_candidate)
-                    if isinstance(_parsed, list) and len(_parsed) > 0:
-                        _extracted_json = _candidate
-                        print(f"  📦 [Planner] 从用户消息提取到 JSON 数组，"
-                              f"共 {len(_parsed)} 条记录")
-                except Exception:
-                    pass
+            # ★ JSON数据注入：精准版
+            # 规则：
+            #   1. 从当前消息提取所有JSON数组
+            #   2. data_agent 且 depends_on=[] → 按顺序分配（支持多组并行）
+            #   3. data_agent 且 有 depends_on → 不注入（靠运行时参数传真实结果）
+            #   4. http_agent 且 当前消息有JSON → 注入（解决post_json找不到数据问题）
+            #   5. 当前消息无JSON时，只对 data_agent depends_on=[] 的任务做历史回填
+            import re as _re, json as _j
 
-            if _extracted_json:
-                for t in task_plan:
-                    if t.get("agent") == "data_agent":
-                        t["_resolved_description"] = (
-                            t["description"]
-                            + "\n\n【数据】\n"
-                            + _extracted_json
-                        )
-                        print(f"  💉 [Planner] task[{t['task_id']}] "
-                              f"data_agent 已注入 JSON 数据")
+            def _extract_all_json_arrays(text: str) -> list[str]:
+                """从文本中提取所有合法 JSON 数组（list[dict]），返回列表"""
+                results, seen = [], set()
+                for m in _re.finditer(r'\[', text):
+                    start = m.start()
+                    depth, in_str, escape, i = 0, False, False, start
+                    while i < len(text):
+                        c = text[i]
+                        if escape:
+                            escape = False; i += 1; continue
+                        if c == '\\' and in_str:
+                            escape = True; i += 1; continue
+                        if c == '"': in_str = not in_str
+                        if not in_str:
+                            if c == '[': depth += 1
+                            elif c == ']': depth -= 1
+                            if depth == 0:
+                                candidate = text[start:i+1]
+                                try:
+                                    parsed = _j.loads(candidate)
+                                    if (isinstance(parsed, list)
+                                            and len(parsed) > 0
+                                            and isinstance(parsed[0], dict)
+                                            and candidate not in seen):
+                                        results.append(candidate)
+                                        seen.add(candidate)
+                                except Exception:
+                                    pass
+                                break
+                        i += 1
+                return results
+
+            # 从当前消息提取JSON数组
+            _cur_arrays = _extract_all_json_arrays(user_msg)
+
+            # 按 agent 和 depends_on 分类任务
+            _data_standalone = [t for t in task_plan
+                                if t.get("agent") == "data_agent"
+                                and not t.get("depends_on")]
+            _data_dependent  = [t for t in task_plan
+                                if t.get("agent") == "data_agent"
+                                and t.get("depends_on")]
+            _http_tasks      = [t for t in task_plan
+                                if t.get("agent") == "http_agent"]
+
+            def _inject(task, arr, label=""):
+                task["_resolved_description"] = (
+                    task["description"] + "\n\n【数据】\n" + arr
+                )
+                print(f"  💉 [Planner] task[{task['task_id']}]"
+                      f" {task['agent']} 注入JSON{label}")
+
+            if _cur_arrays:
+                print(f"  📦 [Planner] 当前消息提取到 {len(_cur_arrays)} 组JSON")
+                # data_agent standalone：按顺序分配，多出的共享最后一组
+                for i, t in enumerate(_data_standalone):
+                    arr = _cur_arrays[i] if i < len(_cur_arrays) else _cur_arrays[-1]
+                    _inject(t, arr, f" (第{i+1}组)")
+                # http_agent：全部注入同一份（通常只有一组POST数据）
+                if _cur_arrays:
+                    _arr_for_http = _cur_arrays[0]
+                    for t in _http_tasks:
+                        if not t.get("depends_on"):  # 只注入首层无依赖的http任务
+                            _inject(t, _arr_for_http, " (http)")
+            else:
+                # 当前消息无JSON → 只对 data_agent standalone 做历史回填
+                if _data_standalone:
+                    _hist_arrays: list[str] = []
+                    for _hist_msg in reversed(msgs[:-1]):
+                        from langchain_core.messages import HumanMessage as _HM
+                        if isinstance(_hist_msg, _HM) and isinstance(_hist_msg.content, str):
+                            _ha = _extract_all_json_arrays(_hist_msg.content)
+                            if _ha:
+                                _hist_arrays = _ha
+                                print(f"  📂 [Planner] 从历史消息回填 "
+                                      f"{len(_ha)} 组JSON")
+                                break
+                    for i, t in enumerate(_data_standalone):
+                        arr = (_hist_arrays[i] if i < len(_hist_arrays)
+                               else _hist_arrays[-1] if _hist_arrays
+                               else None)
+                        if arr:
+                            _inject(t, arr, f" (历史第{i+1}组)")
 
             print(f"  ✅ 规划完成（{len(task_plan)} 个任务）：")
             for t in task_plan:
@@ -1657,8 +1718,7 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
                         val = src.get("result", "")
                         resolved_parts.append(f"【任务{dep_id}的结果】= {val}")
 
-            # ★ 数据保留：如果 planner_node 已经注入了 JSON 数据（_resolved_description 非空），
-            # 以它为基础追加运行时参数，而不是从 description 重新构建（那样会丢掉注入的数据）。
+            # ★ 保留 planner 注入的JSON：以 _resolved_description 为基础，追加运行时参数
             base_desc = task.get("_resolved_description") or task["description"]
             resolved_desc = base_desc
             if resolved_parts:
@@ -1881,12 +1941,16 @@ AGENT_SYSTEM_PROMPTS: dict[str, str] = {
     "data_agent": (
         "你是数据分析专家，核心任务是处理消息中直接提供的 JSON 数据。\n\n"
         "【最高优先级规则】\n"
-        "1. 数据来源：消息中如果包含 JSON 数组（如 '[{\"name\":\"Alice\",\"score\":90}]'），"
-        "它就是要分析的数据，直接使用，严禁调用 fetch_url、get_server_info 等工具去获取数据。\n"
-        "2. 禁止反问：严禁回复'请提供数据'，数据已在消息里。\n\n"
+        "1. 数据来源：消息中如果包含【数据】标记或 JSON 数组，它就是要分析的数据，直接使用。"
+        "严禁调用 fetch_url、get_server_info 等工具去获取数据。\n"
+        "2. 禁止反问：严禁回复'请提供数据'，数据已在消息里。\n"
+        "3. 错误如实上报：工具不支持的操作（如 agg_func=median）必须直接告知用户"
+        "'❌ 不支持该操作，group_and_aggregate 仅支持 sum/mean/max/min/count'，"
+        "严禁自行替换为其他聚合函数或绕过限制。\n\n"
         "【工具选择规则】\n"
         "- 统计摘要（统计信息/描述/概览/行数/列名）→ 必须调用 dataframe_summary\n"
-        "- 分组聚合（按 X 分组/求和/平均/最大/最小）→ 必须调用 group_and_aggregate\n"
+        "- 分组聚合（按 X 分组/求和/平均/最大/最小/计数）→ 必须调用 group_and_aggregate\n"
+        "  ★ agg_func 只允许：sum/mean/max/min/count，传入其他值工具会报错，直接返回报错内容给用户\n"
         "- 过滤行（筛选/filter）→ filter_rows；排序 → sort_dataframe；透视 → pivot_table\n\n"
         "【调用示例】\n"
         "统计摘要：dataframe_summary(records_json='[{\"order_id\":\"A001\",\"amount\":120.5}]')\n"
@@ -2003,43 +2067,9 @@ graph = build_graph()
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
 
-    BATCH_MODE = True  # True → 自动跑完 QUESTIONS；False → 交互式 CLI
+    BATCH_MODE = False  # True → 自动跑完 QUESTIONS；False → 交互式 CLI
 
-    # ══════════════════════════════════════════════════════════════════
-    # 批量测试题库（共 6 组，验证全部修复点）
-    # 运行方式：BATCH_MODE = True，或在交互模式输入 'batch'
-    #
-    # 【组1】多轮闲聊 + 身份信息（验证 Planner 不产生幻觉任务）
-    #   预期：每轮只有 1 个 direct 任务，任务数不随轮次增长
-    # 【组2】单轮纯数学（验证 math_agent 路由正确）
-    #   预期：每轮 1 个 math_agent 任务
-    # 【组3】多任务并行（验证并行调度）
-    #   预期：同一层并行执行 2 个任务，总耗时接近单任务耗时
-    # 【组4】跨轮引用（验证 final_answer_node 能解析"刚才的结果"）
-    #   预期：第2条能正确用上第1条的结果 56，输出 60
-    # 【组5】数据库查询（验证 db_agent 路由 + SQL 生成）
-    #   预期：1 个 db_agent 任务，结果包含真实数据
-    # 【组6】综合压力测试（多轮身份更新 + 混合任务）
-    #   预期：身份更新后回答"Alice"而非"Tony"；最后并行任务恰好 2 个
-    # ══════════════════════════════════════════════════════════════════
-        # ══════════════════════════════════════════════════════════════════
-    # 批量测试题库 v5（共 8 组，24 题）
-    #
-    # 设计原则：
-    #   - 每组只测一个维度，出错时能精确定位问题
-    #   - 覆盖所有 agent 类型 + 所有拓扑结构（单任务/并行/串行/扇出/扇入）
-    #   - 有意在晚期轮次混入身份问题，压测摘要记忆
-    #   - HTTP 测试使用真实公网 API（api.github.com/zen 稳定返回）
-    #
-    # 组1  闲聊 + 身份建立               → 验证 direct 路由、摘要触发
-    # 组2  纯数学（单/多步/跨轮引用）     → 验证 math_agent + Planner 数值注入
-    # 组3  纯 DB 查询（单表/多表/聚合）   → 验证 db_agent SQL 生成质量
-    # 组4  纯文件操作（读/写/目录）       → 验证 file_agent 路径处理
-    # 组5  HTTP 请求                      → 验证 http_agent
-    # 组6  串行依赖（DB→Math→File）       → 验证 3 层拓扑串行
-    # 组7  并行 + 扇出 + 扇入            → 验证复杂拓扑
-    # 组8  长对话记忆压力测试             → 验证摘要在 24 轮后仍正确
-    # ══════════════════════════════════════════════════════════════════
+ 
     QUESTIONS = [
 
     # ══════════════════════════════════════════════════════════════════

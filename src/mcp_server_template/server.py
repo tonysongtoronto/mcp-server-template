@@ -51,18 +51,24 @@ async def fetch_url(url: str, timeout: float = 10.0) -> str:
 
 
 @mcp.tool()
-async def post_json(url: str, payload: dict) -> str:
+async def post_json(url: str, payload: str) -> str:
     """
     向指定 URL 发送 JSON POST 请求，返回响应内容。
     参数:
         url     - 目标接口地址
-        payload - 请求体（会被序列化为 JSON）
+        payload - 请求体 JSON 字符串，可以是 dict 或 list，例如：
+                  '{"key":"value"}' 或 '[{"item":"a"},{"item":"b"}]'
+    ★ payload 必须是 JSON 字符串，不是 Python 对象！
     """
+    import json
+    try:
+        body = json.loads(payload)
+    except json.JSONDecodeError as e:
+        return f"❌ payload JSON 解析失败：{e}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(url, json=payload, follow_redirects=True)
+            resp = await client.post(url, json=body, follow_redirects=True)
             resp.raise_for_status()
-            import json
             return json.dumps(resp.json(), ensure_ascii=False, indent=2)[:2000]
     except httpx.HTTPStatusError as e:
         return f"❌ HTTP {e.response.status_code}：{e.response.text[:200]}"
