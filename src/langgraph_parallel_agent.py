@@ -18,6 +18,29 @@ src/langgraph_parallel_agent.py
 
 【本版本修复】
 
+  ★ 修复I（链式聚合 → dataframe_summary 数据传递问题）
+    问题根因：
+      group_and_aggregate 的 result 是自然语言表格文本（"dept  budget_sum\n  市场  65000\n..."），
+      而不是 JSON 数组。当下游 dataframe_summary 任务通过 depends_on 获取该 result 时，
+      data_agent 在 _resolved_description 里只看到文本，找不到 JSON，拒绝调用工具。
+
+    双层修复：
+      1. Planner system prompt 新增【★ 重要：聚合结果 → dataframe_summary】规则：
+         当用户要求"先聚合再对结果做 dataframe_summary"时，
+         Planner 在 dataframe_summary 任务的 description 里直接嵌入
+         根据原始数据推算的聚合 JSON（作为工具调用的数据底座），
+         同时保留 depends_on 引用以便 data_agent 用实际数据修正。
+
+      2. data_agent system prompt 新增【从运行时参数里构造 JSON】规则：
+         当 description 里无 JSON 但【运行时参数】里有聚合文本时，
+         data_agent 将空白分隔的表格文本解析为 JSON 数组后调用 dataframe_summary。
+         这是双重保险：Planner 嵌入推算 JSON 是主路径，
+         data_agent 自解析是兜底路径（应对 Planner 漏注入的情况）。
+
+    效果：
+      - 轮20（3步串行链：POST → group_and_aggregate → dataframe_summary）
+        task[2] 将正确调用 dataframe_summary 工具，不再因"无 JSON 数据"拒绝执行。
+
   ★ 修复G（_run_direct_task）
     原方案：只传 HumanMessage 纯文本作为 context_note，模型看不到 AI 的历史确认。
     新方案：传摘要 + 最近 20 条 Human+AI 交替消息，direct_task 阶段就能答对，
@@ -251,21 +274,6 @@ AGENT_DESCRIPTIONS: dict[str, str] = {
     "db_agent":   "数据库查询（电商数据库：用户/商品/订单/评价/库存，支持自然语言和直接 SQL）",
 }
 
-AGENT_TRIGGER_KEYWORDS: dict[str, list[str]] = {
-    "math_agent": ["计算", "加", "减", "乘", "除", "求和", "平均", "幂", "开方",
-                   "+", "-", "×", "÷", "*", "/", "²", "√"],
-    "http_agent": ["访问", "请求", "获取", "http", "https", "url", "api",
-                   "fetch", "get ", "post "],
-    "data_agent": ["分析", "统计", "分组", "聚合", "过滤", "排序", "数据集",
-                   "dataframe", "pivot"],
-    "file_agent": ["文件", "目录", "列出", "读取", "写入", "创建", "移动",
-                   "搜索文件", "read_file", "write_file", "list_directory"],
-    "db_agent":   ["查询", "数据库", "订单", "用户", "商品", "库存", "评价",
-                   "销售额", "销售", "购买", "category", "product", "order",
-                   "review", "inventory", "sql", "select", "多少", "哪些",
-                   "列出所有", "找出", "统计订单", "统计用户", "统计商品",
-                   "最高", "最低", "排名", "top", "最畅销"],
-}
 
 def _match_agent(tool_name: str) -> str:
     for agent, patterns in AGENT_TOOL_PATTERNS.items():
@@ -788,19 +796,47 @@ def _extract_json(raw: str) -> str:
         for i in range(1, len(parts), 2):
             candidate = parts[i]
             # 去掉可能的语言标识符行（如 "json\n"、"python\n" 等）
-            candidate = re.sub(r"^[a-zA-Z]+\n", "", candidate).strip()
+            # ★ 修复Bug4-a：原 re.sub 只能去掉英文字母组成的标识符，
+            #   但 ``` 后直接跟换行（无标识符）时，candidate 以 "\n" 开头，
+            #   strip() 统一处理，兼容有/无标识符两种格式。
+            candidate = re.sub(r"^[a-zA-Z]*\n", "", candidate).strip()
             if candidate:
                 return candidate
         # 所有代码块都是空的，fallthrough 到下面的 fallback
 
-    # ── fallback：找第一个 [ 或 {，去掉前面的废话文字 ──────────────────
-    # 场景：模型输出 "好的，以下是任务规划：\n[{...}]"
+    # ── fallback：找第一个 [ 或 {，截取到对应的匹配括号 ─────────────────
+    # ★ 修复Bug4-b：原做法 raw[m.start():] 把括号后面的废话文字也带上，
+    #   导致 json.loads 失败（如 "[{...}]\n好的，任务规划如上。"）。
+    #   新做法：找到 [ 后，用括号计数法找到对应的 ] 截断，只返回 JSON 本身。
     m = re.search(r"[\[{]", raw)
     if m:
-        return raw[m.start():]
+        start = m.start()
+        open_char  = raw[start]
+        close_char = "]" if open_char == "[" else "}"
+        depth, in_str, escape = 0, False, False
+        for idx in range(start, len(raw)):
+            c = raw[idx]
+            if escape:
+                escape = False
+                continue
+            if c == "\\" and in_str:
+                escape = True
+                continue
+            if c == '"':
+                in_str = not in_str
+            if not in_str:
+                if c == open_char:
+                    depth += 1
+                elif c == close_char:
+                    depth -= 1
+                    if depth == 0:
+                        return raw[start:idx + 1]
+        # 括号没有闭合，返回从 start 到末尾（让上层 json.loads 报错触发重试）
+        return raw[start:].strip()
 
     # 实在没有，原样返回（让上层 json.loads 报错，触发重试）
     return raw
+
 
 
 def _extract_llm_content(response: Any) -> str:
@@ -946,6 +982,55 @@ def _planner_system() -> str:
 
 {_registry.tool_desc_block}
 
+━━ 数据传递规则（用户消息含 JSON 时必读）━━
+
+如果用户消息中包含 JSON 数据（数组 [...] 或对象 {{...}}），
+必须把该数据原样嵌入到使用它的任务的 description 字段里。
+严禁只写意图（如"对用户提供的数据做统计"）——执行器看不到原始消息，
+description 是它获取数据的唯一来源。
+
+【单任务 → 直接嵌入】
+  用户说："对这个数据做统计：[{{"name":"Alice","score":90}},{{"name":"Bob","score":75}}]"
+  → description 写："对以下数据做统计分析：[{{"name":"Alice","score":90}},{{"name":"Bob","score":75}}]"
+
+【多组数据 → 多任务并行，每个任务嵌入对应的那一组】
+  用户说："分别统计这两组：[{{"city":"Toronto","cnt":5}}] 和 [{{"city":"NYC","cnt":8}}]"
+  → task_0 description："对以下数据做统计：[{{"city":"Toronto","cnt":5}}]"
+  → task_1 description："对以下数据做统计：[{{"city":"NYC","cnt":8}}]"
+
+【数据 + 后续工具 → 只有直接使用数据的第一个任务嵌入，后续任务通过 depends_on 获取结果】
+  用户说："统计这个数据后把结果 POST 到 https://api.example.com/report：[{{"product":"A","sales":100}}]"
+  → task_0（data_agent）description："对以下数据做统计：[{{"product":"A","sales":100}}]"
+    inputs={{}}，depends_on=[]
+  → task_1（http_agent）description："向 https://api.example.com/report POST 统计结果"
+    inputs={{"data": {{"from_task": 0, "field": "result"}}}}，depends_on=[0]
+    ← task_1 不重复嵌入 JSON，数据通过 depends_on 从 task_0 获取
+
+【★ 重要：聚合结果 → dataframe_summary（链式数据分析）】
+  当用户要求"先聚合再对聚合结果做 dataframe_summary"时，
+  dataframe_summary 的 description 必须直接嵌入原始数据（而非依赖 depends_on result）。
+
+  原因：group_and_aggregate 返回的是自然语言表格文本（"dept  budget_sum\n  市场  65000\n  研发  150000"），
+  data_agent 无法从自然语言文本中调用 dataframe_summary 工具。
+  正确做法：在 dataframe_summary 任务的 description 里直接写入
+  group_and_aggregate 预期输出的 JSON 形式（根据原始数据推算）。
+
+  示例 → 用户说："按 dept 分组求 budget 总和，再对求和结果做 dataframe_summary"
+  原始数据：[{{"dept":"研发","budget":50000}},{{"dept":"市场","budget":30000}},{{"dept":"研发","budget":45000}}]
+
+  → task_0（data_agent）description："按 dept 分组对 budget 求和：[{{"dept":"研发","budget":50000}},...原始数据...]"
+    depends_on=[]
+  → task_1（data_agent）description：
+    "对以下分组求和结果做 dataframe_summary：
+     [{{"dept":"研发","budget_sum":95000}},{{"dept":"市场","budget_sum":30000}}]
+     注：以上 JSON 根据原始数据推算，实际数值请以 task_0 结果为准"
+    inputs={{"grouped_data": {{"from_task": 0, "field": "result"}}}}，depends_on=[0]
+
+  ← task_1 的 description 嵌入推算 JSON，data_agent 可直接调用 dataframe_summary 工具；
+    同时通过 inputs/depends_on 保留对 task_0 result 的引用，data_agent 可用实际结果修正。
+
+【数据较长时】超过 500 字的 JSON 可截断关键字段并注明"（数据已截断，完整数据见原始消息）"。
+
 ━━ agent 选择规则（严格遵守，违反将导致系统错误）━━
 
 ✅ 必须使用工具 agent 的情况：
@@ -1008,14 +1093,11 @@ depends_on 必须与 inputs 中所有 from_task 的值完全一致。
 2. 如果用户当前消息是闲聊/问候/自我介绍（如我是程序员、你好、对）→ 只规划 1 个 direct 任务。
 3. 如果用户当前消息只问一件事 → 只规划完成那一件事所需的最少任务。
 4. description 只写任务意图，不提前计算数值或给出答案。
-   ★ 唯一例外（Memory Store / 用户画像摘要中的已知事实）：
-     如果答案已经在【Memory Store 全局记忆】或【用户画像摘要】中明确存在，
-     则 description 必须把相关内容直接写入，供执行器使用，而不能只写意图。
-     示例（正确）：store 里有 discount_policy="所有用户享受九折优惠，VIP用户享受八折"
-       用户问"折扣政策是什么" → description 必须写：
-       "回答折扣政策：所有用户享受九折优惠，VIP用户享受八折"
-     示例（错误）：description 只写 "回答公司的折扣政策"
-       → 执行器看不到实际内容，会反问用户，这是严重错误。
+   ★ 以下三种情况 description 必须包含实际内容，而不能只写意图：
+     a. 用户消息中含 JSON 数据 → 把数据嵌入 description（见上方"数据传递规则"）
+     b. Memory Store 全局记忆中有答案 → 把记忆内容写入 description
+     c. 用户画像摘要中有答案 → 把摘要内容写入 description
+   原因：执行器只看 description，看不到原始消息、store 或摘要，只写意图会导致执行器反问用户。
 5. 同一个 agent 可出现多次。
 6. 任务按拓扑顺序排列（被依赖的任务排在前面）。
 
@@ -1109,7 +1191,7 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
 
     msgs = state.get("messages", [])
     if not msgs:
-        return {**state, "next_agent": "FINISH", "task_plan": []}
+        return {"next_agent": "FINISH", "task_plan": []}
 
     # 取最后一条 HumanMessage 作为当前问题
     last_human_msg = next(
@@ -1117,7 +1199,7 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
         None
     )
     if not last_human_msg:
-        return {**state, "next_agent": "FINISH", "task_plan": []}
+        return {"next_agent": "FINISH", "task_plan": []}
 
     user_msg = _get_message_content(last_human_msg)
     print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
@@ -1288,99 +1370,6 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                       "\n    ".join(fmt_errors))
                 raise ValueError(retry_feedback)
 
-            # ★ JSON数据注入：精准版
-            # 规则：
-            #   1. 从当前消息提取所有JSON数组
-            #   2. data_agent 且 depends_on=[] → 按顺序分配（支持多组并行）
-            #   3. data_agent 且 有 depends_on → 不注入（靠运行时参数传真实结果）
-            #   4. http_agent 且 当前消息有JSON → 注入（解决post_json找不到数据问题）
-            #   5. 当前消息无JSON时，只对 data_agent depends_on=[] 的任务做历史回填
-            import re as _re, json as _j
-
-            def _extract_all_json_arrays(text: str) -> list[str]:
-                """从文本中提取所有合法 JSON 数组（list[dict]），返回列表"""
-                results, seen = [], set()
-                for m in _re.finditer(r'\[', text):
-                    start = m.start()
-                    depth, in_str, escape, i = 0, False, False, start
-                    while i < len(text):
-                        c = text[i]
-                        if escape:
-                            escape = False; i += 1; continue
-                        if c == '\\' and in_str:
-                            escape = True; i += 1; continue
-                        if c == '"': in_str = not in_str
-                        if not in_str:
-                            if c == '[': depth += 1
-                            elif c == ']': depth -= 1
-                            if depth == 0:
-                                candidate = text[start:i+1]
-                                try:
-                                    parsed = _j.loads(candidate)
-                                    if (isinstance(parsed, list)
-                                            and len(parsed) > 0
-                                            and isinstance(parsed[0], dict)
-                                            and candidate not in seen):
-                                        results.append(candidate)
-                                        seen.add(candidate)
-                                except Exception:
-                                    pass
-                                break
-                        i += 1
-                return results
-
-            # 从当前消息提取JSON数组
-            _cur_arrays = _extract_all_json_arrays(user_msg)
-
-            # 按 agent 和 depends_on 分类任务
-            _data_standalone = [t for t in task_plan
-                                if t.get("agent") == "data_agent"
-                                and not t.get("depends_on")]
-            _data_dependent  = [t for t in task_plan
-                                if t.get("agent") == "data_agent"
-                                and t.get("depends_on")]
-            _http_tasks      = [t for t in task_plan
-                                if t.get("agent") == "http_agent"]
-
-            def _inject(task, arr, label=""):
-                task["_resolved_description"] = (
-                    task["description"] + "\n\n【数据】\n" + arr
-                )
-                print(f"  💉 [Planner] task[{task['task_id']}]"
-                      f" {task['agent']} 注入JSON{label}")
-
-            if _cur_arrays:
-                print(f"  📦 [Planner] 当前消息提取到 {len(_cur_arrays)} 组JSON")
-                # data_agent standalone：按顺序分配，多出的共享最后一组
-                for i, t in enumerate(_data_standalone):
-                    arr = _cur_arrays[i] if i < len(_cur_arrays) else _cur_arrays[-1]
-                    _inject(t, arr, f" (第{i+1}组)")
-                # http_agent：全部注入同一份（通常只有一组POST数据）
-                if _cur_arrays:
-                    _arr_for_http = _cur_arrays[0]
-                    for t in _http_tasks:
-                        if not t.get("depends_on"):  # 只注入首层无依赖的http任务
-                            _inject(t, _arr_for_http, " (http)")
-            else:
-                # 当前消息无JSON → 只对 data_agent standalone 做历史回填
-                if _data_standalone:
-                    _hist_arrays: list[str] = []
-                    for _hist_msg in reversed(msgs[:-1]):
-                        from langchain_core.messages import HumanMessage as _HM
-                        if isinstance(_hist_msg, _HM) and isinstance(_hist_msg.content, str):
-                            _ha = _extract_all_json_arrays(_hist_msg.content)
-                            if _ha:
-                                _hist_arrays = _ha
-                                print(f"  📂 [Planner] 从历史消息回填 "
-                                      f"{len(_ha)} 组JSON")
-                                break
-                    for i, t in enumerate(_data_standalone):
-                        arr = (_hist_arrays[i] if i < len(_hist_arrays)
-                               else _hist_arrays[-1] if _hist_arrays
-                               else None)
-                        if arr:
-                            _inject(t, arr, f" (历史第{i+1}组)")
-
             print(f"  ✅ 规划完成（{len(task_plan)} 个任务）：")
             for t in task_plan:
                 dep_str = f" depends_on={t['depends_on']}" if t['depends_on'] else ""
@@ -1389,19 +1378,40 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
             break
 
         except Exception as e:
-            if not retry_feedback:
-                retry_feedback = (
-                    f"JSON 解析失败：{e}\n"
-                    f"你的原始输出（前300字）：{last_raw_output[:300]}\n"
-                    f"请只输出合法的 JSON 数组，不要有任何额外文字或代码块标记。"
-                )
+            # ★ 修复：每次循环都用最新报错更新 retry_feedback，
+            #   原逻辑 `if not retry_feedback` 只记录第一次错误，
+            #   第2次循环时 LLM 看到的仍是旧报错，无法针对性修正。
+            #
+            #   注意：校验路径（raise ValueError(retry_feedback)）里
+            #   str(e) 就是 retry_feedback 本身，直接用 str(e) 统一处理，
+            #   无需区分两条路径。
+            retry_feedback = (
+                f"上次输出问题：{e}\n"
+                f"你的原始输出（前300字）：{last_raw_output[:300]}\n"
+                f"请只输出合法的 JSON 数组，不要有任何额外文字或代码块标记。"
+            )
             print(f"  ⚠️ Planner 第 {attempt+1} 次失败：{e}")
             if attempt == max_retries - 1:
-                print("  ❌ Planner 全部失败，终止")
-                return {**state, "next_agent": "FINISH", "task_plan": []}
+                print("  ❌ Planner 全部失败，将向用户报告错误")
+                # ★ 修复：Planner 全部失败时路由到 final_answer，让用户收到错误说明
+                # 而不是静默跳到 END（原来用 FINISH 直接跳过 final_answer）
+                error_task: Task = {
+                    "task_id": 0,
+                    "description": "向用户说明任务规划失败，请用户重新描述需求",
+                    "agent": "direct",
+                    "inputs": {},
+                    "depends_on": [],
+                    "status": "done",
+                    "result": f"抱歉，任务规划失败（已重试 {max_retries} 次）。错误信息：{e}。请重新描述您的需求，或换一种方式提问。",
+                    "_resolved_description": "",
+                }
+                return {
+                    "task_plan":       [error_task],
+                    "current_task_id": 0,
+                    "next_agent":      "",
+                }
 
     return {
-        **state,
         "task_plan":       task_plan,
         "current_task_id": task_plan[0]["task_id"] if task_plan else 0,
         "next_agent":      "",
@@ -1412,13 +1422,19 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
 # 8. 并行调度核心
 # ══════════════════════════════════════════════════════
 
-def _topo_layers(tasks: list[Task]) -> list[list[Task]]:
+def _topo_layers(tasks: list[Task], pre_done: set[int] | None = None) -> list[list[Task]]:
     """
     拓扑 BFS 分层。返回 [[layer0], [layer1], ...]：
     - 同层内任务互无依赖，可 asyncio.gather() 并行执行
     - 层与层之间严格串行（后层依赖前层全部完成）
+
+    ★ 修复Bug3：pre_done 参数接收"已完成任务的 task_id 集合"。
+      checkpoint 恢复场景下，只对 pending 任务调用此函数，
+      但 depends_on 中引用的可能是已完成（done）的任务 ID。
+      若 done_ids 初始为空集，这些依赖永远无法满足，导致强制入队乱序。
+      传入 pre_done 后，done_ids 初始就包含已完成任务，依赖正常解析。
     """
-    done_ids: set[int] = set()
+    done_ids: set[int] = set(pre_done or [])
     layers: list[list[Task]] = []
     remaining = list(tasks)
 
@@ -1542,7 +1558,19 @@ async def run_agent_isolated(
                     result_text = f"❌ 未找到工具：{tc['name']}"
                 msgs.append(ToolMessage(content=result_text, tool_call_id=tc["id"]))
         else:
-            print(f"  ⚠️ [{agent_name}] task[{task['task_id']}] 达到最大步数 {max_steps}")
+            # ★ 修复：达到最大步数时，last_response 很可能是"我需要调用工具X"
+            #   这样的中间状态，直接返回会产生误导性输出。
+            #   追加一次无工具的 LLM 调用，强制让模型根据已有工具结果给出最终答案。
+            print(f"  ⚠️ [{agent_name}] task[{task['task_id']}] 达到最大步数 {max_steps}，"
+                  f"追加一次无工具调用以汇总结果")
+            summary_prompt = (
+                "以上是你已完成的所有工具调用和结果。"
+                "请根据这些结果，给出一个简洁的最终答案，不要再调用任何工具。"
+            )
+            msgs.append(HumanMessage(content=summary_prompt))
+            # 用不绑定工具的 llm 调用，强制纯文本输出
+            final_resp = await llm.ainvoke(msgs)
+            return _extract_llm_content(final_resp) if final_resp else "（无结果）"
 
         return _extract_llm_content(last_response) if last_response else "（无结果）"
 
@@ -1661,7 +1689,7 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
 
     if not task_plan:
         print("\n🏁 [ParallelExecutor] task_plan 为空 → 跳过")
-        return {**state, "next_agent": "FINISH"}
+        return {"next_agent": "FINISH"}
 
     # ── checkpoint 失败恢复：过滤掉已完成的任务 ──────────────────────
     # 什么时候会有 status=="done" 的任务？
@@ -1673,20 +1701,60 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
 
     if not pending_tasks:
         print("\n🏁 [ParallelExecutor] 所有任务已完成（从 checkpoint 恢复）→ 直接汇总")
-        return {**state, "next_agent": "FINISH"}
+        return {"next_agent": "FINISH"}
 
     skipped = len(task_plan) - len(pending_tasks)
     if skipped > 0:
         print(f"\n⏭️  [ParallelExecutor] 跳过 {skipped} 个已完成任务（checkpoint 恢复）")
 
-    # 分拓扑层（只对 pending 任务分层）
-    layers = _topo_layers(pending_tasks)
+    # 分拓扑层（只对 pending 任务分层，但把已完成任务的 ID 作为初始 done 集合传入）
+    # ★ 修复Bug3：checkpoint 恢复时，已完成任务的 task_id 必须计入 done_ids，
+    #   否则依赖它们的 pending 任务永远无法满足依赖，触发强制入队乱序。
+    already_done_ids = {t["task_id"] for t in task_plan if t.get("status") == "done"}
+    layers = _topo_layers(pending_tasks, pre_done=already_done_ids)
     total  = len(pending_tasks)
     print(f"\n🚀 [ParallelExecutor] 共 {total} 个待执行任务，分 {len(layers)} 层")
     for i, layer in enumerate(layers):
         print(f"   层 {i}: {[t['task_id'] for t in layer]}")
 
     done_count = 0
+
+    # ★ 修复：_exec_one 定义在 for 循环外部，避免在循环体内反复重新定义函数。
+    #   task 作为参数显式传入（而非闭包捕获），消除 late-binding 风险。
+    #   task["agent"] 的修改是安全的：每个协程操作自己的 task 对象，dict 独立。
+    #   失败路径（BaseException）由 gather(return_exceptions=True) 处理，
+    #   status 回滚在 gather 结果收集阶段处理。
+    async def _exec_one(task: Task) -> tuple[int, str]:
+        agent = task.get("agent", "default_agent")
+
+        # ★ 修复4 — 第一层（执行前）：检查 registry 里该 agent 是否有工具
+        #   如果一个非 direct 的 agent 在 registry 里根本没有注册工具，
+        #   提前改为 default_agent，避免 spawn session 后再失败。
+        #   注意：math_agent 等会独立 spawn session，registry 里可能没有对应工具，
+        #   这种情况不应该 fallback，所以只对"registry 确实有工具但 agent 写错了"
+        #   的情况做前置检查。
+        #   判断依据：registry 里总工具数 > 0，但该 agent 的工具数 == 0
+        if (agent not in ("direct",)
+                and _registry.agents          # registry 已就绪
+                and agent not in _registry.agents  # 该 agent 根本没注册
+        ):
+            print(f"  ⚠️ [{agent}] 不在 registry 中，"
+                  f"前置 fallback → default_agent")
+            task["agent"] = "default_agent"
+            agent = "default_agent"
+
+        try:
+            if agent == "direct":
+                result = await _run_direct_task(task, state)
+            else:
+                system_prompt = AGENT_SYSTEM_PROMPTS.get(agent, DEFAULT_AGENT_SYSTEM_PROMPT)
+                result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
+            return task["task_id"], result
+        except Exception as exc:
+            # ★ 修复：执行失败时把 status 回滚到 "failed"（而非 "in_progress"），
+            #   确保 checkpoint 恢复时不会将失败任务误判为"正在运行"。
+            task["status"] = "failed"
+            raise exc
 
     for layer_idx, layer in enumerate(layers):
         # ── 解析运行时 inputs（依赖上一层的结果）──────────────────────
@@ -1731,42 +1799,27 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
               f"{[t['task_id'] for t in layer]}")
         t_layer_start = time.perf_counter()
 
-        async def _exec_one(task: Task) -> tuple[int, str]:
-            agent = task.get("agent", "default_agent")
-
-            # ★ 修复4 — 第一层（执行前）：检查 registry 里该 agent 是否有工具
-            #   如果一个非 direct 的 agent 在 registry 里根本没有注册工具，
-            #   提前改为 default_agent，避免 spawn session 后再失败。
-            #   注意：math_agent 等会独立 spawn session，registry 里可能没有对应工具，
-            #   这种情况不应该 fallback，所以只对"registry 确实有工具但 agent 写错了"
-            #   的情况做前置检查。
-            #   判断依据：registry 里总工具数 > 0，但该 agent 的工具数 == 0
-            if (agent not in ("direct",)
-                    and _registry.agents          # registry 已就绪
-                    and agent not in _registry.agents  # 该 agent 根本没注册
-            ):
-                print(f"  ⚠️ [{agent}] 不在 registry 中，"
-                      f"前置 fallback → default_agent")
-                task["agent"] = "default_agent"
-                agent = "default_agent"
-
-            if agent == "direct":
-                result = await _run_direct_task(task, state)
-            else:
-                system_prompt = AGENT_SYSTEM_PROMPTS.get(agent, DEFAULT_AGENT_SYSTEM_PROMPT)
-                result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
-            return task["task_id"], result
-
-        results: list[tuple[int, str]] = await asyncio.gather(
+        # ★ 修复Bug1：return_exceptions=True，防止单任务异常拖垮整层
+        #   return_exceptions=False（默认）下，任何一个任务抛异常，
+        #   gather 立即向上抛出，整层其他任务的结果全部丢失。
+        #   改为 True 后，异常会作为结果元素返回，其他任务正常收集。
+        raw_results = await asyncio.gather(
             *[_exec_one(t) for t in layer],
-            return_exceptions=False,
+            return_exceptions=True,
         )
 
         # ── 将结果写回 task_plan ───────────────────────────────────────
-        result_map = dict(results)
+        result_map: dict[int, str] = {}
+        for r in raw_results:
+            if isinstance(r, BaseException):
+                print(f"  ❌ [gather] 某任务抛出未捕获异常：{r}")
+            else:
+                task_id, result = r
+                result_map[task_id] = result
+
         for task in layer:
             task["status"] = "done"
-            task["result"] = result_map.get(task["task_id"], "（无结果）")
+            task["result"] = result_map.get(task["task_id"], "（执行异常，无结果）")
             done_count += 1
             print(f"  ✔ 任务[{task['task_id']}] 完成：{task['result'][:60]}")
 
@@ -1775,11 +1828,13 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
               f"进度 {done_count}/{total}")
 
     print(f"\n🏁 [ParallelExecutor] 全部 {total} 个任务执行完毕")
+    # ★ 修复：只返回需要更新的字段，不展开 **state。
+    #   messages 是 Annotated[list, add_messages]，展开 **state 会把完整历史
+    #   再追加一遍，导致每经过本节点消息数翻倍。
+    #   task_plan 已被就地修改（task["status"] = "done" 等），直接返回引用。
     return {
-        **state,
         "task_plan":  task_plan,
         "next_agent": "FINISH",
-        "messages":   state["messages"],
     }
 
 
@@ -1802,15 +1857,17 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
     if direct_tasks:
         all_results_lines.append("【直接回答任务】")
         for t in direct_tasks:
+            status_tag = "✅已完成" if t.get("status") == "done" else "❌失败"
             all_results_lines.append(
-                f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
+                f"  任务[{t['task_id']}]（{t['description']}）[{status_tag}]：{t['result']}"
             )
 
     if tool_tasks:
-        all_results_lines.append("【工具执行任务】")
+        all_results_lines.append("【工具执行任务（以下为工具实际返回值，必须以此为准）】")
         for t in tool_tasks:
+            status_tag = "✅已完成" if t.get("status") == "done" else "❌失败"
             all_results_lines.append(
-                f"  任务[{t['task_id']}]（{t['description']}）：{t['result']}"
+                f"  任务[{t['task_id']}]（{t['description']}）[{status_tag}]：{t['result']}"
             )
 
     results_text = "\n".join(all_results_lines)
@@ -1859,7 +1916,13 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         "2. 如果结果已经很清晰（如纯数字），直接告知结果即可，不要过度解释。\n"
         "3. 不要在回答里加入与当前问题无关的信息（如用户的城市、年龄等）。\n"
         "4. 如果用户引用了'刚才的结果'/'上一步'等，请从对话历史中查找对应数值。\n"
-        "5. 对话摘要提供了用户的基础画像，近期对话历史中有更新时以最新为准。"
+        "5. 对话摘要提供了用户的基础画像，近期对话历史中有更新时以最新为准。\n"
+        "6. 【关键】上方子任务结果是工具的实际执行输出，必须以这些结果为准汇总回答。\n"
+        "   严禁用对话历史中的旧数据替换工具的实际返回值；\n"
+        "   严禁因为某个子任务失败就忽略其他已成功子任务的结果——\n"
+        "   每个任务的结果独立汇报，成功的如实展示，失败的说明原因，不互相影响。\n"
+        "7. 【关键】如果多个子任务中只有部分失败，其他成功任务的结果仍须完整呈现，\n"
+        "   不能以'第N步失败导致后续无法执行'为由跳过已经执行并有结果的任务。"
     )
 
     # ── 流式 vs 非流式：根据 _stream_queue 是否已注入来决定 ────────────
@@ -1898,33 +1961,42 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         response = await llm.ainvoke(msgs_for_llm)
         new_ai_msg = AIMessage(content=_extract_llm_content(response))
 
-    # ── 触发摘要更新（每5轮一次）────────────────────────────────────
-    # 判断条件：当前消息数（包含本轮新的 Human）- 已摘要轮次×2 >= 10
-    #   即：新增了 5 轮（10条消息）以上时，更新一次摘要。
-    # 为什么在 final_answer_node 末尾触发？
-    #   此时本轮的 AI 回复已生成，消息列表最完整，摘要质量最高。
-    #   用 asyncio.create_task 异步触发，不阻塞当前节点返回。
-    #   但因为 LangGraph graph 是串行节点，这里实际同步 await，
-    #   代价只是每5轮多一次 LLM 调用（约1-2秒），可以接受。
-    current_msg_count = len(msgs) + 1  # +1 因为新的 AI 消息还未追加
-    summary_turn_count = state.get("summary_turn_count", 0)
+    # ── 触发摘要更新（每10条新消息更新一次）────────────────────────
+    #
+    # ★ 修复：原条件 "current_msg_count - summary_turn_count * 2 >= 10" 存在两个问题：
+    #   1. current_msg_count = len(msgs) + 1 是估算值（AI 消息尚未追加），不准确。
+    #   2. summary_turn_count 以"轮次"为单位，但 current_msg_count 以"条数"为单位，
+    #      单位换算（× 2）在 messages 翻倍 bug 修复后才能可靠，否则触发时机错乱。
+    #
+    # 新方案：
+    #   - summary_turn_count 重语义为"已被摘要覆盖的消息条数"（last_summarized_msg_idx）
+    #   - 当前完整消息数 = len(msgs) + 1（本轮 AI 消息）
+    #   - 每新增 10 条消息触发一次，逻辑清晰，无单位换算
+    #
+    # 注意：summary_turn_count 字段名保持不变（避免改 AgentState 定义），
+    #       只改语义：以前存"已摘要轮次"，现在存"已摘要到的消息总条数"。
+    #       已有 checkpoint 里旧值会略偏小，最多导致一次早触发，无害。
+    full_msg_count = len(msgs) + 1         # 本轮 AI 消息追加后的总条数
+    last_summarized_idx = state.get("summary_turn_count", 0)  # 字段复用，存消息条数索引
     new_summary = conv_summary
-    new_summary_turn_count = summary_turn_count
+    new_summary_turn_count = last_summarized_idx
 
-    # 每5轮（10条消息）更新一次摘要
-    if current_msg_count - summary_turn_count * 2 >= 10:
-        print(f"  🔄 [Summary] 触发摘要更新（当前{current_msg_count}条消息，已摘要{summary_turn_count}轮）")
-        # 把本轮的消息也加进去（包含最新的 Human 问题，注意 AI 回复用 new_ai_msg）
+    # 每新增 10 条消息（约 5 轮对话）更新一次摘要
+    if full_msg_count - last_summarized_idx >= 10:
+        print(f"  🔄 [Summary] 触发摘要更新（总消息数={full_msg_count}，"
+              f"上次摘要位置={last_summarized_idx}）")
+        # 把本轮 AI 回复也加进去，摘要覆盖最新内容
         all_msgs_for_summary = list(msgs) + [new_ai_msg]
         new_summary = await _update_summary(all_msgs_for_summary, conv_summary)
-        new_summary_turn_count = current_msg_count // 2  # 更新已摘要轮次
+        new_summary_turn_count = full_msg_count  # 更新已摘要消息索引
 
     # ★ 返回新增字段。add_messages reducer 只追加 new_ai_msg，不覆盖历史。
+    # 不展开 **state：messages 用 add_messages reducer 追加，其他字段
+    # LangGraph 从 checkpoint 保留，只需返回本节点实际改变的字段。
     return {
-        **state,
-        "messages": [new_ai_msg],
+        "messages":            [new_ai_msg],
         "conversation_summary": new_summary,
-        "summary_turn_count": new_summary_turn_count,
+        "summary_turn_count":   new_summary_turn_count,
     }
 
 
@@ -1943,8 +2015,20 @@ AGENT_SYSTEM_PROMPTS: dict[str, str] = {
         "【最高优先级规则】\n"
         "1. 数据来源：消息中如果包含【数据】标记或 JSON 数组，它就是要分析的数据，直接使用。"
         "严禁调用 fetch_url、get_server_info 等工具去获取数据。\n"
-        "2. 禁止反问：严禁回复'请提供数据'，数据已在消息里。\n"
-        "3. 错误如实上报：工具不支持的操作（如 agg_func=median）必须直接告知用户"
+        "2. 无数据时的处理（★ 升级版）：\n"
+        "   a. 如果 description 里没有 JSON，但【运行时参数】里有前置任务的聚合结果文本\n"
+        "      （形如 'dept  budget_sum\\n  市场  65000\\n  研发  150000'），\n"
+        "      则把该文本解析为 JSON 数组后调用工具。\n"
+        "      解析方法：把空白分隔的表格文本转成 [{\"列名\": 值, ...}] 格式的 JSON。\n"
+        "      示例：'dept  salary_sum\\n  工程  49000\\n  设计  26000'\n"
+        "      → [{\"dept\": \"工程\", \"salary_sum\": 49000}, {\"dept\": \"设计\", \"salary_sum\": 26000}]\n"
+        "      解析后直接调用 dataframe_summary(records_json='[...]')。\n"
+        "   b. 如果 description 里有推算好的 JSON（Planner 预填的），优先用它，\n"
+        "      再检查【运行时参数】里的实际数据是否与之一致，以实际数据为准修正后调用工具。\n"
+        "   c. 如果既无 JSON 也无可解析的聚合文本，才回复：\n"
+        "      '❌ 请在同一条消息中提供需要分析的 JSON 数据，例如：[{\"col\":\"val\"}]'。\n"
+        "3. 禁止反问：除无数据提示外，严禁其他形式的'请提供数据'反问。\n"
+        "4. 错误如实上报：工具不支持的操作（如 agg_func=median）必须直接告知用户"
         "'❌ 不支持该操作，group_and_aggregate 仅支持 sum/mean/max/min/count'，"
         "严禁自行替换为其他聚合函数或绕过限制。\n\n"
         "【工具选择规则】\n"
@@ -1955,6 +2039,10 @@ AGENT_SYSTEM_PROMPTS: dict[str, str] = {
         "【调用示例】\n"
         "统计摘要：dataframe_summary(records_json='[{\"order_id\":\"A001\",\"amount\":120.5}]')\n"
         "分组聚合：group_and_aggregate(records_json='...', group_by=\"product\", agg_col=\"price\", agg_func=\"sum\")\n\n"
+        "【从运行时参数里构造 JSON 的示例】\n"
+        "运行时参数包含：grouped_data = 'dept  budget_sum\\n  市场  65000\\n  研发  150000'\n"
+        "→ 解析为：[{\"dept\": \"市场\", \"budget_sum\": 65000}, {\"dept\": \"研发\", \"budget_sum\": 150000}]\n"
+        "→ 调用：dataframe_summary(records_json='[{\"dept\":\"市场\",\"budget_sum\":65000},{\"dept\":\"研发\",\"budget_sum\":150000}]')\n\n"
         "任务要求几种操作就做几种，不要自行扩展。完成后给出简洁结论。"
     ),
     "http_agent": (
