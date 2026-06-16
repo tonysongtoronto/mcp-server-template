@@ -139,7 +139,7 @@ from dataclasses import dataclass, field
 #   checkpoint 保存的是整个 state。下次 invoke 恢复 state 后，
 #   新的 HumanMessage 需要"追加"到历史里，而不是"替换"历史。
 #   如果不加 add_messages，每次对话都会把之前的消息全部清空。
-from typing import Any, Optional, TypedDict, Annotated
+from typing import Any, TypedDict, Annotated
 from langgraph.graph.message import add_messages   # ← 新增
 
 from dotenv import load_dotenv
@@ -175,7 +175,6 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.client.sse import sse_client
 from mcp import StdioServerParameters
 from pathlib import Path
-from pydantic import create_model
 
 _dotenv_path = Path(__file__).parent.parent / ".env"
 load_dotenv(str(_dotenv_path), override=False)
@@ -698,15 +697,38 @@ async def _stop_mcp_sessions() -> None:
 # 6. 工具加载
 # ══════════════════════════════════════════════════════
 async def load_tools(session: ClientSession) -> list[StructuredTool]:
+    """
+    ★ 修复：args_schema 直接复用 MCP inputSchema（JSON Schema dict）
+    ──────────────────────────────────────────────────────────────
+    旧实现：通过 create_model() 把每个参数统一退化成 Any / Optional[Any]，
+            type / description / enum / items / default 等信息全部丢失，
+            模型在 function-calling 阶段拿不到参数的真实类型和说明，
+            容易"乱猜"参数（例如把数组传成字符串、编出不存在的枚举值）。
+
+    新实现：langchain-core >= 0.3.40 起，StructuredTool.args_schema
+            支持直接传入 JSON Schema dict（不再强制要求 pydantic BaseModel）。
+            这里把 MCP 返回的 inputSchema 原样（1:1）传给 args_schema，
+            bind_tools() 时会被原样转换成 OpenAI/DeepSeek 的
+            function-calling parameters，模型能看到与 MCP 完全一致的
+            type / description / enum / items / required 等约束。
+    """
     lc_tools: list[StructuredTool] = []
     for t in (await session.list_tools()).tools:
-        schema   = t.inputSchema or {}
-        required = set(schema.get("required", []))
-        fields   = {
-            name: (Any, ...) if name in required else (Optional[Any], None)
-            for name in schema.get("properties", {})
+        raw_schema: dict = t.inputSchema or {}
+
+        # 兜底：确保是一个合法的 object schema，即使 MCP 没给 inputSchema
+        # 或者 inputSchema 里缺 type/properties。
+        args_schema: dict = {
+            "type": raw_schema.get("type", "object"),
+            "properties": raw_schema.get("properties", {}),
+            "required": raw_schema.get("required", []),
         }
-        DynSchema = create_model(f"{t.name}_schema", **fields) if fields else None
+        # 透传其他字段（$defs / additionalProperties / title 等），
+        # 避免带 $ref 嵌套结构的复杂 schema 丢信息。
+        for k, v in raw_schema.items():
+            if k not in args_schema:
+                args_schema[k] = v
+
         tool_name = t.name
 
         async def _call(_name=tool_name, _sess=session, **kwargs) -> str:
@@ -718,7 +740,7 @@ async def load_tools(session: ClientSession) -> list[StructuredTool]:
 
         lc_tools.append(StructuredTool.from_function(
             coroutine=_call, name=t.name,
-            description=t.description or "", args_schema=DynSchema,
+            description=t.description or "", args_schema=args_schema,
         ))
 
     print(f"✅ 已加载 {len(lc_tools)} 个工具：{[t.name for t in lc_tools]}")
@@ -2155,355 +2177,155 @@ graph = build_graph()
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
 
-    BATCH_MODE = False  # True → 自动跑完 QUESTIONS；False → 交互式 CLI
+    BATCH_MODE = True  # True → 自动跑完 QUESTIONS；False → 交互式 CLI
 
  
     QUESTIONS = [
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组1】fetch_url — 单次请求
-    #
-    # 预期行为：
-    #   - 每题路由到 http_agent，调用 fetch_url
-    #   - 返回内容为纯文本格言（非 JSON）
-    #
-    # 关键验证点：
-    #   工具调用成功，返回 zen 格言原文
-    # ══════════════════════════════════════════════════════════════════
-    "访问 https://api.github.com/zen，把返回的内容原样告诉我",  # 轮1 → http_agent × 1
+        # ══════════════════════════════════════════════════════════════════
+        # 【组1】闲聊 + 身份建立（5 题）
+        #
+        # 预期行为：
+        #   - 每题只有 1 个 direct 任务，绝不路由到 db_agent / math_agent
+        #   - 第5轮提问时，Planner description 应出现"用户画像摘要"字样
+        #   - 摘要在第5轮结束时（10条消息）首次触发
+        #
+        # 关键验证点：
+        #   轮2 能复述轮1的信息（纯窗口记忆）
+        #   轮5 能回答轮3的职业（跨2轮，还在窗口内）
+        # ══════════════════════════════════════════════════════════════════
+        "你好！我叫 Lily，今年 30 岁，住在温哥华",          # 轮1  → direct × 1
+        "请复述一下我刚才告诉你的信息",                      # 轮2  → direct × 1，应答 Lily/30/温哥华
+        "我是一名 UI 设计师，主要用 Figma 和 Sketch",       # 轮3  → direct × 1
+        "我最近在学 Python，目标是转行做数据分析",           # 轮4  → direct × 1
+        "我的职业是什么？我在学什么？",                      # 轮5  → direct × 1，应答 UI设计师/Python/数据分析
+        #   ↑ 第5轮结束时（10条消息）触发首次摘要
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组2】fetch_url — 并行调用
-    #
-    # 预期行为：
-    #   - 两个 fetch_url 可并行执行（无依赖）
-    #   - Planner 拆成 2 个同层任务
-    #
-    # 关键验证点：
-    #   层0 两个 http_agent 真并行，各自返回内容
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "同时访问以下两个网址，把各自返回的内容都告诉我：\n"
-        "① https://api.github.com/zen\n"
-        "② https://httpbin.org/json"
-    ),  # 轮2 → http_agent × 2 并行
+        # ══════════════════════════════════════════════════════════════════
+        # 【组2】纯数学（4 题）
+        #
+        # 预期行为：
+        #   - 每题路由到 math_agent，工具调用可见（不是 LLM 猜）
+        #   - 轮7"刚才的结果"：Planner 从上一轮 AI 回复读到 1764，description 写 "1764-100"
+        #   - 轮8"再除以"：Planner 读到 1664，description 写 "1664÷4"
+        #   - 工具调用序列：subtract(1764,100) → 1664，division(1664,4) → 416
+        #
+        # 失败信号：description 出现"刚才的结果"而不是具体数值 → 修复X失效
+        # ══════════════════════════════════════════════════════════════════
+        "计算 42 × 42",                                      # 轮6  → math_agent，结果 1764
+        "刚才的结果减去 100",                                 # 轮7  → math_agent，subtract(1764,100)=1664
+        "再把上面的结果除以 4",                               # 轮8  → math_agent，division(1664,4)=416
+        "计算 sin(30°) 和 cos(60°)，各是多少？",             # 轮9  → math_agent × 2 或 1（取决于拆分）
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组3】fetch_url — 超时处理
-    #
-    # 预期行为：
-    #   - 调用 fetch_url(url, timeout=3.0)
-    #   - 返回超时错误提示 "❌ 请求超时"
-    #
-    # 关键验证点：
-    #   工具正确传递 timeout 参数，不崩溃
-    # ══════════════════════════════════════════════════════════════════
-    "访问 https://httpbin.org/delay/12，设置超时时间为 3 秒",  # 轮3 → http_agent × 1，预期超时
+        # ══════════════════════════════════════════════════════════════════
+        # 【组3】纯 DB 查询（5 题）
+        #
+        # 覆盖：单表筛选 / 多表 JOIN / 聚合排序 / 子查询 / NULL 处理
+        #
+        # 预期：每题 1 个 db_agent，Planner 不拆成多个 DB 子任务
+        # 失败信号：db_agent 调用 ask_db（被明确禁止）而不是 query_db
+        # ══════════════════════════════════════════════════════════════════
+        "查询所有来自 Vancouver 的活跃用户，显示姓名和邮箱",  # 轮10 → db_agent，WHERE city+status
+        "统计每个城市的用户数量，按数量从高到低排列",          # 轮11 → db_agent，GROUP BY + ORDER BY
+        "找出消费总额前 3 名的用户姓名和消费金额",             # 轮12 → db_agent，JOIN + SUM + LIMIT
+        "查询库存数量为 0 的商品名称和分类",                   # 轮13 → db_agent，JOIN products+categories，WHERE stock=0
+        "查询平均评分低于 3 分且评价数超过 1 条的商品",        # 轮14 → db_agent，HAVING
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组4】fetch_url — 错误处理（404）
-    #
-    # 预期行为：
-    #   - 调用 fetch_url 访问不存在的路径
-    #   - 返回 "❌ HTTP 404"
-    #
-    # 关键验证点：
-    #   错误被正确捕获并返回，不抛异常
-    # ══════════════════════════════════════════════════════════════════
-    "访问 https://httpbin.org/status/404，看看返回什么",  # 轮4 → http_agent × 1，预期 404 错误
+        # ══════════════════════════════════════════════════════════════════
+        # 【组4】纯文件操作（3 题）
+        #
+        # 预期：每题 1 个 file_agent
+        # 注意：write 之后 read，验证内容确实写入
+        # ══════════════════════════════════════════════════════════════════
+        (                                                      # 轮15 → file_agent
+            "在 File_Agent/demo/ 目录下创建文件 test_note.txt，"
+            "内容为：今天是测试日，Hello World！"
+        ),
+        "读取刚才创建的 File_Agent/demo/test_note.txt 文件，告诉我内容",  # 轮16 → file_agent，应读到上面写的内容
+        "列出 File_Agent/demo/ 目录下所有文件，显示文件名",    # 轮17 → file_agent，list_directory
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组5】fetch_url 串行依赖（轮6依赖轮5结果）
-    #
-    # 预期行为：
-    #   - 轮5：fetch_url → 获取 UUID
-    #   - 轮6：fetch_url → 获取 zen，然后拼接
-    #
-    # 关键验证点：
-    #   轮6 的 AI 回复应包含轮5 的 UUID 和轮6 的 zen 格言
-    # ══════════════════════════════════════════════════════════════════
-    "访问 https://httpbin.org/uuid，把返回的 UUID 记下来",  # 轮5 → http_agent × 1
-    (
-        "再次访问 https://api.github.com/zen 获取格言，"
-        "然后把这次获取的格言和上一轮获取的 UUID 拼接成："
-        "'UUID: xxx | 格言: xxx' 的格式告诉我"
-    ),  # 轮6 → http_agent × 1，需从轮5 AI回复中提取 UUID
+        # ══════════════════════════════════════════════════════════════════
+        # 【组5】HTTP 请求（1 题）
+        #
+        # 使用 api.github.com/zen，这个接口稳定、无需 token、返回一句英文格言
+        # 预期：1 个 http_agent，调用 fetch_url
+        # ══════════════════════════════════════════════════════════════════
+        "访问 https://api.github.com/zen，返回的是什么内容？",  # 轮18 → http_agent
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组6】post_json — 基础 POST
-    #
-    # 预期行为：
-    #   - 调用 post_json(url, payload)
-    #   - 返回 httpbin 回显的 JSON（含 data / json / origin 字段）
-    #
-    # 关键验证点：
-    #   工具调用成功，payload 被正确序列化
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "向 https://httpbin.org/post 发送 JSON：\n"
-        '{"name":"Alex","role":"tester","skills":["Python","MCP"]}\n'
-        "告诉我服务器返回了什么"
-    ),  # 轮7 → http_agent × 1，post_json
+        # ══════════════════════════════════════════════════════════════════
+        # 【组6】串行依赖链（DB → Math → File）（1 题）
+        #
+        # 预期分拆（3层串行）：
+        #   任务0  db_agent：查询 Montreal 的活跃用户总数
+        #   任务1  math_agent：用户数 × 500，depends_on=[0]
+        #   任务2  file_agent：把结果写入 File_Agent/demo/montreal_report.txt，depends_on=[1]
+        #
+        # 关键验证点：
+        #   - 层0→层1：math_agent 的 description 里应有具体数字（不是"查询结果"）
+        #   - 层1→层2：file_agent 写入的是计算后的数值
+        # ══════════════════════════════════════════════════════════════════
+        (                                                      # 轮19 → 3层串行
+            "请依次完成三步："
+            "① 查询 Montreal 的活跃用户总数；"
+            "② 把这个数字乘以 500；"
+            "③ 把最终结果写入 File_Agent/demo/montreal_report.txt"
+        ),
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组7】post_json — 串行 POST（依赖上一步）
-    #
-    # 预期行为：
-    #   - 先 post_json action=ping
-    #   - 再 post_json action=pong，携带上一步的 origin
-    #
-    # 关键验证点：
-    #   第二次 POST 的 payload 中包含第一次返回的 origin 字段值
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "依次完成两步：\n"
-        '① 向 https://httpbin.org/post 发送 {"action":"ping"}；\n'
-        '② 向 https://httpbin.org/post 发送 {"action":"pong","reply_to":"<上一步返回的origin>"}；\n'
-        "③ 把两次返回的 origin 字段值都告诉我"
-    ),  # 轮8 → http_agent × 2 串行，depends_on
+        # ══════════════════════════════════════════════════════════════════
+        # 【组7】复杂拓扑：并行 + 扇出 + 扇入（2 题）
+        #
+        # 题目A（扇入型）：两个独立 DB 查询 → 合并写文件
+        #   预期分拆（2层）：
+        #     层0  任务0 db_agent：查询最年轻的用户（无依赖）
+        #          任务1 db_agent：查询价格最高的商品（无依赖）
+        #     层1  任务2 file_agent：合并写入 File_Agent/demo/extremes.txt，depends_on=[0,1]
+        #   验证：层0 两个 db_agent 真并行，层1 等两个都完成后才写文件
+        #
+        # 题目B（扇出型）：一个 DB 查询 → 两个独立计算
+        #   预期分拆（2层）：
+        #     层0  任务0 db_agent：查询 Calgary 活跃用户数
+        #     层1  任务1 math_agent：用户数的平方，depends_on=[0]
+        #          任务2 math_agent：用户数 × 1000，depends_on=[0]
+        #   验证：层1 两个 math_agent 真并行
+        # ══════════════════════════════════════════════════════════════════
+        (                                                      # 轮20 → 扇入，层0并行×2 + 层1×1
+            "同时帮我查两件事，然后合并写文件：\n"
+            "① 查询数据库中年龄最小的用户姓名和年龄；\n"
+            "② 查询价格最高的商品名称和价格；\n"
+            "③ 把两个结果合并写入 File_Agent/demo/extremes.txt，"
+            "格式：'最年轻用户：XXX(N岁)，最贵商品：YYY(¥ZZZ)'"
+        ),
+        (                                                      # 轮21 → 扇出，层0×1 + 层1并行×2
+            "先查询来自 Calgary 的活跃用户数量，"
+            "然后同时计算：① 这个数字的平方；② 这个数字乘以 1000"
+        ),
 
-    # ══════════════════════════════════════════════════════════════════
-    # 【组8】dataframe_summary — 基础统计
-    #
-    # 预期行为：
-    #   - 调用 dataframe_summary，传入 JSON 数组字符串
-    #   - 返回行数、列名、数值列 describe
-    #
-    # 关键验证点：
-    #   正确返回 age 和 score 的 mean/std/min/max 等统计值
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "对以下数据做统计摘要：\n"
-        '[{"name":"Alice","age":25,"score":88,"city":"Vancouver"},'
-        '{"name":"Bob","age":30,"score":76,"city":"Toronto"},'
-        '{"name":"Charlie","age":35,"score":92,"city":"Montreal"},'
-        '{"name":"Diana","age":28,"score":81,"city":"Vancouver"},'
-        '{"name":"Eve","age":22,"score":95,"city":"Toronto"}]'
-    ),  # 轮9 → data_agent × 1，dataframe_summary
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组9】dataframe_summary — 从统计结果中提取特定值
-    #
-    # 预期行为：
-    #   - dataframe_summary 返回 describe 表格
-    #   - AI 从表格中读出具体数值回答
-    #
-    # 关键验证点：
-    #   回答中 price 的 mean 和 stock 的 max 数值正确
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "对下面数据做 dataframe_summary，然后告诉我 price 列的平均值"
-        "和 stock 列的最大值分别是多少：\n"
-        '[{"product":"A","price":100,"stock":50,"rating":4.5},'
-        '{"product":"B","price":200,"stock":30,"rating":3.8},'
-        '{"product":"C","price":150,"stock":0,"rating":4.2},'
-        '{"product":"D","price":300,"stock":20,"rating":4.9},'
-        '{"product":"E","price":250,"stock":15,"rating":3.5}]'
-    ),  # 轮10 → data_agent × 1，需从 describe 提取 price.mean / stock.max
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组10】dataframe_summary — 两组数据并行对比
-    #
-    # 预期行为：
-    #   - 两个 dataframe_summary 并行执行
-    #   - AI 对比两组 value 的均值
-    #
-    # 关键验证点：
-    #   层0 两个 data_agent 真并行，结果正确对比
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "并行对以下两组数据分别做 dataframe_summary，然后告诉我"
-        "两组 value 列的均值各是多少，差异是多少：\n"
-        "第一组：[{\"name\":\"X\",\"value\":10},{\"name\":\"Y\",\"value\":20},{\"name\":\"Z\",\"value\":30}]\n"
-        "第二组：[{\"name\":\"X\",\"value\":15},{\"name\":\"Y\",\"value\":25},{\"name\":\"Z\",\"value\":35}]"
-    ),  # 轮11 → data_agent × 2 并行
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组11】group_and_aggregate — sum 聚合
-    #
-    # 预期行为：
-    #   - 调用 group_and_aggregate，group_by="department"，agg_col="salary"，agg_func="sum"
-    #   - 返回分组求和结果
-    #
-    # 关键验证点：
-    #   工程部 sum=49000，设计部 sum=26000
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "对下面数据按 department 分组，对 salary 求和：\n"
-        '[{"name":"张三","department":"工程","salary":15000},'
-        '{"name":"李四","department":"设计","salary":12000},'
-        '{"name":"王五","department":"工程","salary":18000},'
-        '{"name":"赵六","department":"设计","salary":14000},'
-        '{"name":"孙七","department":"工程","salary":16000}]'
-    ),  # 轮12 → data_agent × 1，group_and_aggregate(sum)
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组12】group_and_aggregate — 多种聚合函数并行
-    #
-    # 预期行为：
-    #   - 3 个 group_and_aggregate 并行执行
-    #   - 分别用 mean / max / count
-    #
-    # 关键验证点：
-    #   层0 三个 data_agent 真并行，结果互不干扰
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "对同一组数据（轮12的数据），并行做三个聚合：\n"
-        "① 按 department 分组，求 salary 的平均值（mean）；\n"
-        "② 按 department 分组，求 salary 的最大值（max）；\n"
-        "③ 按 department 分组，求人数（count）；\n"
-        "把三个结果都告诉我"
-    ),  # 轮13 → data_agent × 3 并行，mean/max/count
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组13】group_and_aggregate — 错误处理（非法聚合函数）
-    #
-    # 预期行为：
-    #   - 传入 agg_func="median"，不在允许列表
-    #   - 返回 "❌ agg_func 只支持：{...}"
-    #
-    # 关键验证点：
-    #   错误被正确捕获，提示合法函数列表
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "对下面数据按 city 分组，对 score 求中位数（median）：\n"
-        '[{"name":"A","city":"Vancouver","score":88},'
-        '{"name":"B","city":"Toronto","score":76},'
-        '{"name":"C","city":"Vancouver","score":92}]'
-    ),  # 轮14 → data_agent × 1，预期返回错误提示
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组14】group_and_aggregate — 按其他列分组
-    #
-    # 预期行为：
-    #   - group_by="city"，agg_col="age"，agg_func="mean"
-    #   - 正确返回 Vancouver 和 Toronto 的平均年龄
-    #
-    # 关键验证点：
-    #   工具参数灵活切换，非固定 department/salary
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "对下面数据按 city 分组，求 age 的平均值：\n"
-        '[{"name":"A","city":"Vancouver","age":25},'
-        '{"name":"B","city":"Toronto","age":30},'
-        '{"name":"C","city":"Vancouver","age":35},'
-        '{"name":"D","city":"Toronto","age":28},'
-        '{"name":"E","city":"Montreal","age":22}]'
-    ),  # 轮15 → data_agent × 1，group_and_aggregate(mean)
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组15】get_server_info — 基础调用
-    #
-    # 预期行为：
-    #   - 调用 get_server_info，返回平台和 Python 版本
-    #
-    # 关键验证点：
-    #   工具可正常调用，返回值包含 sys.platform 和 Python 版本
-    # ══════════════════════════════════════════════════════════════════
-    "调用 get_server_info，告诉我当前服务器信息",  # 轮16 → direct × 1，get_server_info
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组16】混合任务 — HTTP + 数据处理 串行
-    #
-    # 预期行为：
-    #   - 层0：fetch_url 获取 httpbin.org/json
-    #   - 层1：从返回的 JSON 中提取 slideshow.slides 数组，传给 dataframe_summary
-    #
-    # 关键验证点：
-    #   两层串行，dataframe_summary 的数据来自 fetch_url 的实际返回值
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "依次完成两步：\n"
-        "① 访问 https://httpbin.org/json 获取 JSON 数据；\n"
-        "② 从返回的 JSON 中找到 slideshow.slides 数组，把它传给"
-        "dataframe_summary 做统计摘要"
-    ),  # 轮17 → http_agent + data_agent 串行
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组17】混合任务 — 扇入型（HTTP + HTTP → 数据处理）
-    #
-    # 预期行为：
-    #   - 层0：fetch_url(uuid) + fetch_url(zen) 并行
-    #   - 层1：用 dataframe_summary 对拼装的数据做统计
-    #
-    # 关键验证点：
-    #   层0 两个 http_agent 真并行，层1 等待两者完成
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "并行访问 https://httpbin.org/uuid 和 https://api.github.com/zen，"
-        "然后把两个返回结果拼成一条 JSON 记录：\n"
-        '{"uuid":"<uuid结果>","zen":"<zen结果>","source":"mcp_test"}，'
-        "把这个 JSON 数组传给 dataframe_summary 做统计"
-    ),  # 轮18 → http_agent × 2 并行 + data_agent × 1 串行
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组18】混合任务 — 扇出型（HTTP → 数据处理 + 数据处理）
-    #
-    # 预期行为：
-    #   - 层0：post_json 发送数据到 httpbin
-    #   - 层1：对同一份原始数据并行做 dataframe_summary 和 group_and_aggregate
-    #
-    # 关键验证点：
-    #   层1 两个 data_agent 真并行，数据来源相同
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "先向 https://httpbin.org/post 发送下面这组数据：\n"
-        '[{"item":"apple","category":"fruit","price":5},'
-        '{"item":"banana","category":"fruit","price":3},'
-        '{"item":"carrot","category":"vegetable","price":2},'
-        '{"item":"durian","category":"fruit","price":15},'
-        '{"item":"eggplant","category":"vegetable","price":4}]\n'
-        "然后并行做两件事：① 对这组数据做 dataframe_summary；"
-        "② 按 category 分组对 price 求平均值（group_and_aggregate）"
-    ),  # 轮19 → http_agent × 1 + data_agent × 2 并行（扇出）
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组19】复杂串行链 — POST → 提取 → 聚合 → 统计
-    #
-    # 预期行为（4层串行）：
-    #   - 层0：post_json 发送原始数据
-    #   - 层1：从返回的 json 字段提取数据，group_and_aggregate
-    #   - 层2：对聚合结果做 dataframe_summary
-    #
-    # 关键验证点：
-    #   每一步依赖上一步的真实输出，不走捷径
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "按顺序完成以下三步：\n"
-        "① 向 https://httpbin.org/post 发送：\n"
-        '[{"dept":"研发","budget":50000},{"dept":"市场","budget":30000},'
-        '{"dept":"研发","budget":45000},{"dept":"市场","budget":35000},'
-        '{"dept":"研发","budget":55000}]\n'
-        "② 从返回的 json 字段中提取原始数据，按 dept 分组对 budget 求和；\n"
-        "③ 对求和结果做 dataframe_summary 统计摘要"
-    ),  # 轮20 → http_agent + data_agent(聚合) + data_agent(统计) 三层串行
-
-    # ══════════════════════════════════════════════════════════════════
-    # 【组20】全工具压力测试 — 4 工具串行依赖
-    #
-    # 预期行为（4层串行）：
-    #   - 层0：get_server_info 获取平台信息
-    #   - 层1：fetch_url 获取 zen 格言
-    #   - 层2：post_json 发送 server_info + zen 组合
-    #   - 层3：dataframe_summary 对前几步的元数据做统计
-    #
-    # 关键验证点：
-    #   覆盖全部 5 个工具中的 4 个，串行链完整
-    # ══════════════════════════════════════════════════════════════════
-    (
-        "按顺序完成以下全部步骤：\n"
-        "① 调用 get_server_info 获取服务器信息；\n"
-        "② 访问 https://api.github.com/zen 获取格言；\n"
-        "③ 向 https://httpbin.org/post 发送：\n"
-        '{"server":"<步骤①的结果>","zen":"<步骤②的结果>"}；\n'
-        "④ 对以下元数据做 dataframe_summary：\n"
-        '[{"step":1,"tool":"get_server_info","status":"done"},'
-        '{"step":2,"tool":"fetch_url","status":"done"},'
-        '{"step":3,"tool":"post_json","status":"done"},'
-        '{"step":4,"tool":"dataframe_summary","status":"running"}]'
-    ),  # 轮21 → 4种工具串行链
-
-]
+        # ══════════════════════════════════════════════════════════════════
+        # 【组8】长对话记忆压力测试（3 题）
+        #
+        # 此时已经经过 21 轮对话（42 条消息），摘要应已更新 4 次。
+        # 组1 建立的 Lily / 温哥华 / UI设计师 / Python 信息应仍在摘要中。
+        #
+        # 题目1：纯身份回忆（最早期信息，轮1告知，跨20轮）
+        #   预期：direct × 1，答出 Lily / 温哥华 / UI设计师
+        #   失败信号：回答"没有提供个人信息" → 摘要机制失效
+        #
+        # 题目2：身份 + 即时计算混合（验证摘要不干扰工具路由）
+        #   预期：direct × 1（身份部分） + math_agent × 1（计算部分）
+        #   或拆成 2 个任务：[0] math_agent，[1] direct（depends_on=[0] 可选）
+        #
+        # 题目3：全面身份回忆（4 项，压力最大）
+        #   预期：direct × 1，答出组1所有字段
+        # ══════════════════════════════════════════════════════════════════
+        "我叫什么名字？我住在哪个城市？",                     # 轮22 → direct，应答 Lily / 温哥华
+        (                                                      # 轮23 → math_agent + direct
+            "我的职业是什么？另外帮我计算一下：我的年龄（30岁）乘以 12 等于多少？"
+        ),
+        (                                                      # 轮24 → direct × 1，4 项全回忆
+            "现在综合告诉我：① 我叫什么名字？"
+            "② 我住在哪里？③ 我的职业是什么？④ 我在学什么技能？"
+        ),
+    ]
 
     # ★ 修复Z（核心 Checkpoint 修复）：invoke 时只传当前轮的新消息
     #
