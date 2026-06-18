@@ -700,10 +700,6 @@ async def load_tools(session: ClientSession) -> list[StructuredTool]:
     """
     ★ 修复：args_schema 直接复用 MCP inputSchema（JSON Schema dict）
     ──────────────────────────────────────────────────────────────
-    旧实现：通过 create_model() 把每个参数统一退化成 Any / Optional[Any]，
-            type / description / enum / items / default 等信息全部丢失，
-            模型在 function-calling 阶段拿不到参数的真实类型和说明，
-            容易"乱猜"参数（例如把数组传成字符串、编出不存在的枚举值）。
 
     新实现：langchain-core >= 0.3.40 起，StructuredTool.args_schema
             支持直接传入 JSON Schema dict（不再强制要求 pydantic BaseModel）。
@@ -1212,16 +1208,48 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
     await _ensure_registry()
 
     msgs = state.get("messages", [])
+    
+    # ── 修复：messages 为空 → 生成错误消息任务，而不是直接 FINISH ──
     if not msgs:
-        return {"next_agent": "FINISH", "task_plan": []}
+        error_task: Task = {
+            "task_id": 0,
+            "description": "向用户说明未收到任何消息",
+            "agent": "direct",
+            "inputs": {},
+            "depends_on": [],
+            "status": "done",   # ← done 状态让 parallel_executor 跳过执行
+            "result": "您好，我没有收到您的消息，请重新提问。",
+            "_resolved_description": "",
+        }
+        return {
+            "next_agent": "",          # ← 不为 "FINISH"，路由到 parallel_executor
+            "task_plan": [error_task],
+            "current_task_id": 0,
+        }
 
     # 取最后一条 HumanMessage 作为当前问题
     last_human_msg = next(
         (m for m in reversed(msgs) if isinstance(m, HumanMessage)),
         None
     )
+    
+    # ── 修复：没有 HumanMessage → 生成错误消息任务，而不是直接 FINISH ──
     if not last_human_msg:
-        return {"next_agent": "FINISH", "task_plan": []}
+        error_task: Task = {
+            "task_id": 0,
+            "description": "向用户说明未找到有效问题",
+            "agent": "direct",
+            "inputs": {},
+            "depends_on": [],
+            "status": "done",
+            "result": "抱歉，我没有理解您的问题，请重新描述。",
+            "_resolved_description": "",
+        }
+        return {
+            "next_agent": "",
+            "task_plan": [error_task],
+            "current_task_id": 0,
+        }
 
     user_msg = _get_message_content(last_human_msg)
     print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
@@ -1234,20 +1262,6 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
         print(f"    [{i}] {mtype}: {content}")
 
     # ★ 修复X（升级版）：Planner 注入摘要 + 上一轮 AI 回复
-    #
-    # 原方案只注入"最近一条 AIMessage"，仅能解决跨轮数值引用问题。
-    # 但对于"我叫什么名字？"这类问题，若早期信息已滑出窗口，
-    # Planner 看不到用户曾说"我叫Tony"，就会把它路由到 db_agent 查数据库。
-    #
-    # 新方案：同时注入两层上下文：
-    #   层1 - conversation_summary（用户画像摘要）：
-    #     "用户叫Tony，住多伦多，后端工程师，喜欢篮球..."
-    #     Planner 看到这条，就知道"我叫什么名字"是闲聊，答案已在摘要里，→ direct
-    #     不会再误路由到 db_agent。这自然解决了问题1，无需硬规则。
-    #   层2 - 上一轮 AI 回复（跨轮数值引用）：
-    #     "上一轮回复：56"
-    #     Planner 知道"刚才的结果=56"，description 可以写"56+4"，
-    #     math_agent 拿到具体数值正确调工具。
     last_ai_context = ""
 
     # 层1：摘要注入
@@ -1280,27 +1294,16 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
     last_raw_output: str = ""
 
     # ★ STORE 改动5/5（续）：从 Memory Store 读取全局记忆
-    #
-    # 读取逻辑：
-    #   - 命名空间 ("system",)：管理员预置的全局知识（公司信息、业务规则等）
-    #   - 命名空间 ("user", thread_id)：跨会话的用户级持久信息（VIP标签、偏好等）
-    #
-    # 与 conversation_summary 的区别：
-    #   conversation_summary → 从本会话对话历史提取，thread 隔离
-    #   store_context        → 来自 Memory Store，跨所有 thread 共享
-    #
-    # 异步兼容：InMemoryStore 用 .search()，AsyncSqliteStore 用 await .asearch()
     store_context = ""
     if store:
         try:
-            # 读取系统全局记忆（("system",) 命名空间）
             if hasattr(store, "asearch"):
                 system_results = await store.asearch(("system",))
             else:
                 system_results = store.search(("system",))
     
             thread_id = (config or {}).get("configurable", {}).get("thread_id", "")
-            if thread_id :
+            if thread_id:
                  if hasattr(store, "asearch"):
                     user_results = await store.asearch(("user", thread_id))
                  else:
@@ -1331,7 +1334,6 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
 
     for attempt in range(max_retries):
         try:
-            # Planner system prompt = 基础 + 摘要/上轮上下文 + Store 全局记忆
             planner_system_with_context = _planner_system() + last_ai_context + store_context
 
             invoke_msgs: list = [
@@ -1400,13 +1402,6 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
             break
 
         except Exception as e:
-            # ★ 修复：每次循环都用最新报错更新 retry_feedback，
-            #   原逻辑 `if not retry_feedback` 只记录第一次错误，
-            #   第2次循环时 LLM 看到的仍是旧报错，无法针对性修正。
-            #
-            #   注意：校验路径（raise ValueError(retry_feedback)）里
-            #   str(e) 就是 retry_feedback 本身，直接用 str(e) 统一处理，
-            #   无需区分两条路径。
             retry_feedback = (
                 f"上次输出问题：{e}\n"
                 f"你的原始输出（前300字）：{last_raw_output[:300]}\n"
@@ -1415,8 +1410,7 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
             print(f"  ⚠️ Planner 第 {attempt+1} 次失败：{e}")
             if attempt == max_retries - 1:
                 print("  ❌ Planner 全部失败，将向用户报告错误")
-                # ★ 修复：Planner 全部失败时路由到 final_answer，让用户收到错误说明
-                # 而不是静默跳到 END（原来用 FINISH 直接跳过 final_answer）
+                # ★ 修复：Planner 全部失败时生成错误消息任务
                 error_task: Task = {
                     "task_id": 0,
                     "description": "向用户说明任务规划失败，请用户重新描述需求",
@@ -1430,16 +1424,14 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                 return {
                     "task_plan":       [error_task],
                     "current_task_id": 0,
-                    "next_agent":      "",
+                    "next_agent":      "",   # ← 路由到 parallel_executor
                 }
 
     return {
         "task_plan":       task_plan,
         "current_task_id": task_plan[0]["task_id"] if task_plan else 0,
-        "next_agent":      "",
+        "next_agent":      "",   # ← 路由到 parallel_executor
     }
-
-
 # ══════════════════════════════════════════════════════
 # 8. 并行调度核心
 # ══════════════════════════════════════════════════════
@@ -1832,18 +1824,27 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
 
         # ── 将结果写回 task_plan ───────────────────────────────────────
         result_map: dict[int, str] = {}
+        success_ids: set[int] = set()   # 记录真正成功的 task_id
         for r in raw_results:
             if isinstance(r, BaseException):
                 print(f"  ❌ [gather] 某任务抛出未捕获异常：{r}")
+                # 异常已经在 _exec_one 里被改为 "failed" 了，这里保持即可
             else:
                 task_id, result = r
                 result_map[task_id] = result
+                success_ids.add(task_id)
 
         for task in layer:
-            task["status"] = "done"
-            task["result"] = result_map.get(task["task_id"], "（执行异常，无结果）")
-            done_count += 1
-            print(f"  ✔ 任务[{task['task_id']}] 完成：{task['result'][:60]}")
+            if task["task_id"] in success_ids:
+                task["status"] = "done"
+                task["result"] = result_map[task["task_id"]]
+                done_count += 1   # ← 新增这一行
+            else:
+                # ★ 关键修复：保留 _exec_one 里设置的 "failed" 状态，不改写！
+                # task["status"] 已经是 "failed"（在 _exec_one 的 except 里设置的）
+                # 只需确保 result 有值即可（_exec_one 里可能还没来得及设置 result）
+                if task.get("result", "") == "":
+                    task["result"] = "（执行异常，无结果）"
 
         layer_elapsed = time.perf_counter() - t_layer_start
         print(f"◀ [层 {layer_idx}] 全部完成，耗时 {layer_elapsed:.2f}s，"
