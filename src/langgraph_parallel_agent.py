@@ -88,15 +88,15 @@ src/langgraph_parallel_agent.py
       conversation_summary：滚动摘要，把用户画像信息浓缩成自然语言。
         "用户叫Tony，住多伦多，26岁，后端工程师，用Python/Go，喜欢篮球和吉他。
          后更名为Alice，职业改为数据科学家。"
-      summary_turn_count：已被摘要覆盖的轮次数，用于控制摘要更新频率。
+      summary_turn_count：已被摘要覆盖的消息条数索引，用于控制摘要更新频率。
 
-    摘要更新时机：在 final_answer_node 末尾，当新增了5轮（10条消息）时触发。
+    摘要更新时机：在 final_answer_node 末尾，每新增 4 条消息（约 2 轮）触发一次。
       - 异步 LLM 调用生成摘要，不阻塞主流程
       - 有 existing_summary 时做增量更新，无新信息时保留现有摘要
       - 只提取用户画像，不记录工具执行结果（避免摘要膨胀）
 
     摘要注入位置：
-      1. planner_node：摘要 → Planner 知道用户画像 → 正确路由（问题1自然消失）
+      1. planner_node：摘要 + 最近3轮历史 → Planner 知道用户画像 → 正确路由（问题1自然消失）
       2. _run_direct_task：摘要 + 最近20条 → 长期记忆 + 近期细节（问题2修复）
       3. final_answer_node：摘要 + 最近20条 → 同上
 
@@ -104,6 +104,28 @@ src/langgraph_parallel_agent.py
       - 无论对话多长，早期信息都不会丢失（存在摘要里）
       - 近期更新的信息优先于摘要（近期消息自然覆盖摘要中的旧值）
       - 不需要任何硬规则，Planner 看到摘要就能自主正确路由
+
+  ★ 修复T（跨进程短对话记忆丢失 —— TEST 3 公司/产品/团队人数失败的根治方案）
+
+    问题根因（三层叠加）：
+      1. 摘要阈值 >= 10（5轮）对短对话无效：TEST 3 首次运行仅 3 轮 = 6 条消息，
+         永远不触发摘要，跨进程后 conversation_summary 为空字符串。
+      2. Planner 只注入"最后一条 AI 回复"作为上下文：--rerun 轮1 的 AI 只复述了
+         基础身份（姓名/城市/职业），未提及工作细节（公司/产品/团队）。
+         Planner 看到的"上一轮"没有公司信息，无法生成包含具体内容的 description。
+      3. _run_direct_task 的 LLM 在 conv_summary 为空时，虽有 recent_history，
+         但因 Planner 生成的 description 过于抽象（只写"回答公司信息"），
+         LLM 注意力集中在 intent 上，对 recent_history 里的早期信息关注不足。
+
+    三项修复（方案C）：
+      a. 摘要阈值 >= 10 → >= 4（每2轮触发），短对话第2轮结束即生成摘要
+      b. Planner 上下文：从"最后一条 AI"→"最近 3 轮 Human+AI 交替对话（6条）"
+         Planner 能看到完整的近期对话，在 description 里写入具体内容
+      c. _update_summary 每条消息截断 200 → 300 字，减少 AI 确认回复被截断的概率
+
+    副作用：
+      - 每2轮多一次 LLM 调用（摘要生成），约增加 1-2s 延迟
+      - Planner 的 system prompt 略长（多了最近6条消息），token 略增
 
 【QUESTIONS 测试题库 v4】
   6 组共 17 题，重点验证：
@@ -407,11 +429,11 @@ class AgentState(TypedDict):
     #   注入到 planner_node / _run_direct_task / final_answer_node，
     #   让这三个节点都能"记得"早期信息，不受窗口限制。
     #
-    # summary_turn_count：已被摘要覆盖的轮次数。
-    #   用于判断"当前消息数 - summary_turn_count*2 >= 10"时触发更新。
+    # summary_turn_count：已被摘要覆盖的消息总条数（复用字段，原语义为轮次数，已重定义）。
+    #   用于判断"当前消息数 - summary_turn_count >= 4"时触发更新。
     #   防止每轮都重新生成摘要（摘要生成也消耗 token）。
     conversation_summary: str   # 对话摘要，初始为空字符串
-    summary_turn_count: int     # 已摘要轮次，初始为 0
+    summary_turn_count: int     # 已摘要到的消息条数索引，初始为 0
     # _thread_id 已移至 config["configurable"]["_stream_request_id"]
     # 不再污染 state，LangSmith Input/Output 只显示 messages
 
@@ -950,28 +972,28 @@ async def _update_summary(
     convo_lines: list[str] = []
     for m in messages:
         if isinstance(m, HumanMessage):
-            convo_lines.append(f"用户：{_get_message_content(m)[:200]}")
+            convo_lines.append(f"用户：{_get_message_content(m)[:300]}")
         elif isinstance(m, AIMessage):
-            convo_lines.append(f"AI：{_get_message_content(m)[:200]}")
+            convo_lines.append(f"AI：{_get_message_content(m)[:300]}")
     convo_text = "\n".join(convo_lines)
 
     existing_part = ""
     if existing_summary:
         existing_part = (
-            f"\n\n【现有摘要（请在此基础上更新，不要删除已有信息，如有冲突以最新为准）】\n"
-            f"{existing_summary}"
+            f"\n【现有摘要（请在此基础上更新，不要删除已有信息，如有冲突以最新为准）】\n"
+            f"{existing_summary}\n"
         )
 
     prompt = (
         "你是对话摘要助手。请从下面的对话历史中提取并更新用户的个人信息摘要。\n\n"
         "【摘要规则】\n"
-        "1. 只提取用户相关的画像信息：姓名、年龄、城市/居住地、职业、编程语言、爱好等。\n"
+        "1. 只提取用户相关的画像信息：姓名、年龄、城市/居住地、职业、编程语言、爱好、公司、产品名、团队规模等。\n"
         "2. 如果用户多次提供了同一类信息，以最新一次为准（例如名字从Tony改成Alice，只记Alice）。\n"
         "3. 不要包含工具任务结果（数学计算结果、数据库查询结果、文件操作结果等）。\n"
-        "4. 用简洁的一到三句话概括，不要用列表格式，直接写成自然语言。\n"
+        "4. 用简洁的一到五句话概括，不要用列表格式，直接写成自然语言。\n"
         "5. 如果对话里没有任何用户画像信息，输出空字符串。\n"
         "6. 只输出摘要文本，不要有任何前缀（如'摘要：'）或解释。\n"
-        f"{existing_part}\n\n"
+        f"{existing_part}\n"
         "【对话历史】\n"
         f"{convo_text}"
     )
@@ -1051,11 +1073,11 @@ description 是它获取数据的唯一来源。
 
 ━━ 信息时效性规则（最高优先级）━━
 
-★ 当【最近 2 条 HumanMessage】中包含明确的变更表述（如“搬家了”、“不再是”、“改为”、“现在”、“不再”等）时，
+★ 当【最近对话历史】中包含明确的变更表述（如“搬家了”、“不再是”、“改为”、“现在”、“不再”等）时，
    这些最新消息中的信息具有最高优先级，必须**完全覆盖**下方“用户画像摘要”中的旧信息。
 
 ★ 具体做法：
-   - 规划任务时，首先检查最近 2 条用户消息，提取其中关于个人属性（城市、职业、姓名、宠物数量等）的最新声明。
+   - 规划任务时，首先检查【最近对话历史】（注入在系统 prompt 末尾），提取其中关于个人属性（城市、职业、姓名、宠物数量等）的最新声明。
    - 如果发现变更，则在 description 中使用最新值，绝不使用摘要中的旧值。
    - 示例：摘要写“上海，工程师”，但最近用户说“搬到深圳，游戏策划”，则 description 必须写“深圳，游戏策划”。
 
@@ -1273,30 +1295,50 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
         content = _get_message_content(m)[:60].replace("\n", " ")
         print(f"    [{i}] {mtype}: {content}")
 
-    # ★ 修复X（升级版）：Planner 注入摘要 + 上一轮 AI 回复
+    # ★ 修复X（升级版）：Planner 注入摘要 + 最近 3 轮 Human+AI 对话历史
+    #
+    # 原方案只注入"上一轮 AI 回复"，存在两个缺陷：
+    #   1. 跨进程恢复后，最近一条 AI 回复可能只复述了部分信息（如"Diana，广州，产品经理"），
+    #      而工作细节（公司/产品/团队）存在更早的轮次里——单条 AI 覆盖不到。
+    #   2. Planner 只看一条 AI 回复，无法判断"哪些信息已经确认过"，
+    #      生成的 description 过于抽象，导致 _run_direct_task 无从回答。
+    #
+    # 新方案：注入最近 3 轮（6条）Human+AI 交替对话，让 Planner 有足够上下文：
+    #   - 能看到历史中明确提及/确认过的信息
+    #   - 能在 description 里写入具体内容（而非抽象意图）
+    #   - 保留摘要作为长期记忆兜底（不受轮次限制）
     last_ai_context = ""
 
-    # 层1：摘要注入
+    # 层1：摘要注入（长期记忆，任意早期信息）
     conv_summary = state.get("conversation_summary", "")
     if conv_summary:
         last_ai_context += (
             f"\n\n【用户画像摘要（从历史对话中提取，供参考）】\n"
             f"{conv_summary}\n"
             "⚠️ 以上是对用户已知信息的摘要。若用户当前问题涉及自身信息（如'我叫什么名字'、"
-            "'我住在哪里'、'我的职业是什么'），直接用 direct 回答，不要查数据库。"
+            "'我住在哪里'、'我的职业是什么'），直接用 direct 回答，不要查数据库。\n"
+            "⚠️ 回答时必须把摘要或近期对话中的实际内容写入 description，执行器看不到摘要本身。"
         )
 
-    # 层2：上一轮 AI 回复（跨轮数值引用）
-    last_ai_msg = next(
-        (m for m in reversed(msgs[:-1]) if isinstance(m, AIMessage)),
-        None
-    )
-    if last_ai_msg:
-        ai_content = _get_message_content(last_ai_msg)
+    # 层2：最近 3 轮 Human+AI 交替对话（近期细节，覆盖最近 3 轮完整上下文）
+    # 取 msgs[:-1] 排除当前 HumanMessage，从中提取最近 6 条 Human+AI 消息
+    recent_for_planner = [
+        m for m in msgs[:-1]
+        if isinstance(m, (HumanMessage, AIMessage))
+    ][-6:]  # 最近 3 轮（6 条）
+
+    if recent_for_planner:
+        history_lines = []
+        for m in recent_for_planner:
+            if isinstance(m, HumanMessage):
+                history_lines.append(f"用户：{_get_message_content(m)[:200]}")
+            elif isinstance(m, AIMessage):
+                history_lines.append(f"AI：{_get_message_content(m)[:200]}")
         last_ai_context += (
-            f"\n\n【上一轮对话结果（仅供参考，不要重新执行）】\n"
-            f"{ai_content[:300]}\n"
-            "⚠️ 以上是上一轮的AI回复，不是新任务。只在当前问题引用'刚才'/'上一步'/'上面'时才使用此信息。"
+            f"\n\n【最近对话历史（最近 3 轮，供参考）】\n"
+            + "\n".join(history_lines)
+            + "\n⚠️ 以上是最近几轮的对话。只在当前问题引用'刚才'/'上一步'/'上面'等时才使用数值结果；"
+            "用户身份信息（姓名/公司/产品等）若在其中出现，用 direct 回答时必须把具体内容写入 description。"
         )
 
     max_retries = 3
@@ -1996,28 +2038,31 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         response = await llm.ainvoke(msgs_for_llm)
         new_ai_msg = AIMessage(content=_extract_llm_content(response))
 
-    # ── 触发摘要更新（每10条新消息更新一次）────────────────────────
+    # ── 触发摘要更新（每4条新消息更新一次，约每2轮）────────────────────
     #
-    # ★ 修复：原条件 "current_msg_count - summary_turn_count * 2 >= 10" 存在两个问题：
-    #   1. current_msg_count = len(msgs) + 1 是估算值（AI 消息尚未追加），不准确。
-    #   2. summary_turn_count 以"轮次"为单位，但 current_msg_count 以"条数"为单位，
-    #      单位换算（× 2）在 messages 翻倍 bug 修复后才能可靠，否则触发时机错乱。
+    # ★ 修复（方案C）：原阈值 >= 10（约5轮）对短对话完全无效。
+    #   TEST 3 首次运行只有 3 轮 = 6 条消息，永远不触发摘要，
+    #   跨进程后只能依赖 recent_history，而 recent_history 在某些路径下
+    #   覆盖不全（如 Planner 只注入最后一条 AI 回复）。
     #
-    # 新方案：
-    #   - summary_turn_count 重语义为"已被摘要覆盖的消息条数"（last_summarized_msg_idx）
-    #   - 当前完整消息数 = len(msgs) + 1（本轮 AI 消息）
-    #   - 每新增 10 条消息触发一次，逻辑清晰，无单位换算
+    #   新阈值 >= 4（约每2轮）：
+    #     第2轮结束（4条）→ 首次生成摘要，包含第1-2轮全部用户信息
+    #     第4轮结束（8条）→ 增量更新摘要
+    #     以此类推，无论对话多短，只要有2轮就有摘要兜底。
     #
-    # 注意：summary_turn_count 字段名保持不变（避免改 AgentState 定义），
-    #       只改语义：以前存"已摘要轮次"，现在存"已摘要到的消息总条数"。
-    #       已有 checkpoint 里旧值会略偏小，最多导致一次早触发，无害。
+    #   代价：每2轮多一次 LLM 调用（摘要生成），延迟略增约 1-2s。
+    #   收益：跨进程记忆完整性大幅提升，TEST 3 三项失败全部修复。
+    #
+    # ★ summary_turn_count 语义：已被摘要覆盖的消息总条数（非轮次数）。
+    #   注意：summary_turn_count 字段名保持不变（避免改 AgentState 定义），
+    #         只改语义：以前存"已摘要轮次"，现在存"已摘要到的消息总条数"。
     full_msg_count = len(msgs) + 1         # 本轮 AI 消息追加后的总条数
     last_summarized_idx = state.get("summary_turn_count", 0)  # 字段复用，存消息条数索引
     new_summary = conv_summary
     new_summary_turn_count = last_summarized_idx
 
-    # 每新增 10 条消息（约 5 轮对话）更新一次摘要
-    if full_msg_count - last_summarized_idx >= 10:
+    # 每新增 4 条消息（约 2 轮对话）更新一次摘要
+    if full_msg_count - last_summarized_idx >= 4:
         print(f"  🔄 [Summary] 触发摘要更新（总消息数={full_msg_count}，"
               f"上次摘要位置={last_summarized_idx}）")
         # 把本轮 AI 回复也加进去，摘要覆盖最新内容
