@@ -480,7 +480,10 @@ async def list_sessions(user_id: str) -> SessionListResponse:
                 "ORDER BY last_rowid DESC",
             )
         else:
-            like_prefix = uid.replace("%", r"\%").replace("_", r"\_") + _SEP
+            escaped_sep = _SEP.replace("_", r"\_")  # 结果为 "\\_\\_"（字符串字面量）
+
+            like_prefix = uid.replace("%", r"\%").replace("_", r"\_") + escaped_sep
+
             cursor = await cp.conn.execute(
                 "SELECT thread_id, MAX(rowid) as last_rowid "
                 "FROM checkpoints "
@@ -488,7 +491,7 @@ async def list_sessions(user_id: str) -> SessionListResponse:
                 "GROUP BY thread_id "
                 "ORDER BY last_rowid DESC",
                 (f"{like_prefix}%",),
-            )
+              )
         rows = await cursor.fetchall()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"查询会话列表失败：{exc}") from exc
