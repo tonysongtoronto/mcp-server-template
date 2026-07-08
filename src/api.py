@@ -57,6 +57,23 @@ api.py  ——  LangGraph Parallel Agent 的 FastAPI 后台服务
   自定义：设置环境变量 CHECKPOINT_DB=/path/to/your.db
 """
 
+import sys
+
+# ──────────────────────────────────────────────────────────────────────
+# Windows 编码兜底：当本进程的 stdout/stderr 被重定向到文件而不是连接到
+# 控制台时（例如被测试脚本 / systemd / Docker 当作子进程启动，stdout 重定向
+# 进日志文件），Python 不会沿用控制台的 UTF-8 代码页，而是退回到系统 ANSI
+# 代码页（cp1252 / cp936 等）。本文件里大量 print() 用了 emoji，一旦被这种
+# 方式启动就会在 lifespan 里直接 UnicodeEncodeError 崩溃、应用根本起不来。
+# 这里强制把标准输出/错误流统一成 UTF-8，且遇到无法编码的字符用 replace
+# 而不是抛异常，保证不管以什么方式拉起本服务都不会被这个问题绊倒。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 import asyncio
 import time
 import uuid
