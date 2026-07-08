@@ -1072,6 +1072,13 @@ class ChaosProcessManager:
         env = os.environ.copy()
         env["CHECKPOINT_DB"] = str(self.db_dir / "checkpoints.db")
         env["STORE_DB"]      = str(self.db_dir / "memory_store.db")
+        # Windows 下子进程 stdout 一旦被重定向到文件（而不是控制台），Python
+        # 会退回系统 ANSI 代码页（cp1252/cp936）而不是 UTF-8，被测应用里只要
+        # 有一个 print() 带 emoji 就会在 lifespan 阶段直接 UnicodeEncodeError
+        # 崩掉、子进程秒退。强制指定 PYTHONIOENCODING / PYTHONUTF8，让子进程
+        # 解释器不再依赖系统区域设置去猜编码。
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
 
         cmd = [
             sys.executable, "-m", "uvicorn", self.app_module,
@@ -1545,13 +1552,19 @@ def test_9_db_integrity_audit(db_path: str) -> None:
 # 汇总报告
 # ══════════════════════════════════════════════
 
-def print_summary(mode: str, elapsed: float, api_url: str) -> int:
+def print_summary(mode: str, elapsed: float, api_url: str, aborted: bool = False) -> int:
     total  = len(_results)
     passed = sum(1 for r in _results if r["passed"])
     failed = total - passed
 
     print(f"\n{'═' * 60}")
-    print(f"  测试汇总：{passed}/{total} 通过   {'🎉 全部通过！' if failed == 0 else f'❌ {failed} 项失败'}")
+    if aborted:
+        # 中途异常中止：哪怕断言一条没跑（total=0, failed=0），也绝不能跟
+        # "全部通过"共用一套文案——0/0 trivially 满足 failed==0，但实际上
+        # 是因为子进程没起来 / 提前崩溃，根本没执行到断言，是失败而不是通过。
+        print(f"  测试汇总：{passed}/{total} 通过   ⛔ 异常中止，未完整执行（详见上方报错）")
+    else:
+        print(f"  测试汇总：{passed}/{total} 通过   {'🎉 全部通过！' if failed == 0 else f'❌ {failed} 项失败'}")
     print(f"{'═' * 60}")
 
     if failed > 0:
@@ -1574,7 +1587,9 @@ def print_summary(mode: str, elapsed: float, api_url: str) -> int:
             "total":      total,
             "passed":     passed,
             "failed":     failed,
-            "all_passed": failed == 0,
+            "aborted":    aborted,
+            # 中止时一律视为未通过，不再让 0/0 这种"平凡情况"伪装成 all_passed=true。
+            "all_passed": (failed == 0) and not aborted,
         },
         "summary": _results,
         "events":  _log,
@@ -1583,7 +1598,7 @@ def print_summary(mode: str, elapsed: float, api_url: str) -> int:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n  📄 测试报告已保存：{report_path.name}")
 
-    return failed
+    return failed if not aborted else max(failed, 1)
 
 
 # ══════════════════════════════════════════════
@@ -1787,7 +1802,7 @@ def main() -> None:
         print(f"\n❌ 意外错误（已运行 {elapsed}s）：{msg}")
         print(traceback.format_exc())
         _emit("abort", error=msg, elapsed_s=elapsed)
-        print_summary(mode=mode, elapsed=elapsed, api_url=BASE_URL)
+        print_summary(mode=mode, elapsed=elapsed, api_url=BASE_URL, aborted=True)
         sys.exit(1)
 
     elapsed = round(time.time() - start, 1)
