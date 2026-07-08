@@ -900,6 +900,44 @@ def _get_message_content(msg: Any) -> str:
     return str(msg)
 
 
+def _drop_orphan_human_messages(msgs: list) -> list:
+    """
+    过滤掉"孤儿 HumanMessage"——即从未收到过对应 AI 回复的用户消息。
+
+    典型成因：graph 在处理某条 HumanMessage 的过程中被中断（例如进程被
+    SIGKILL、或客户端断开导致服务端 invoke 半途夭折）。这条消息本身在
+    LangGraph 的 __start__ 阶段就已经作为 checkpoint 落盘了，但对应的
+    AIMessage 永远不会生成——它会以"孤儿"的形态永久留在这个 thread 的
+    历史里。
+
+    危害：如果不过滤，下游给 planner / direct_answer / final_answer 这些
+    节点组装 prompt 时，会拼出"HumanMessage 后面紧跟着另一条 HumanMessage、
+    中间没有任何 AI 回复"这种在正常多轮对话里不会出现的异常结构。这种
+    结构容易让 LLM 误判——即使 system prompt 里已经明确写了"只回答当前
+    这一个子任务"，模型仍可能被更靠前、内容更具体的孤儿消息带偏，生成
+    文不对题的长篇回答，同时白白拖慢响应速度（实测中一次简单的身份确认
+    问题因此被拖到 29~32 秒）。
+
+    规则：一条 HumanMessage 被判定为"孤儿"，当且仅当消息列表里紧跟在它
+    后面的下一条消息仍然是 HumanMessage（说明它从未等到 AI 回复）。
+    必须传入包含"当前这一轮"在内的完整消息列表调用本函数（不要预先
+    切掉最后一条），这样列表中真正的最后一条消息才不会被误判——它后面
+    没有更晚的消息，天然不满足"下一条也是 HumanMessage"的孤儿判定条件。
+    调用方如果只需要"历史部分"，应该在过滤完成后再自行排除最后一条。
+    """
+    filtered: list = []
+    n = len(msgs)
+    for i, m in enumerate(msgs):
+        if isinstance(m, HumanMessage):
+            nxt = msgs[i + 1] if i + 1 < n else None
+            if isinstance(nxt, HumanMessage):
+                # 孤儿消息：紧接着的下一条依然是 HumanMessage，
+                # 说明它从未被任何 AI 回复覆盖过，丢弃、不进入下游 prompt。
+                continue
+        filtered.append(m)
+    return filtered
+
+
 # ══════════════════════════════════════════════════════
 # 6b. Memory Store 辅助函数（实验 & 管理用）
 # ══════════════════════════════════════════════════════
@@ -1321,9 +1359,14 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
         )
 
     # 层2：最近 3 轮 Human+AI 交替对话（近期细节，覆盖最近 3 轮完整上下文）
-    # 取 msgs[:-1] 排除当前 HumanMessage，从中提取最近 6 条 Human+AI 消息
+    # ★ 修复"孤儿消息污染"：先对完整 msgs（含当前这一轮）做孤儿过滤，
+    #   再排除当前 HumanMessage、截取最近 6 条 Human+AI 消息。
+    #   顺序不能颠倒——必须在孤儿过滤时让"当前这轮问题"仍然可见，
+    #   这样孤儿判定（"下一条是不是还是 HumanMessage"）才能正确识别
+    #   出那些被中断、从未得到 AI 回复的历史消息。
+    _cleaned_msgs = _drop_orphan_human_messages(msgs)
     recent_for_planner = [
-        m for m in msgs[:-1]
+        m for m in _cleaned_msgs[:-1]
         if isinstance(m, (HumanMessage, AIMessage))
     ][-6:]  # 最近 3 轮（6 条）
 
@@ -1712,8 +1755,17 @@ async def _run_direct_task(task: Task, state: AgentState) -> str:
             f"【对话摘要（用户画像，供参考）】\n{conv_summary}\n\n"
         )
 
+    # ★ 修复"孤儿消息污染"：这里是实测中真正触发 bug 的地方——
+    #   过滤前，msgs[:-1] 里可能混入一条从未被回答的孤儿 HumanMessage，
+    #   紧跟着 HumanMessage(content=intent) 这条任务描述，形成"连续两条
+    #   Human 消息中间没有 AI 回复"的异常结构，导致模型即使被 system
+    #   prompt 明确要求"只回答当前子任务"，仍会被内容更具体的孤儿消息
+    #   带偏，生成文不对题的长篇回答（实测：本该回答"你叫什么名字"，
+    #   却生成了一整篇跟当前问题无关的技术方案，白白耗费 25~27 秒）。
+    #   先对完整 msgs 做孤儿过滤，再排除当前任务、截取最近 20 条。
+    _cleaned_msgs = _drop_orphan_human_messages(msgs)
     recent_history: list = [
-        m for m in msgs[:-1]
+        m for m in _cleaned_msgs[:-1]
         if isinstance(m, (HumanMessage, AIMessage))
     ][-20:]  # 窗口从10扩大到20（约10轮对话）
 
@@ -1726,7 +1778,10 @@ async def _run_direct_task(task: Task, state: AgentState) -> str:
             "1. 如果对话历史中用户多次提供了姓名/职业/地点等信息，以最新一次为准。\n"
             "2. 如果对话历史中 AI 已经确认过某个信息（如职业、姓名），直接采用该确认结论。\n"
             "3. 对话摘要提供了用户的基础画像，近期对话历史中有更新时以最新为准。\n"
-            "4. 只回答子任务要求的内容，不要主动补充与子任务无关的信息。"
+            "4. 只回答子任务要求的内容，不要主动补充与子任务无关的信息。\n"
+            "5. 下方历史中如果出现某条用户消息，其后没有任何 AI 回复紧跟着，"
+            "视为系统尚未处理完的残留消息，完全忽略其内容，绝不能把它当作"
+            "当前要回答的问题。"
         )),
         *recent_history,
         HumanMessage(content=intent),
@@ -1977,8 +2032,13 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
     #   两者结合：近期对话中的新信息自然覆盖摘要里的旧信息
     #
     # 窗口从10扩大到20：
+    # ★ 修复"孤儿消息污染"：与 _run_direct_task 同样的原因，final_answer
+    #   节点也会读取最近历史来汇总回答。虽然实测两次都靠这里的 system
+    #   prompt（"只回答用户当前这一轮的问题"）把跑题内容兜底过滤掉了，
+    #   但那只是运气好，不该依赖兜底——这里同样要在源头把孤儿消息摘除。
+    _cleaned_msgs = _drop_orphan_human_messages(msgs)
     recent_history: list = [
-        m for m in msgs[:-1]
+        m for m in _cleaned_msgs[:-1]
         if isinstance(m, (HumanMessage, AIMessage))
     ][-20:]  # 窗口从10扩大到20
 
