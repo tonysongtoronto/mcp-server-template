@@ -208,7 +208,7 @@ if sys.platform == "win32":
 # 1. LLM
 # ══════════════════════════════════════════════════════
 llm = ChatOpenAI(
-    model="deepseek-chat",
+    model="deepseek-v4-flash",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
     temperature=0,

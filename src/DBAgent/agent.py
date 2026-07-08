@@ -36,7 +36,7 @@ def _get_llm():
     if _llm is None:
         from langchain_openai import ChatOpenAI
         _llm = ChatOpenAI(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com",
             temperature=0,

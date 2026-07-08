@@ -55,7 +55,7 @@ KEYWORD_THRESHOLD  = 0.6           # 关键词命中率阈值
 # Judge 模型（语义评估用）
 # ══════════════════════════════════════════════════════════════════════════════
 judge_llm = ChatOpenAI(
-    model    = "deepseek-chat",
+    model    = "deepseek-v4-flash",
     api_key  = os.getenv("DEEPSEEK_API_KEY"),
     base_url = "https://api.deepseek.com",
     temperature = 0,

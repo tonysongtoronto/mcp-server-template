@@ -18,7 +18,7 @@ async def test_connection():
     try:
         # 发送一个简单的聊天请求
         response = await client.chat.completions.create(
-            model="deepseek-chat",  # DeepSeek 模型名称：deepseek-chat 或 deepseek-coder     
+            model="deepseek-v4-flash",  # DeepSeek 模型名称：deepseek-v4-flash 或 deepseek-coder     
             messages=[
                 {"role": "system", "content": "你是一个专业的AI助手。"},
                 {"role": "user", "content": "如果你收到了这条消息，请回复：' 连接正常'。"}
