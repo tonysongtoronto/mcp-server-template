@@ -128,11 +128,12 @@ class MemoryListResponse(BaseModel):
     items: dict = Field(..., description="当前所有全局记忆 {key: value}")
 
 class HealthResponse(BaseModel):
-    status:         str       = Field(..., description="ok / degraded / initializing")
-    tool_count:     int       = Field(..., description="已加载的 MCP 工具数量")
-    agents:         list[str] = Field(..., description="已注册的 Agent 列表")
-    uptime_seconds: float     = Field(..., description="服务运行时间（秒）")
-    checkpoint_db:  str       = Field(..., description="SQLite 数据库文件路径")
+    status:            str       = Field(..., description="ok / degraded / initializing")
+    tool_count:        int       = Field(..., description="已加载的 MCP 工具数量")
+    agents:            list[str] = Field(..., description="已注册的 Agent 列表")
+    agent_desc_block:  str       = Field(..., description="Agent 列表的可读描述文本（含各 Agent 对应工具映射，末尾附 direct 选项，用于 Prompt 拼接）")
+    uptime_seconds:    float     = Field(..., description="服务运行时间（秒）")
+    checkpoint_db:     str       = Field(..., description="SQLite 数据库文件路径")
 
 # ══════════════════════════════════════════════════════
 # 2. 应用生命周期
@@ -437,6 +438,7 @@ async def chat_stream(
 @app.get("/health", response_model=HealthResponse, summary="健康检查")
 async def health() -> HealthResponse:
     agents     = agent_module._registry.agents
+    agent_desc_block     = agent_module._registry.agent_desc_block
     tool_count = len(agent_module._tools)
     status     = "ok" if tool_count >= 4 else ("initializing" if tool_count == 0 else "degraded")
 
@@ -444,6 +446,7 @@ async def health() -> HealthResponse:
         status         = status,
         tool_count     = tool_count,
         agents         = agents,
+        agent_desc_block =agent_desc_block ,
         uptime_seconds = round(time.time() - _start_time, 1),
         checkpoint_db  = agent_module._CHECKPOINT_DB,
     )

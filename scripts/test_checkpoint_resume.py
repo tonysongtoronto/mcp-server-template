@@ -1374,6 +1374,7 @@ def test_8_kill9_mid_execution(app_module: str, kill_delay: float, app_cwd: str 
                  user_id=uid, thread_id=tid, base_url=mgr.base_url)
         show_answer(r)
         mc_before = r.get("message_count", 0)
+        duration_baseline_ms = r.get("duration_ms", 0) or 0
         info("等待 1 秒确保第 1 步的 checkpoint 已完全落盘")
         time.sleep(1)
 
@@ -1446,6 +1447,45 @@ def test_8_kill9_mid_execution(app_module: str, kill_delay: float, app_cwd: str 
             mc_after >= mc_before,
             "TEST_8：图执行中被强杀后，消息数未发生回退（至少不低于打断前的基准）",
             detail=f"打断前基准={mc_before}, 重启后={mc_after}",
+        )
+
+        # ── 黑盒验证 (a2)：孤儿消息污染回归检测 ───────────────────────
+        # 背景：被 kill 打断的 slow_question 大概率会作为一条"从未被
+        # AI 回复过"的孤儿 HumanMessage 留在历史里。以下两个信号都是
+        # 直接从黑盒 API 响应里观测到的，不依赖任何存储引擎实现细节。
+        #
+        # 信号1：耗时是否异常膨胀。turn3 只是一个"我叫什么名字"级别的
+        # 简单身份确认问题，正常耗时应该和 turn1 建立身份时同一量级；
+        # 如果孤儿消息把 direct_answer / final_answer 带偏去处理另一个
+        # 无关的复杂问题，耗时会成倍暴涨（实测中从 ~5s 膨胀到 ~30s）。
+        # 阈值取"基准的 4 倍，且至少 15 秒"，兼顾正常 LLM 耗时波动与
+        # bug 触发时的数量级差异，避免在耗时抖动下产生误报。
+        duration_turn3_ms = r.get("duration_ms", 0) or 0
+        if duration_baseline_ms > 0:
+            duration_limit_ms = max(duration_baseline_ms * 4, 15000)
+            assert_true(
+                duration_turn3_ms <= duration_limit_ms,
+                "TEST_8：重启后的简单追问未出现异常耗时膨胀（未被孤儿消息污染执行）",
+                detail=(
+                    f"turn1基准={duration_baseline_ms:.0f}ms, "
+                    f"turn3={duration_turn3_ms:.0f}ms, "
+                    f"允许上限={duration_limit_ms:.0f}ms"
+                ),
+            )
+        else:
+            info("turn1 未返回有效 duration_ms，跳过耗时膨胀检测")
+
+        # 信号2：回答内容是否泄漏了孤儿消息（slow_question）该有的答案。
+        # slow_question 问的是"推荐系统离线评估方案"，如果 turn3 对"我叫
+        # 什么名字"这个问题的回答里混入了这些术语，说明孤儿消息内容
+        # 确实污染进了最终答案，而不只是内部浪费了算力。
+        _leak_keywords = ["召回阶段", "排序阶段", "重排阶段", "NDCG", "GAUC",
+                          "实验对照设计", "AUC", "MRR", "Recall@"]
+        _leaked = [kw for kw in _leak_keywords if kw in a]
+        assert_true(
+            not _leaked,
+            "TEST_8：重启后的简单追问回答未混入孤儿消息（推荐系统评估方案）的无关内容",
+            detail=f"命中的泄漏关键词={_leaked}" if _leaked else "",
         )
 
         step(4, "【黑盒】验证服务在'最难的中断点'之后仍能正常处理新请求")
