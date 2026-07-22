@@ -985,26 +985,65 @@ async def store_delete(key: str, namespace: tuple = ("system",)) -> bool:
 # 7. 对话摘要生成（解决长对话记忆丢失）
 # ══════════════════════════════════════════════════════
 
+def _load_summary_dict(raw: str) -> dict:
+    """
+    把 state 里 conversation_summary 字段（JSON 字符串）解析成 dict。
+
+    向后兼容：如果读到的是旧版本留下的自然语言纯文本（无法 json.loads），
+    不丢弃它，包装成 {"历史摘要（旧版）": 原文本} 放进新结构里，
+    后续新字段会正常追加，不会因为格式升级丢失旧数据。
+    """
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"历史摘要（旧版）": raw}
+
+
+def _dump_summary_dict(data: dict) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _summary_dict_to_text(data: dict) -> str:
+    """把结构化摘要字段渲染成自然语言，供注入 planner / direct_task / final_answer 的 prompt。"""
+    if not data:
+        return ""
+    return "；".join(f"{k}：{v}" for k, v in data.items())
+
+
 async def _update_summary(
     messages: list,
     existing_summary: str,
 ) -> str:
     """
-    生成/更新对话摘要（滚动摘要策略）。
+    生成/更新对话摘要（结构化增量更新策略）。
 
-    设计原则：
-      - 摘要只关注"用户画像信息"：姓名、年龄、城市、职业、爱好、编程语言等。
-      - 若用户多次更新了同一信息，摘要只保留最新版本（例如 Tony→Alice）。
-      - 工具任务结果（数学计算、DB 查询等）不进入摘要，避免摘要膨胀。
-      - 现有摘要作为基础，只对新增信息做增量更新。
+    ★ 修复"摘要自噬"（信息随轮次增加反而越来越少）：
+      旧方案每次都让 LLM 把"现有摘要 + 全部历史"压缩成固定的
+      "一到五句话"，随着用户画像字段增多（姓名/城市/职业/项目/习惯/搭档……），
+      这个句数上限会强迫模型主动丢弃信息——句数限制和信息量增长天然矛盾，
+      是信息蒸发的直接原因，而不是"小模型压缩能力不足"。
+
+      新方案：LLM 只负责"从本次新增对话里提取增量字段"，输出一个
+      JSON 补丁（只包含本轮新出现/发生变化的字段），
+      合并（dict.update）这一步交给代码而不是 LLM——
+      代码合并是确定性的：旧字段永远保留，除非补丁里出现了同名 key 才会被覆盖，
+      彻底消除"LLM 重写时顺手漏掉几条"的可能性。
 
     参数：
       messages        - 完整消息列表（Human + AI 交替）
-      existing_summary - 上一次的摘要（可为空字符串）
+      existing_summary - 上一次的摘要（JSON 字符串，可为空字符串；
+                          也兼容旧版本留下的纯文本，见 _load_summary_dict）
 
     返回：
-      更新后的摘要字符串
+      更新后的摘要（JSON 字符串，dict 形式）
     """
+    existing_dict = _load_summary_dict(existing_summary)
+
     # 把消息列表格式化成对话文本，供 LLM 读取
     # 只取 Human + AI 交替消息（过滤掉 System / Tool 等）
     convo_lines: list[str] = []
@@ -1015,38 +1054,53 @@ async def _update_summary(
             convo_lines.append(f"AI：{_get_message_content(m)[:300]}")
     convo_text = "\n".join(convo_lines)
 
-    existing_part = ""
-    if existing_summary:
-        existing_part = (
-            f"\n【现有摘要（请在此基础上更新，不要删除已有信息，如有冲突以最新为准）】\n"
-            f"{existing_summary}\n"
-        )
+    existing_keys_hint = (
+        "、".join(existing_dict.keys()) if existing_dict else "（目前为空，本次是首次提取）"
+    )
 
     prompt = (
-        "你是对话摘要助手。请从下面的对话历史中提取并更新用户的个人信息摘要。\n\n"
-        "【摘要规则】\n"
-        "1. 只提取用户相关的画像信息：姓名、年龄、城市/居住地、职业、编程语言、爱好、公司、产品名、团队规模等。\n"
-        "2. 如果用户多次提供了同一类信息，以最新一次为准（例如名字从Tony改成Alice，只记Alice）。\n"
-        "3. 不要包含工具任务结果（数学计算结果、数据库查询结果、文件操作结果等）。\n"
-        "4. 用简洁的一到五句话概括，不要用列表格式，直接写成自然语言。\n"
-        "5. 如果对话里没有任何用户画像信息，输出空字符串。\n"
-        "6. 只输出摘要文本，不要有任何前缀（如'摘要：'）或解释。\n"
-        f"{existing_part}\n"
-        "【对话历史】\n"
+        "你是对话信息提取助手。请从下面【新增对话内容】里提取用户的个人画像信息更新，"
+        "只输出一个 JSON 对象（增量补丁），不要输出完整摘要。\n\n"
+        "【规则】\n"
+        "1. 只输出一个 JSON 对象，不要 markdown 代码块标记，不要任何解释性文字。\n"
+        "2. key 是信息类别（中文短词），value 是该类别对应的最新值（字符串）。\n"
+        "3. 只输出本次对话中新出现的信息，或发生了变化需要更新的信息；"
+        "没有变化、之前已经提取过的字段【不要】重复输出（代码会自动保留旧字段，"
+        "重复输出不会有额外好处，反而增加你漏掉真正新信息的风险）。\n"
+        "4. 如果同一类别信息在【现有字段】里已经存在对应的 key，请复用完全相同的 key 名，"
+        "不要为同一个概念新造近义词 key（比如已有'城市'就不要再造'居住地'/'所在城市'）。\n"
+        "5. 常见类别命名参考（可按需使用未列出的类别，但同一概念务必保持 key 名一致）：\n"
+        "   姓名、年龄、城市、职业、公司、产品名称、团队规模、编程语言、爱好、宠物、\n"
+        "   饮食习惯、作息习惯、搭档信息、项目进度、其他。\n"
+        "6. 不要包含工具任务结果（数学计算结果、数据库查询结果、文件操作结果等），"
+        "那些不是用户画像信息。\n"
+        "7. 如果本次对话里没有任何新的或变化的用户画像信息，输出空对象 {}。\n\n"
+        f"【现有字段（供参考，同类信息请复用这些 key 名）】\n{existing_keys_hint}\n\n"
+        "【新增对话内容】\n"
         f"{convo_text}"
     )
 
     try:
         response = await llm.ainvoke([HumanMessage(content=prompt)])
-        summary = _extract_llm_content(response).strip()
-        # 防止模型输出"空字符串"字面量或其他无效内容
-        if summary in ("空字符串", "无", "无信息", "（无）", ""):
-            return existing_summary  # 无新信息，保留现有摘要
-        print(f"  📝 [Summary] 摘要已更新：{summary[:100]}")
-        return summary
+        raw = _extract_llm_content(response).strip()
+        # 防御性清理：万一模型还是套了代码块标记
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+        patch = json.loads(raw) if raw else {}
+        if not isinstance(patch, dict):
+            raise ValueError(f"提取结果不是 JSON 对象：{raw[:100]}")
     except Exception as e:
-        print(f"  ⚠️ [Summary] 摘要生成失败：{e}，保留现有摘要")
-        return existing_summary
+        print(f"  ⚠️ [Summary] 增量提取失败：{e}，保留现有摘要不变")
+        return _dump_summary_dict(existing_dict)
+
+    if not patch:
+        print("  📝 [Summary] 本轮无新增/变更字段，摘要保持不变")
+        return _dump_summary_dict(existing_dict)
+
+    merged = dict(existing_dict)
+    merged.update(patch)  # 只有补丁里出现的 key 才会被覆盖，其余旧字段原样保留
+    print(f"  📝 [Summary] 摘要字段已更新：新增/变更 {list(patch.keys())}，"
+          f"当前共 {len(merged)} 个字段")
+    return _dump_summary_dict(merged)
 
 
 # ══════════════════════════════════════════════════════
@@ -1348,7 +1402,8 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
     last_ai_context = ""
 
     # 层1：摘要注入（长期记忆，任意早期信息）
-    conv_summary = state.get("conversation_summary", "")
+    # ★ conversation_summary 现在存的是 JSON 字符串（结构化字段），渲染成可读文本再用
+    conv_summary = _summary_dict_to_text(_load_summary_dict(state.get("conversation_summary", "")))
     if conv_summary:
         last_ai_context += (
             f"\n\n【用户画像摘要（从历史对话中提取，供参考）】\n"
@@ -1748,7 +1803,8 @@ async def _run_direct_task(task: Task, state: AgentState) -> str:
     msgs = state.get("messages", [])
 
     # 构建"摘要前缀"：如果有摘要，作为系统上下文的补充
-    conv_summary = state.get("conversation_summary", "")
+    # ★ conversation_summary 是 JSON 字符串，渲染成可读文本再用
+    conv_summary = _summary_dict_to_text(_load_summary_dict(state.get("conversation_summary", "")))
     summary_prefix = ""
     if conv_summary:
         summary_prefix = (
@@ -2016,11 +2072,14 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
     )
 
     # ── 构建"摘要前缀"────────────────────────────────────────────────
+    # ★ conversation_summary 是 JSON 字符串：conv_summary 保留原始字符串
+    #   （后面 _update_summary 合并要用），conv_summary_text 只用于渲染显示
     conv_summary = state.get("conversation_summary", "")
+    conv_summary_text = _summary_dict_to_text(_load_summary_dict(conv_summary))
     summary_prefix = ""
-    if conv_summary:
+    if conv_summary_text:
         summary_prefix = (
-            f"【对话摘要（用户画像，早期对话的精华提取）】\n{conv_summary}\n\n"
+            f"【对话摘要（用户画像，早期对话的精华提取）】\n{conv_summary_text}\n\n"
         )
 
     # ── 构建对话历史上下文（交替 HumanMessage + AIMessage）────────────

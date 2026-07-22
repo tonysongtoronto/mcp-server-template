@@ -290,6 +290,37 @@ async def _get_checkpoint_message_count(config: dict) -> int:
     return 0
 
 
+# ── 会话级并发锁：同一个 thread_id 的请求必须排队执行 ────────────────
+#
+# 背景（实测踩过的坑）：
+#   /chat/stream 用 asyncio.create_task 后台跑 graph.ainvoke，SSE 流的
+#   [DONE] 信号只代表"回答文本已经吐完"，不代表 checkpoint 已经落盘
+#   （final_answer_node 在吐完文本之后还要做摘要更新，然后才 return 触发
+#   LangGraph 落 checkpoint）。如果客户端一看到 [DONE] 就立刻发下一轮
+#   请求，两次 graph.ainvoke() 会各自基于同一个"旧 checkpoint 快照"起步，
+#   谁的写入落盘晚，谁的结果就会把另一轮的 AI 消息/摘要更新整体覆盖掉
+#   ——表现为多轮对话里某几轮的回复和摘要更新无声消失。
+#
+#   下面这把锁 + 修复过的 [DONE] 发送时机（见 chat_stream）双管齐下：
+#   - [DONE] 改到 invoke_task 真正跑完（checkpoint 已落盘）之后再发，
+#     从根上避免客户端"看到 DONE 就抢跑"。
+#   - 这把锁作为兜底：即使客户端没等 DONE、或未来某个调用路径又绕过了
+#     这个时序（比如重试逻辑、多个前端标签页并发发同一个 thread_id），
+#     也能物理上保证同一个 thread_id 不会有两个 ainvoke 同时在跑。
+#
+# 注意：这是进程内锁，只对单个 uvicorn worker 有效——这也是本文件顶部
+# 强调"必须 workers=1（SQLite 不支持多进程并发写）"的原因，天然满足前提。
+_thread_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_thread_lock(internal_tid: str) -> asyncio.Lock:
+    lock = _thread_locks.get(internal_tid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_locks[internal_tid] = lock
+    return lock
+
+
 # ══════════════════════════════════════════════════════
 # 4. 核心接口：POST /chat（普通对话）
 # ══════════════════════════════════════════════════════
@@ -318,17 +349,19 @@ async def chat(req: ChatRequest) -> ChatResponse:
     config       = {"configurable": {"thread_id": internal_tid}}
 
     start_ms = time.time()
-    try:
-        result = await agent_module.graph.ainvoke(
-            {"messages": [HumanMessage(content=req.question)]},
-            config=config,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Agent 执行失败：{exc}") from exc
+    # ★ 同一个 thread_id 排队执行，避免和另一个并发请求互相踩 checkpoint
+    async with _get_thread_lock(internal_tid):
+        try:
+            result = await agent_module.graph.ainvoke(
+                {"messages": [HumanMessage(content=req.question)]},
+                config=config,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Agent 执行失败：{exc}") from exc
 
-    answer    = agent_module._get_message_content(result["messages"][-1])
-    duration  = (time.time() - start_ms) * 1000
-    msg_count = await _get_checkpoint_message_count(config)
+        answer    = agent_module._get_message_content(result["messages"][-1])
+        duration  = (time.time() - start_ms) * 1000
+        msg_count = await _get_checkpoint_message_count(config)
 
     return ChatResponse(
         answer        = answer,
@@ -388,25 +421,42 @@ async def chat_stream(
         q: asyncio.Queue = asyncio.Queue()
         agent_module._stream_queues[request_id] = q
 
-        invoke_task = asyncio.create_task(
-            agent_module.graph.ainvoke(
-                # ★ 修复3：state 只传 messages，去掉 _thread_id
-                {"messages": [HumanMessage(content=question)]},
-                config=config,
-            )
-        )
+        # ★ 同一个 thread_id 排队执行，避免和另一个并发请求互相踩 checkpoint
+        lock = _get_thread_lock(internal_tid)
+        lock_acquired = False
 
         try:
+            await lock.acquire()
+            lock_acquired = True
+
+            invoke_task = asyncio.create_task(
+                agent_module.graph.ainvoke(
+                    # ★ 修复3：state 只传 messages，去掉 _thread_id
+                    {"messages": [HumanMessage(content=question)]},
+                    config=config,
+                )
+            )
+
             while True:
                 try:
                     token = await asyncio.wait_for(q.get(), timeout=120.0)
                 except asyncio.TimeoutError:
                     yield "data: [ERROR] 等待超时（120s）\n\n"
                     invoke_task.cancel()
-                    break
+                    return
 
                 if token is None:
-                    yield f"data: [DONE:{raw_tid}]\n\n"
+                    # ★ 修复"[DONE] 提前于 checkpoint 落盘"的竞态：
+                    #   token=None 只代表 final_answer_node 里 llm.astream()
+                    #   把回答文本吐完了，但摘要更新 + checkpoint 落盘是在这之后
+                    #   才做的（还没 return，图还没跑完）。旧代码在这里立刻
+                    #   yield [DONE]，客户端一看到 DONE 就可能立刻发下一轮，
+                    #   下一轮的 ainvoke 会读到"AI回复还没写进去、摘要还没更新"
+                    #   的旧 checkpoint 快照，两轮各自基于旧快照往前推，谁后
+                    #   写盘谁生效，中间这一轮的结果就被无声覆盖丢失。
+                    #   现在改成：先等 invoke_task 真正跑完（图 return、
+                    #   checkpoint 已落盘），再 yield [DONE]，让 [DONE]
+                    #   真正代表"这一轮已经彻底结束，可以放心发下一轮"。
                     break
 
                 safe_token = str(token).replace("\n", " ")
@@ -416,8 +466,13 @@ async def chat_stream(
                 await invoke_task
             except Exception as exc:
                 yield f"data: [ERROR] {exc}\n\n"
+                return
+
+            yield f"data: [DONE:{raw_tid}]\n\n"
         finally:
             agent_module._stream_queues.pop(request_id, None)  # 兜底清理
+            if lock_acquired:
+                lock.release()
 
     return StreamingResponse(
         generate(),
