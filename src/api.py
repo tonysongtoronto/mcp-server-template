@@ -78,7 +78,7 @@ import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -121,11 +121,14 @@ class SessionListResponse(BaseModel):
     sessions: list[SessionInfo] = Field(..., description="该用户名下的所有会话，按更新时间倒序")
 
 class MemoryItem(BaseModel):
-    key:   str = Field(..., description="记忆键名")
-    value: str = Field(..., description="记忆内容（字符串）")
+    key:       str                       = Field(..., description="记忆键名")
+    value:     str                       = Field(..., description="记忆内容（字符串）")
+    namespace: Literal["system", "user"] = Field("system", description="记忆命名空间：system=全局共享，user=按 user_id 隔离共享")
+    user_id:   str | None                = Field(None, description="namespace='user' 时必填，标识这条记忆属于哪个用户（跨该用户所有会话共享）")
 
 class MemoryListResponse(BaseModel):
-    items: dict = Field(..., description="当前所有全局记忆 {key: value}")
+    system: dict = Field(..., description="system 命名空间下的全局记忆 {key: value}")
+    user:   dict = Field(..., description="user 命名空间下的记忆，按 user_id 分组：{user_id: {key: value}}")
 
 class HealthResponse(BaseModel):
     status:            str       = Field(..., description="ok / degraded / initializing")
@@ -346,7 +349,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
     user_id      = _normalize_user_id(req.user_id)
     internal_tid = _make_internal_thread_id(user_id, req.thread_id)
     _, raw_tid   = _split_internal_thread_id(internal_tid)
-    config       = {"configurable": {"thread_id": internal_tid}}
+    # ★ 显式传 user_id，供 planner 节点读取 Memory Store 的 user 命名空间
+    #   （("user", user_id)，跨该用户所有会话共享）；不依赖从 thread_id 反解析。
+    config       = {"configurable": {"thread_id": internal_tid, "user_id": user_id}}
 
     start_ms = time.time()
     # ★ 同一个 thread_id 排队执行，避免和另一个并发请求互相踩 checkpoint
@@ -415,7 +420,8 @@ async def chat_stream(
     # ★ 修复2：_stream_request_id 走 configurable（侧信道），不污染 state
     #   final_answer_node 从 config["configurable"]["_stream_request_id"] 读 queue key
     #   state 只含 messages → LangSmith Input/Output 显示正常问题内容
-    config        = {"configurable": {"thread_id": internal_tid, "_stream_request_id": request_id}}
+    # ★ 同上：补传 user_id，供 planner 节点读取 Memory Store 的 user 命名空间
+    config        = {"configurable": {"thread_id": internal_tid, "user_id": resolved_uid, "_stream_request_id": request_id}}
 
     async def generate() -> AsyncGenerator[str, None]:
         q: asyncio.Queue = asyncio.Queue()
@@ -666,25 +672,55 @@ async def clear_session_for_user(user_id: str, thread_id: str) -> dict:
     "/memory",
     response_model=MemoryListResponse,
     summary="列出全局记忆",
-    description="返回 AsyncSqliteStore 里所有记忆。数据持久化在 SQLite，重启后仍然保留。",
+    description=(
+        "返回 AsyncSqliteStore 里所有记忆，按命名空间拆成两块：\n\n"
+        "- `system`：全局共享，所有用户所有会话都能读到。\n"
+        "- `user`：按 user_id 分组，`{user_id: {key: value}}`，同一用户的所有会话共享，"
+        "不同用户互相隔离。\n\n"
+        "数据持久化在 SQLite，重启后仍然保留。"
+    ),
 )
 async def list_memory() -> MemoryListResponse:
-    items = await agent_module.store_list()
-    return MemoryListResponse(items=items)
+    system_items = await agent_module.store_list(("system",))
+    user_grouped_raw = await agent_module.store_list_by_namespace(("user",))
+    # user_grouped_raw 的 key 是完整 namespace 元组 ("user", "<user_id>")，
+    # 拍平成 {user_id: {key: value}} 给前端用
+    user_items = {ns[1]: kv for ns, kv in user_grouped_raw.items() if len(ns) >= 2}
+    return MemoryListResponse(system=system_items, user=user_items)
 
 
 @app.post("/memory", summary="写入全局记忆")
 async def put_memory(item: MemoryItem) -> dict:
-    await agent_module.store_put(item.key, item.value)
-    return {"success": True, "key": item.key, "value": item.value}
+    if item.namespace == "user":
+        uid = _normalize_user_id(item.user_id or "")
+        if not item.user_id or not item.user_id.strip():
+            raise HTTPException(status_code=400, detail="写入 user 命名空间必须提供 user_id")
+        namespace = ("user", uid)
+    else:
+        uid = None
+        namespace = ("system",)
+
+    await agent_module.store_put(item.key, item.value, namespace=namespace)
+    return {"success": True, "key": item.key, "value": item.value, "namespace": item.namespace, "user_id": uid}
 
 
 @app.delete("/memory/{key}", summary="删除全局记忆")
-async def delete_memory(key: str) -> dict:
-    success = await agent_module.store_delete(key)
+async def delete_memory(
+    key:       str,
+    namespace: Literal["system", "user"] = Query("system", description="要删除的命名空间"),
+    user_id:   str | None                = Query(None, description="namespace='user' 时必填"),
+) -> dict:
+    if namespace == "user":
+        if not user_id or not user_id.strip():
+            raise HTTPException(status_code=400, detail="删除 user 命名空间记忆必须提供 user_id")
+        ns = ("user", _normalize_user_id(user_id))
+    else:
+        ns = ("system",)
+
+    success = await agent_module.store_delete(key, namespace=ns)
     if not success:
-        raise HTTPException(status_code=404, detail=f"记忆 '{key}' 不存在或删除失败")
-    return {"success": True, "key": key}
+        raise HTTPException(status_code=404, detail=f"记忆 '{key}' 不存在或删除失败（namespace={namespace}）")
+    return {"success": True, "key": key, "namespace": namespace, "user_id": user_id}
 
 
 # ══════════════════════════════════════════════════════

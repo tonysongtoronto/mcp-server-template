@@ -981,6 +981,25 @@ async def store_delete(key: str, namespace: tuple = ("system",)) -> bool:
         return False
 
 
+async def store_list_by_namespace(namespace_prefix: tuple) -> dict:
+    """
+    按命名空间前缀列出记忆（async），保留完整 namespace 信息。
+
+    与 store_list() 的区别：store_list() 只返回 {key: value}，如果用前缀
+    （比如 ("user",)）一次查出多个不同用户的记忆，会因为 key 相同而互相覆盖。
+    这个函数返回 {namespace_tuple: {key: value}}，按子命名空间（比如各个 user_id）
+    分组，供管理后台展示 "user 命名空间" 时使用。
+    """
+    try:
+        results = await _store.asearch(namespace_prefix)
+        grouped: dict = {}
+        for r in results:
+            grouped.setdefault(r.namespace, {})[r.key] = r.value
+        return grouped
+    except Exception:
+        return {}
+
+
 # ══════════════════════════════════════════════════════
 # 7. 对话摘要生成（解决长对话记忆丢失）
 # ══════════════════════════════════════════════════════
@@ -1453,13 +1472,24 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                 system_results = await store.asearch(("system",))
             else:
                 system_results = store.search(("system",))
-    
-            thread_id = (config or {}).get("configurable", {}).get("thread_id", "")
-            if thread_id:
+
+            # ★ user 命名空间按 user_id 隔离（同一用户跨会话共享），
+            #   不能按 thread_id 隔离，否则同一用户换个新会话就读不到之前写的记忆。
+            #   configurable 里优先取显式传入的 user_id（api.py 的 chat/chat_stream
+            #   已经会传）；兼容旧调用路径（比如 LangSmith Studio 直接调图，不传
+            #   user_id）时，退化为从复合 thread_id（"{user_id}__{raw_tid}"）里拆出来。
+            configurable = (config or {}).get("configurable", {})
+            user_id = configurable.get("user_id", "")
+            if not user_id:
+                raw_thread_id = configurable.get("thread_id", "")
+                if "__" in raw_thread_id:
+                    user_id = raw_thread_id.split("__", 1)[0]
+
+            if user_id:
                  if hasattr(store, "asearch"):
-                    user_results = await store.asearch(("user", thread_id))
+                    user_results = await store.asearch(("user", user_id))
                  else:
-                    user_results = store.search(("user", thread_id))
+                    user_results = store.search(("user", user_id))
             else:
                  user_results = []
 
