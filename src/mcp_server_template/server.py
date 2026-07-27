@@ -213,3 +213,26 @@ if __name__ == "__main__":
         # 第四步：VS Code 下拉选 Attach MCP Server → F5
         # 进程开始运行 ✅
         # 第五步：Inspector UI 里调用 tool → VS Code 命中断点 → 暂停 ✅
+        
+        # uv run python src/mcp_server_template/server.py --sse
+        # uv run python src/mcp_server_template/server.py
+        
+        # 第一步,单独开一个终端,自己手动起 HTTP 服务:
+
+        # uv run python src/mcp_server_template/server.py --dev
+
+        # 确认终端里打印出:
+
+        # 🚀 Streamable HTTP 模式启动，监听 http://0.0.0.0:8000
+        # 🚀 Endpoint: http://localhost:8000/mcp
+
+        # 第二步,另开一个终端,不带任何命令参数,单独启动 Inspector:
+
+        # npx @modelcontextprotocol/inspector
+
+        # 浏览器打开后,在 UI 里手动填:
+
+        # Transport Type: Streamable HTTP
+        # URL: http://localhost:8000/mcp
+
+        # 点击 Connect

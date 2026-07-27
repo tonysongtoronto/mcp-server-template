@@ -566,3 +566,56 @@ async def memory_delete(request: Request, key: str, namespace: str = "system") -
     # --stdio 
     
     # npx @modelcontextprotocol/inspector node "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/src/math-mcp/build/index.js"
+    
+    #     方案A：最简单，单独测 filesystem，不启动你的 webapp
+
+    # npx @modelcontextprotocol/inspector npx -y @modelcontextprotocol/server-filesystem "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/File_Agent"
+
+    # 它会自动打开浏览器 http://127.0.0.1:6274，左边不要改成SSE，要保持：
+    # Transport Type: STDIO
+    # Command: npx
+    # Args: -y @modelcontextprotocol/server-filesystem C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/File_Agent
+    # 点最下面的 Connect，连上后右上角会变绿 Connected。
+
+    # 测试：
+
+    # path* C:\Users\tonysong\Desktop\AI_Python\mcp-server-template\File_Agent\memory_tony.txt
+
+    # content*  inputinfo
+
+    # Read Text File：
+
+    # path*
+    # C:\Users\tonysong\Desktop\AI_Python\mcp-server-template\File_Agent\memory_tony.txt
+
+    # 方案 B sse
+
+    #  npx -y supergateway --port 8002 --stdio 'npx -y @modelcontextprotocol/server-filesystem "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/File_Agent"'
+    
+    # 另一个终端 运行 
+    #     # npx @modelcontextprotocol/inspector
+    #     UI Transport Type sse
+    # 	URL:
+    #     # http://localhost:8002/sse
+        
+    # 	connect
+    
+    #     math-mcp  mcp inspector 测试：
+
+    # --stdio 
+        
+    # npx @modelcontextprotocol/inspector node "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/src/math-mcp/build/index.js"
+
+    # --sse 
+
+    # npx -y supergateway --port 8004 --stdio 'node "C:/Users/tonysong/Desktop/AI_Python/mcp-server-template/src/math-mcp/build/index.js"'
+
+    # 另一个窗口
+
+    # npx @modelcontextprotocol/inspector
+
+    # Transport Type sse
+
+    # URL  http://localhost:8004/sse
+
+    # Connection Type Via Proxy
