@@ -1687,6 +1687,20 @@ async def _spawn_session_for(
     return session
 
 
+# ★ 修复5 — 这几个 agent 在 _spawn_session_for 里没有专属分支（会落进 else，
+#   只连 server.py），但它们的工具是 _match_agent 按"工具名匹配 AGENT_TOOL_PATTERNS，
+#   匹配不上/明确归属 server.py 的工具"聚合出来的逻辑分组，并不对应一个独立可 spawn
+#   的 MCP 服务。之前的实现里，对这三个 agent 调 _spawn_session_for 会连到 server.py、
+#   拿到 server.py 暴露的全部工具（load_tools 不按 agent 过滤），而不是 registry 里
+#   按 _match_agent 精确分类过的那个子集——等于 scope 泄漏：比如 data_agent 任务实际上
+#   连 fetch_url/post_json/get_server_info 也会被一并 bind_tools 绑给 LLM。
+#   这几个 agent 本来就没有独立进程可 spawn，与其"假装 spawn 一次再纠错"，
+#   不如直接用 registry 里已经精确分类好的全局共享工具（对应的 MCP session 由
+#   _start_mcp_sessions_stdio/_start_mcp_sessions 在应用启动时常驻打开，
+#   进程生命周期内一直有效，不存在"用了已关闭连接"的问题）。
+_SHARED_SESSION_AGENTS = {"default_agent", "data_agent", "http_agent"}
+
+
 async def run_agent_isolated(
     task: Task,
     system_prompt: str,
@@ -1696,15 +1710,21 @@ async def run_agent_isolated(
     单任务执行单元：独立 spawn session → load_tools → run → close session。
     返回任务结果字符串，不修改全局状态。
 
-    ★ 修复4 — 两层 fallback：
-      第一层：session spawn 失败 → 改用 default_agent 的全局已注册工具重试
-      第二层：spawn 成功但工具列表为空 → 同上 fallback
+    ★ 修复4 — 两层 fallback（仅适用于有独立 MCP 服务、走独立 spawn 的
+      math_agent / file_agent / db_agent）：
+      第一层：session spawn 失败 → 优先用该 agent 在 registry 里的已注册工具重试，
+              仍为空则再退一步用 default_agent 的全局工具
+      第二层：spawn 成功但工具列表为空 → 同上，先试该 agent 自己的 registry 工具，
+              再退一步用 default_agent
       两层都失败时 → 纯 LLM 语言推理兜底（不调工具，直接回答）
+
+    ★ 修复5：default_agent / data_agent / http_agent 直接走 registry 共享 session，
+      不再尝试独立 spawn（原因见 _SHARED_SESSION_AGENTS 上方注释）。
     """
     agent_name = task.get("agent", "default_agent")
     intent     = task.get("_resolved_description") or task.get("description", "")
 
-    print(f"\n🤖 [{agent_name}] 任务[{task['task_id']}] 开始（独立 session）：{intent[:60]}")
+    print(f"\n🤖 [{agent_name}] 任务[{task['task_id']}] 开始：{intent[:60]}")
     t0 = time.perf_counter()
 
     # ── 内部执行函数：给定工具列表，跑 LLM + 工具循环 ──────────────────
@@ -1770,40 +1790,54 @@ async def run_agent_isolated(
 
         return _extract_llm_content(last_response) if last_response else "（无结果）"
 
-    # ── 第一层：尝试独立 spawn session ──────────────────────────────────
+    def _registry_fallback(name: str) -> tuple[list, str]:
+        """按 name 从 registry 取工具+配套 prompt，找不到工具就退一步用 default_agent。"""
+        tools = _registry.tools_for(name)
+        if tools:
+            prompt = AGENT_SYSTEM_PROMPTS.get(name, system_prompt)
+            return tools, prompt
+        tools = _registry.tools_for("default_agent") or []
+        prompt = AGENT_SYSTEM_PROMPTS.get("default_agent", DEFAULT_AGENT_SYSTEM_PROMPT)
+        return tools, prompt
+
+    # ── default_agent / data_agent / http_agent：无独立 MCP 服务，
+    #    直接用 registry 里已按 _match_agent 精确分类好的共享工具，不走 spawn ──
+    if agent_name in _SHARED_SESSION_AGENTS:
+        tools = _registry.tools_for(agent_name) or []
+        if not tools:
+            print(f"  ⚠️ [{agent_name}] registry 中无对应工具，"
+                  f"fallback → default_agent 全局工具")
+            tools, prompt = _registry_fallback(agent_name)
+        else:
+            prompt = system_prompt
+        result = await _run_with_tools(tools, prompt)
+
+        elapsed = time.perf_counter() - t0
+        print(f"  ⏱️ [{agent_name}] task[{task['task_id']}] 耗时 {elapsed:.2f}s")
+        return result
+
+    # ── math_agent / file_agent / db_agent：有独立 MCP 服务，独立 spawn session ──
     async with AsyncExitStack() as stack:
         try:
             session = await _spawn_session_for(agent_name, stack, use_sse=use_sse)
             tools   = await load_tools(session)
 
-            # 第二层（spawn 成功但工具为空）：fallback 到 default_agent 的全局工具
+            # 第二层（spawn 成功但工具为空）：先试该 agent 自己的 registry 工具，
+            # 再退一步用 default_agent（与第一层的 fallback 逻辑保持一致）
             if not tools:
                 print(f"  ⚠️ [{agent_name}] session 已连接但工具列表为空，"
-                      f"fallback → 使用 _registry 中的全局工具")
-                fallback_tools   = _registry.tools_for("default_agent") or []
-                fallback_prompt  = AGENT_SYSTEM_PROMPTS.get(
-                    "default_agent", DEFAULT_AGENT_SYSTEM_PROMPT
-                )
+                      f"fallback → 使用 _registry 中的工具")
+                fallback_tools, fallback_prompt = _registry_fallback(agent_name)
                 result = await _run_with_tools(fallback_tools, fallback_prompt)
             else:
                 result = await _run_with_tools(tools, system_prompt)
 
         except Exception as exc:
-            # 第一层：spawn 失败 → 用 _registry 里已注册的全局工具兜底
+            # 第一层：spawn 失败 → 先试该 agent 自己的 registry 工具，
+            # 再退一步用 default_agent
             print(f"  ⚠️ [{agent_name}] session 启动失败：{exc}，"
-                  f"fallback → 使用 _registry 中的全局工具", file=sys.stderr)
-            fallback_tools  = _registry.tools_for(agent_name)
-            fallback_prompt = system_prompt  # 保留原 agent 的 prompt，语义不变
-
-            if not fallback_tools:
-                # 该 agent 在 registry 里也没有工具，再退一步用 default_agent 的工具
-                print(f"  ⚠️ [{agent_name}] registry 中也无工具，"
-                      f"最终 fallback → default_agent 全局工具", file=sys.stderr)
-                fallback_tools  = _registry.tools_for("default_agent") or []
-                fallback_prompt = AGENT_SYSTEM_PROMPTS.get(
-                    "default_agent", DEFAULT_AGENT_SYSTEM_PROMPT
-                )
-
+                  f"fallback → 使用 _registry 中的工具", file=sys.stderr)
+            fallback_tools, fallback_prompt = _registry_fallback(agent_name)
             result = await _run_with_tools(fallback_tools, fallback_prompt)
 
     elapsed = time.perf_counter() - t0
