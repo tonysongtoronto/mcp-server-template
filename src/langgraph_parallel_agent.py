@@ -1790,9 +1790,13 @@ async def run_agent_isolated(
 
         return _extract_llm_content(last_response) if last_response else "（无结果）"
 
-    def _registry_fallback(name: str) -> tuple[list, str]:
-        """按 name 从 registry 取工具+配套 prompt，找不到工具就退一步用 default_agent。"""
-        tools = _registry.tools_for(name)
+    def _registry_fallback(name: str, known_tools: list | None = None) -> tuple[list, str]:
+        """
+        按 name 从 registry 取工具+配套 prompt，找不到工具就退一步用 default_agent。
+        known_tools：如果调用方已经查过 tools_for(name) 且已确认为空，
+        直接传进来，避免这里再重复查一次同一个 key。
+        """
+        tools = _registry.tools_for(name) if known_tools is None else known_tools
         if tools:
             prompt = AGENT_SYSTEM_PROMPTS.get(name, system_prompt)
             return tools, prompt
@@ -1807,7 +1811,7 @@ async def run_agent_isolated(
         if not tools:
             print(f"  ⚠️ [{agent_name}] registry 中无对应工具，"
                   f"fallback → default_agent 全局工具")
-            tools, prompt = _registry_fallback(agent_name)
+            tools, prompt = _registry_fallback(agent_name, known_tools=tools)  # tools 已知为空，不重复查
         else:
             prompt = system_prompt
         result = await _run_with_tools(tools, prompt)
