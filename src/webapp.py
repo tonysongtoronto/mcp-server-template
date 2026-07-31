@@ -85,9 +85,11 @@ async def _wait_for_http(url: str, timeout: float = 40.0, interval: float = 1.0)
     while asyncio.get_event_loop().time() < deadline:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
-                resp = await client.get(url)
-                if resp.status_code in (200, 405, 406):
-                    return True
+                # 用 stream() 而不是 get()：只等响应头到达就返回，
+                # 不会卡在读取 SSE 永不结束的响应体上。
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code in (200, 405, 406):
+                        return True
         except Exception:
             pass
         await asyncio.sleep(interval)
@@ -307,7 +309,8 @@ async def lifespan(app: FastAPI):
             )
             if math_proc:
                 _subprocesses.append(math_proc)
-                ok = await _wait_for_http(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse")
+                ok = await _wait_for_http(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse",
+                                          timeout=90.0)
                 print(f"  {'✅' if ok else '❌'} [mcp-proxy(math)] SSE {'就绪' if ok else '超时'}",
                       file=sys.stderr)
 
