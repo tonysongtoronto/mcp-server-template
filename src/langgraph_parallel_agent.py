@@ -62,8 +62,8 @@ src/langgraph_parallel_agent.py
 
   ★ 修复Z（_run_question —— Checkpoint 核心修复，最重要）
     原问题：每次 invoke 传入完整 state：
-              {"messages": [...], "task_plan": [], "current_task_id": 0, "next_agent": ""}
-            task_plan / current_task_id / next_agent 是普通字段，LangGraph merge 规则
+              {"messages": [...], "task_plan": [],
+            task_plan / next_agent 是普通字段，LangGraph merge 规则
             是"新值覆盖旧值"，每次都传 task_plan=[] 等于每次清空任务计划。
             即使 MemorySaver 存了历史，也因为字段被强制覆盖而失效。
     新方案：invoke 时只传当前轮的 HumanMessage：
@@ -419,7 +419,6 @@ class Task(TypedDict):
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]   # ← 改动：加了 Annotated[list, add_messages]
     task_plan: list[Task]
-    current_task_id: int
     next_agent: str
     # ★ 摘要记忆字段（解决长对话记忆丢失问题）
     #
@@ -1369,7 +1368,6 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
         return {
             "next_agent": "",          # ← 不为 "FINISH"，路由到 parallel_executor
             "task_plan": [error_task],
-            "current_task_id": 0,
         }
 
     # 取最后一条 HumanMessage 作为当前问题
@@ -1393,7 +1391,6 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
         return {
             "next_agent": "",
             "task_plan": [error_task],
-            "current_task_id": 0,
         }
 
     user_msg = _get_message_content(last_human_msg)
@@ -1605,13 +1602,11 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                 }
                 return {
                     "task_plan":       [error_task],
-                    "current_task_id": 0,
                     "next_agent":      "",   # ← 路由到 parallel_executor
                 }
 
     return {
         "task_plan":       task_plan,
-        "current_task_id": task_plan[0]["task_id"] if task_plan else 0,
         "next_agent":      "",   # ← 路由到 parallel_executor
     }
 # ══════════════════════════════════════════════════════
@@ -2457,14 +2452,14 @@ if __name__ == "__main__":
     #   graph.ainvoke({
     #       "messages":        [HumanMessage(content=q)],  # 新消息 ✅
     #       "task_plan":       [],      # ← 强制覆盖 checkpoint 里的 task_plan ❌
-    #       "current_task_id": 0,       # ← 强制覆盖 ❌
+    #
     #       "next_agent":      "",      # ← 强制覆盖 ❌
     #   }, config=config)
     #
     # LangGraph 的 checkpoint 合并规则：
     #   invoke 传入的 state 会与 checkpoint 里存的 state 做 merge。
     #   对于 Annotated[list, add_messages] 字段（messages）：新消息追加，历史保留 ✅
-    #   对于普通字段（task_plan / current_task_id / next_agent）：新值直接覆盖旧值 ❌
+    #   对于普通字段（task_plan / next_agent）：新值直接覆盖旧值 ❌
     #
     # 每次 invoke 都传 task_plan=[] 等于每次都清空任务计划，
     # 导致即使 checkpoint 里有上一轮的 task_plan，也会被强制清零。
@@ -2487,7 +2482,7 @@ if __name__ == "__main__":
 
         try:
             result = await graph.ainvoke(
-                # ★ 只传当前消息，不传 task_plan/current_task_id/next_agent
+                # ★ 只传当前消息，不传 task_plan/next_agent
                 # 让 LangGraph 从 checkpoint 恢复其他字段，再由各 node 正常更新
                 {"messages": [HumanMessage(content=q)]},
                 config=config,
