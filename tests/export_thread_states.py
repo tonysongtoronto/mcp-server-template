@@ -16,7 +16,7 @@ LANGGRAPH_URL = "http://127.0.0.1:2024"
 # ── 在这里手动添加要导出 state 的 Thread ID ────────────────────
 # （从 LangSmith Studio / LangGraph Studio -> Threads 视图顶部复制）
 THREAD_IDS = [
-    "019fb922-cd15-75c2-b4b6-74c4b9b5aa2f",
+    "019fbaf5-3cca-7f90-a5a3-e47ca74aa8d3",
     # "aa5d5ea2-c120-40f3-9d53-fc5faef3b81a",
     # 继续添加更多 Thread ID...
 ]

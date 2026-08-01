@@ -169,183 +169,162 @@ async def lifespan(app: FastAPI):
     os.environ["MCP_USE_SSE"] = "1"
     print("\n🟢 [lifespan] 开始启动 MCP 子进程...", file=sys.stderr)
 
-    # ── 持久化：AsyncSqliteSaver（进程重启后对话历史仍保留）────────────────
-    #
-    # 为什么不用平台自带的持久化？
-    #   平台持久化只对 /threads/{id}/runs 端点有效。
-    #   我们的 /chat/stream 直接调 graph.ainvoke()，绕过了平台的 thread 管理层。
-    #
-    # 为什么不用 MemorySaver？
-    #   MemorySaver 进程重启后历史清空，生产环境不可用。
-    #   AsyncSqliteSaver 把 checkpoint 写入磁盘，重启后历史完整保留。
-    #
-    # 关键：lifespan 在 _start_mcp_sessions() 之后再用 saver 重建 graph，
-    #   覆盖掉 _init_registry 里用 _checkpointer（MemorySaver）建的那个版本，
-    #   确保运行时的 graph 用的是 AsyncSqliteSaver。
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-    # ★ STORE webapp改动1/4：导入 AsyncSqliteStore（持久化 Memory Store，进程重启数据不丢）
-    #
-    # AsyncSqliteStore vs InMemoryStore（在 langgraph_parallel_agent.py 里）：
-    #   InMemoryStore   → CLI 实验用，Python 字典，重启清空
-    #   AsyncSqliteStore → webapp 生产用，写入 SQLite，重启仍在
-    #
-    # 两个 Store 存储在不同的 SQLite 文件里，互不干扰：
-    #   checkpoints.db   → 对话历史 checkpoint（AsyncSqliteSaver）
-    #   memory_store.db  → 全局记忆 Memory Store（AsyncSqliteStore）
-    from langgraph.store.sqlite.aio import AsyncSqliteStore
     import src.langgraph_parallel_agent as agent_module
 
-    _CHECKPOINT_DB = Path(__file__).parent.parent / "data" / "checkpoints.db"
-    await asyncio.to_thread(lambda: _CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True))
-    print(f"  💾 [Checkpoint] SQLite 路径：{_CHECKPOINT_DB}", file=sys.stderr)
+    # ── 持久化：复用 agent_module 自己的 SQLite 连接，不再重复开一组 ──────
+    #
+    # ★ 重构说明（原方案的问题）：
+    #   旧代码在这里自己 `async with AsyncSqliteSaver/AsyncSqliteStore` 开了
+    #   webapp 专属的一组连接（saver/store），跟 agent_module._open_sqlite_backends()
+    #   打开的模块级 _checkpointer/_store 是两条独立的 connection，只是连到
+    #   同一份 .db 文件。这带来两个问题：
+    #     1. 同一份文件被两条独立 connection 同时打开，本身就多一份心智负担。
+    #     2. 更麻烦的是：_ensure_registry() 懒初始化在请求期间可能重新调用
+    #        _init_registry() → build_graph(_checkpointer, _store)，会把
+    #        graph 悄悄换回 agent_module 那组连接，且没有任何日志提示，
+    #        属于运行时的隐性风险。
+    #
+    # ★ 新方案：不在 webapp.py 里另开一组连接，直接把
+    #   agent_module._open_sqlite_backends() 打开的那一组，原样挂到
+    #   app.state 上。整个进程从头到尾只有一份 checkpointer、一份 store，
+    #   不管是 _init_registry() 内部触发的重建，还是 webapp 这边的引用，
+    #   拿到的永远是同一个对象——不存在"悄悄换成另一条连接"这种可能性，
+    #   因为压根不存在"另一条连接"。
+    #
+    # 为什么不用 MemorySaver / InMemoryStore？
+    #   进程重启后历史会清空，生产环境不可用；SQLite 落盘才能保证重启后
+    #   对话历史和全局记忆都还在。
+    #
+    # 注意：agent_module.py 本身完全没有改动，_open_sqlite_backends() /
+    #   _checkpointer_cm / _store_cm 这些接口原样保留，CLI / api.py 模式
+    #   依然可以独立运行，不依赖 webapp.py。
+    await agent_module._open_sqlite_backends()
+    app.state.checkpointer = agent_module._checkpointer
+    app.state.store = agent_module._store
+    print(f"  💾 [Checkpoint] SQLite 路径：{agent_module._CHECKPOINT_DB}", file=sys.stderr)
+    print(f"  🗄️  [MemoryStore] SQLite 路径：{agent_module._STORE_DB}", file=sys.stderr)
+    print("  ✅ [Persistence] AsyncSqliteSaver + AsyncSqliteStore 就绪（唯一一组连接）",
+          file=sys.stderr)
 
-    # ★ STORE webapp改动2/4：Memory Store 独立 SQLite 文件
-    _STORE_DB = Path(__file__).parent.parent / "data" / "memory_store.db"
-    await asyncio.to_thread(lambda: _STORE_DB.parent.mkdir(parents=True, exist_ok=True))
-    print(f"  🗄️  [MemoryStore] SQLite 路径：{_STORE_DB}", file=sys.stderr)
+    # ── 1. 启动 server.py（Streamable HTTP @ 8001）──────────────────────────────
+    server_proc = await _launch_subprocess(
+        tag="server.py",
+        cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
+        env={
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "PORT": str(_SERVER_PORT),
+            "MCP_FS_BASE_DIR": str(_FS_BASE_DIR),
+        },
+        port=_SERVER_PORT,
+    )
+    if server_proc:
+        _subprocesses.append(server_proc)
+        ok = await _wait_for_http(f"http://127.0.0.1:{_SERVER_PORT}/mcp")
+        print(f"  {'✅' if ok else '❌'} [server.py] HTTP {'就绪' if ok else '超时'}",
+              file=sys.stderr)
 
-    async with AsyncSqliteSaver.from_conn_string(str(_CHECKPOINT_DB)) as saver:
-        app.state.checkpointer = saver
-        print("  ✅ [Checkpoint] AsyncSqliteSaver 就绪", file=sys.stderr)
+    # ── 2. 启动 mcp-proxy（Streamable HTTP @ 8002：filesystem）──────────────────
+    # ★ 超时修复：npx 首次运行需要从 npm 下载包，网络慢时耗时长。
+    # pre-warm：先让 npx 把包下载到本地缓存，再启动 mcp-proxy 时就走缓存秒起。
+    print("  ⏳ [mcp-proxy(fs)] 预热 npm 包（首次约 30-60s）...", file=sys.stderr)
+    try:
+        await asyncio.to_thread(
+            subprocess.run,
+            ["npx", "--yes", "@modelcontextprotocol/server-filesystem", "--help"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=90,
+        )
+    except Exception:
+        pass  # pre-warm 失败不阻断，继续尝试启动
 
-        # ★ STORE webapp改动3/4：打开 AsyncSqliteStore，嵌套在 AsyncSqliteSaver 里
+    fs_proc = await _launch_subprocess(
+        tag="mcp-proxy(fs)",
+        cmd=["mcp-proxy", "--port", str(_FS_PROXY_PORT), "--",
+             "npx", "--yes", "@modelcontextprotocol/server-filesystem", str(_FS_BASE_DIR)],
+        port=_FS_PROXY_PORT,
+    )
+    if fs_proc:
+        _subprocesses.append(fs_proc)
+        # timeout 提高到 90s，覆盖网络慢的场景
+        ok = await _wait_for_http(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse",
+                                  timeout=90.0)
+        print(f"  {'✅' if ok else '❌'} [mcp-proxy(fs)] SSE {'就绪' if ok else '超时'}",
+              file=sys.stderr)
+
+    # ── 3. 启动 db_server.py（Streamable HTTP @ 8003）───────────────────────────
+    db_proc = await _launch_subprocess(
+        tag="db_server.py",
+        cmd=[sys.executable, "-u", str(_DB_SERVER_PY), "--sse"],
+        env={
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "PORT": str(_DB_SERVER_PORT),
+        },
+        port=_DB_SERVER_PORT,
+    )
+    if db_proc:
+        _subprocesses.append(db_proc)
+        ok = await _wait_for_http(f"http://127.0.0.1:{_DB_SERVER_PORT}/mcp")
+        print(f"  {'✅' if ok else '❌'} [db_server.py] HTTP {'就绪' if ok else '超时'}",
+              file=sys.stderr)
+
+    # ── 4. 启动 mcp-proxy（Streamable HTTP @ 8004：math-mcp）────────────────────
+    math_proc = await _launch_subprocess(
+        tag="mcp-proxy(math)",
+        cmd=["mcp-proxy", "--port", str(_MATH_PROXY_PORT), "--",
+             _NODE, str(_MATH_MCP_JS)],
+        port=_MATH_PROXY_PORT,
+    )
+    if math_proc:
+        _subprocesses.append(math_proc)
+        ok = await _wait_for_http(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse",
+                                  timeout=90.0)
+        print(f"  {'✅' if ok else '❌'} [mcp-proxy(math)] SSE {'就绪' if ok else '超时'}",
+              file=sys.stderr)
+
+    # ── 5. 初始化 MCP sessions ───────────────────────────────────────
+    #
+    # _start_mcp_sessions() 内部会调 _init_registry() → build_graph(_checkpointer, _store)。
+    # 因为 _open_sqlite_backends() 已经在最前面调用过，_checkpointer/_store
+    # 此刻就是"唯一的那组"持久化连接——这一次 build_graph() 编译出来的
+    # graph 已经是最终版本，不再需要像旧方案那样等这一步完成后再用
+    # 另一组连接重建一次。
+    await agent_module._start_mcp_sessions()
+    print("  ✅ [Graph] 已用 AsyncSqliteSaver + AsyncSqliteStore 编译就绪", file=sys.stderr)
+    print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
+
+    try:
+        yield
+
+    finally:
+        await agent_module._stop_mcp_sessions()
+        print("\n🛑 [lifespan] 关闭子进程...", file=sys.stderr)
+        for proc in reversed(_subprocesses):
+            await _terminate_subprocess("subprocess", proc)
+        _subprocesses.clear()
+
+        # ── 关闭持久化连接（唯一的一组，agent_module._checkpointer_cm/_store_cm）──
         #
-        # 为什么嵌套？
-        #   两者都是 async context manager，同时需要保持连接到 yield（服务期间）。
-        #   嵌套写法确保两个 SQLite 连接在整个 lifespan 期间都是打开状态。
-        #   yield 之后两者按相反顺序自动关闭，安全落盘。
-        async with AsyncSqliteStore.from_conn_string(str(_STORE_DB)) as store:
-            app.state.store = store
-            print("  ✅ [MemoryStore] AsyncSqliteStore 就绪", file=sys.stderr)
-
-            # ── ★ 打开 agent_module 的 SQLite 后端（过渡桥梁） ──────────────
-            #
-            # 调用时机：必须在 _start_mcp_sessions() 之前。
-            #   _start_mcp_sessions() → _init_registry() → build_graph(_checkpointer, _store)
-            #   如果此时 _checkpointer/_store 还是 None，build_graph 拿到 None，
-            #   LangGraph 会用无持久化模式编译（可以接受，不崩）。
-            #
-            # 路径已在 langgraph_parallel_agent.py 里统一：
-            #   checkpointer → data/checkpoints.db
-            #   store        → data/memory_store.db
-            # 三条路径（CLI / api.py / webapp.py）默认值完全一致，无需再设环境变量。
-            #
-            # webapp 模式下这两个连接只是"过渡"：
-            #   _start_mcp_sessions 完成后，lifespan 立即用 webapp 自己的
-            #   saver/store 重建 graph（第③次赋值），覆盖过渡版本。
-            await agent_module._open_sqlite_backends()
-            print("  ✅ [agent_module] SQLite 后端已就绪", file=sys.stderr)
-
-            # ── 1. 启动 server.py（Streamable HTTP @ 8001）──────────────────────────────
-            server_proc = await _launch_subprocess(
-                tag="server.py",
-                cmd=[sys.executable, "-u", str(_SERVER_PY), "--sse"],
-                env={
-                    "PYTHONUNBUFFERED": "1",
-                    "PYTHONIOENCODING": "utf-8",
-                    "PORT": str(_SERVER_PORT),
-                    "MCP_FS_BASE_DIR": str(_FS_BASE_DIR),
-                },
-                port=_SERVER_PORT,
-            )
-            if server_proc:
-                _subprocesses.append(server_proc)
-                ok = await _wait_for_http(f"http://127.0.0.1:{_SERVER_PORT}/mcp")
-                print(f"  {'✅' if ok else '❌'} [server.py] HTTP {'就绪' if ok else '超时'}",
-                      file=sys.stderr)
-
-            # ── 2. 启动 mcp-proxy（Streamable HTTP @ 8002：filesystem）──────────────────
-            # ★ 超时修复：npx 首次运行需要从 npm 下载包，网络慢时耗时长。
-            # pre-warm：先让 npx 把包下载到本地缓存，再启动 mcp-proxy 时就走缓存秒起。
-            print("  ⏳ [mcp-proxy(fs)] 预热 npm 包（首次约 30-60s）...", file=sys.stderr)
-            try:
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["npx", "--yes", "@modelcontextprotocol/server-filesystem", "--help"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=90,
-                )
-            except Exception:
-                pass  # pre-warm 失败不阻断，继续尝试启动
-
-            fs_proc = await _launch_subprocess(
-                tag="mcp-proxy(fs)",
-                cmd=["mcp-proxy", "--port", str(_FS_PROXY_PORT), "--",
-                     "npx", "--yes", "@modelcontextprotocol/server-filesystem", str(_FS_BASE_DIR)],
-                port=_FS_PROXY_PORT,
-            )
-            if fs_proc:
-                _subprocesses.append(fs_proc)
-                # timeout 提高到 90s，覆盖网络慢的场景
-                ok = await _wait_for_http(f"http://127.0.0.1:{_FS_PROXY_PORT}/sse",
-                                          timeout=90.0)
-                print(f"  {'✅' if ok else '❌'} [mcp-proxy(fs)] SSE {'就绪' if ok else '超时'}",
-                      file=sys.stderr)
-
-            # ── 3. 启动 db_server.py（Streamable HTTP @ 8003）───────────────────────────
-            db_proc = await _launch_subprocess(
-                tag="db_server.py",
-                cmd=[sys.executable, "-u", str(_DB_SERVER_PY), "--sse"],
-                env={
-                    "PYTHONUNBUFFERED": "1",
-                    "PYTHONIOENCODING": "utf-8",
-                    "PORT": str(_DB_SERVER_PORT),
-                },
-                port=_DB_SERVER_PORT,
-            )
-            if db_proc:
-                _subprocesses.append(db_proc)
-                ok = await _wait_for_http(f"http://127.0.0.1:{_DB_SERVER_PORT}/mcp")
-                print(f"  {'✅' if ok else '❌'} [db_server.py] HTTP {'就绪' if ok else '超时'}",
-                      file=sys.stderr)
-
-            # ── 4. 启动 mcp-proxy（Streamable HTTP @ 8004：math-mcp）────────────────────
-            math_proc = await _launch_subprocess(
-                tag="mcp-proxy(math)",
-                cmd=["mcp-proxy", "--port", str(_MATH_PROXY_PORT), "--",
-                     _NODE, str(_MATH_MCP_JS)],
-                port=_MATH_PROXY_PORT,
-            )
-            if math_proc:
-                _subprocesses.append(math_proc)
-                ok = await _wait_for_http(f"http://127.0.0.1:{_MATH_PROXY_PORT}/sse",
-                                          timeout=90.0)
-                print(f"  {'✅' if ok else '❌'} [mcp-proxy(math)] SSE {'就绪' if ok else '超时'}",
-                      file=sys.stderr)
-
-            # ── 5. 初始化 MCP sessions ───────────────────────────────────────
-            await agent_module._start_mcp_sessions()
-
-            # ── 6. 用 AsyncSqliteSaver + AsyncSqliteStore 重建 graph ─────────
-            #
-            # ★ STORE webapp改动4/4：build_graph 同时传入 checkpointer 和 store
-            #
-            # 之前：build_graph(checkpointer=saver)
-            # 现在：build_graph(checkpointer=saver, store=store)
-            #
-            # 效果：
-            #   - 对话历史 checkpoint → 写入 checkpoints.db（AsyncSqliteSaver）
-            #   - 全局记忆 Memory Store → 写入 memory_store.db（AsyncSqliteStore）
-            #   - planner_node 会自动收到 store 对象，读取全局记忆注入到 system prompt
-            agent_module.graph = agent_module.build_graph(checkpointer=saver, store=store)
-            print("  ✅ [Graph] 已用 AsyncSqliteSaver + AsyncSqliteStore 重新编译",
+        # 因为整个进程只开过这一组连接，这里就是全部需要关闭的资源，
+        # 不再有"webapp 自己那组"和"agent_module 那组"的区分。
+        # 关闭顺序与打开顺序相反：先 store 后 checkpointer。
+        # 用 getattr 兜底：如果启动阶段提前异常退出，这两个属性可能还是 None。
+        store_cm = getattr(agent_module, "_store_cm", None)
+        checkpointer_cm = getattr(agent_module, "_checkpointer_cm", None)
+        try:
+            if store_cm is not None:
+                await store_cm.__aexit__(None, None, None)
+            if checkpointer_cm is not None:
+                await checkpointer_cm.__aexit__(None, None, None)
+            print("🛑 [lifespan] SQLite 连接已关闭（checkpoints.db + memory_store.db）",
                   file=sys.stderr)
-            print("🟢 [lifespan] 全部就绪，开始服务\n", file=sys.stderr)
+        except Exception as e:
+            # 关闭失败不应该阻塞其余的优雅退出流程，记录日志即可
+            print(f"⚠️ [lifespan] SQLite 关闭异常（已忽略）：{e}", file=sys.stderr)
 
-            try:
-                yield
-
-            finally:
-                await agent_module._stop_mcp_sessions()
-                print("\n🛑 [lifespan] 关闭子进程...", file=sys.stderr)
-                for proc in reversed(_subprocesses):
-                    await _terminate_subprocess("subprocess", proc)
-                _subprocesses.clear()
-                print("🛑 [lifespan] 全部已关闭\n", file=sys.stderr)
-
-    # async with 结束时，AsyncSqliteStore 和 AsyncSqliteSaver 按相反顺序自动关闭，
-    # memory_store.db 和 checkpoints.db 均安全落盘。
+        print("🛑 [lifespan] 全部已关闭\n", file=sys.stderr)
 
 
 # ──────────────────────────────────────────
