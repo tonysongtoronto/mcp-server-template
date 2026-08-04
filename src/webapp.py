@@ -413,8 +413,37 @@ async def chat_stream(request: Request) -> StreamingResponse:
             # 等待 invoke 完全结束（含摘要更新等后续操作）
             try:
                 await invoke_task
+            except asyncio.CancelledError:
+                # ★ 修复5：CancelledError 继承自 BaseException，不是 Exception。
+                # 这里的取消是我们自己在上面 120s 超时分支主动 invoke_task.cancel()
+                # 触发的，属于预期内的收尾动作。注意：那个分支在调用 cancel() 之前
+                # 已经 yield 过一条 "等待超时" 的 ERROR 消息给前端了，所以这里不用
+                # 再重复 yield 一次，直接 pass 即可，避免前端收到两条重复的 ERROR。
+                #
+                # 但为了防止未来有人在别处新增 invoke_task.cancel() 调用、却忘了
+                # 提前 yield 消息告知前端（导致前端静默卡住、排查困难），这里保留一条
+                # 服务端日志作为兜底：不发给前端，但至少能在服务端日志里看到痕迹。
+                print(f"ℹ️  [/chat/stream] invoke_task 已按预期被取消（request_id={request_id}）",
+                      file=sys.stderr)
             except Exception as e:
                 yield f"data: [ERROR] {str(e)}\n\n"
+
+        except asyncio.CancelledError:
+            # ★ 修复5（外层，注意和内层 416 行语义不同）：
+            # 这里捕获到的 CancelledError，大概率意味着 _generate() 这个
+            # 协程本身被取消了（例如客户端中途断开连接，Starlette/uvicorn
+            # 会取消驱动这个异步生成器的 Task），而不是我们主动取消
+            # invoke_task 那种"预期内"的情况。
+            #
+            # 按 asyncio 的协作取消约定：捕获到"自己被取消"的 CancelledError
+            # 后不应该吞掉，而是做完必要清理后重新 raise，把取消信号正确
+            # 传递回调用方（driving 这个生成器的 Task）。直接 pass 掉会让
+            # 上层误以为这个 Task 正常结束、并没有真的响应取消请求。
+            print("⚠️  [/chat/stream] 连接被取消（客户端断开或上游取消），清理后重新抛出",
+                  file=sys.stderr)
+            if not invoke_task.done():
+                invoke_task.cancel()
+            raise
 
         except Exception as e:
             print(f"❌ [/chat/stream] 出错：{e}", file=sys.stderr)
