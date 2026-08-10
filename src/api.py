@@ -45,6 +45,19 @@ api.py  ——  LangGraph Parallel Agent 的 FastAPI 后台服务
   POST   /memory                   → 写入一条全局 Store 记忆
   DELETE /memory/{key}             → 删除一条全局 Store 记忆
 
+【★ HITL 改动：v2.3.0 新增 —— 人工介入断点续传接口】
+  GET  /session/{user_id}/{thread_id}/state   → 查询任务计划当前状态（含待人工处理事项）
+  POST /session/{user_id}/{thread_id}/resume  → 提交人工决策，从中断点精确恢复执行
+  POST /session/{user_id}/{thread_id}/abort   → 放弃当前中断，直接终止整个任务计划
+
+  配套改动：
+    - /chat、/chat/stream 在调用前会先检查线程是否还冻结在上一轮的人工审核上
+      （409 拒绝，避免新消息悄悄覆盖掉未处理完的中断）
+    - /chat 的响应新增 plan_status / is_awaiting_human / pending_gate_items 三个字段
+      （均带默认值，向后兼容老客户端）
+    - /chat/stream 遇到中断时会推送 `event: interrupted` 这个专门的 SSE 事件，
+      而不是让客户端傻等到 120s 超时
+
 【启动方式】
   pip install langgraph-checkpoint-sqlite
   uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1
@@ -58,6 +71,7 @@ api.py  ——  LangGraph Parallel Agent 的 FastAPI 后台服务
 """
 
 import sys
+import json
 
 # ──────────────────────────────────────────────────────────────────────
 # Windows 编码兜底：当本进程的 stdout/stderr 被重定向到文件而不是连接到
@@ -87,6 +101,9 @@ from fastapi.middleware.gzip import GZipMiddleware
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
+# ★ HITL 改动：Command 用于恢复被 interrupt() 冻结的图
+from langgraph.types import Command
+
 import langgraph_parallel_agent as agent_module
 
 # ══════════════════════════════════════════════════════
@@ -104,6 +121,10 @@ class ChatResponse(BaseModel):
     thread_id:     str   = Field(..., description="本次对话所属的会话 ID（不含 user_id 前缀）")
     message_count: int   = Field(..., description="该会话累计消息条数")
     duration_ms:   float = Field(..., description="本次请求耗时（毫秒）")
+    # ★ HITL 改动：新增三个字段，全部带默认值，老客户端可以直接忽略、向后兼容。
+    plan_status:        str        = Field("completed", description="running/waiting_human/completed/aborted")
+    is_awaiting_human:    bool       = Field(False, description="True 时表示图冻结在 human_review_gate，answer 只是提示文案，需调用 /resume 才能拿到真正结果")
+    pending_gate_items:    list[dict] = Field(default_factory=list, description="is_awaiting_human=True 时，本批待人工处理的事项")
 
 class SessionResponse(BaseModel):
     user_id:    str   = Field(..., description="所属用户 ID")
@@ -129,6 +150,61 @@ class MemoryItem(BaseModel):
 class MemoryListResponse(BaseModel):
     system: dict = Field(..., description="system 命名空间下的全局记忆 {key: value}")
     user:   dict = Field(..., description="user 命名空间下的记忆，按 user_id 分组：{user_id: {key: value}}")
+
+# ══════════════════════════════════════════════════════
+# 1b. ★ HITL 改动：人工介入相关的请求/响应模型
+# ══════════════════════════════════════════════════════
+
+class TaskInfo(BaseModel):
+    task_id:               int
+    description:           str
+    agent:                 str
+    status:                str
+    result:                str
+    depends_on:             list[int] = Field(default_factory=list)
+    retry_count:            int       = 0
+    max_retries:            int       = 0
+    last_error:             str       = ""
+    high_risk:              bool      = False
+
+
+class GateItemModel(BaseModel):
+    task_id:            int
+    reason:              str                 = Field(..., description="'needs_human' 或 'pending_approval'")
+    description:         str                 = ""
+    error:                str | None          = None
+    risk_type:            str | None          = None
+    downstream_blocked:   list[int]           = Field(default_factory=list)
+
+
+class TaskPlanStateResponse(BaseModel):
+    user_id:              str
+    thread_id:            str
+    plan_status:           str                = Field(..., description="running / waiting_human / completed / aborted")
+    is_awaiting_human:      bool               = Field(..., description="图当前是否正冻结在 human_review_gate 等待决策")
+    task_plan:              list[TaskInfo]     = Field(default_factory=list)
+    pending_gate_items:      list[GateItemModel] = Field(default_factory=list)
+
+
+class HumanDecisionIn(BaseModel):
+    task_id: int
+    action:   str            = Field(..., description="retry / edit_and_retry / skip / approve / reject / abort_all")
+    patch:    dict | None    = Field(None, description="edit_and_retry 时可带 {'description': '...'}；skip 时可带 {'manual_result': '...'}")
+
+
+class ResumeRequest(BaseModel):
+    decisions: list[HumanDecisionIn] = Field(..., description="一次性提交本批全部待办事项的决策（数组顺序不要求，按 task_id 匹配）")
+
+
+class ResumeResponse(BaseModel):
+    user_id:               str
+    thread_id:              str
+    plan_status:             str
+    is_awaiting_human:        bool
+    answer:                   str | None       = Field(None, description="plan_status 变为 completed/aborted 时的最终回答；仍为 waiting_human 时为 None")
+    pending_gate_items:        list[GateItemModel] = Field(default_factory=list, description="若恢复后又产生了新一批待办事项（比如刚重试的任务又失败了），列在这里")
+    duration_ms:              float
+
 
 class HealthResponse(BaseModel):
     status:            str       = Field(..., description="ok / degraded / initializing")
@@ -325,6 +401,113 @@ def _get_thread_lock(internal_tid: str) -> asyncio.Lock:
 
 
 # ══════════════════════════════════════════════════════
+# 3b. ★ HITL 改动：查询 / 恢复中断状态的公共辅助函数
+# ══════════════════════════════════════════════════════
+
+async def _check_awaiting_human(config: dict) -> tuple[bool, list[dict], str]:
+    """
+    查询指定 thread 当前是否冻结在 human_review_gate。
+
+    直接读 graph.aget_state(config)——这是 LangGraph 自带的 checkpoint 查询接口，
+    不需要我们额外维护一张"待办表"：interrupt() 调用时已经把 payload 和完整
+    state 一起落盘了，这里查到的就是最新真相，即使跨进程/客户端断线重连也一样。
+
+    返回 (是否处于等待人工态, 待办事项列表, plan_status)
+    """
+    snapshot = await agent_module.graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        return False, [], "completed"
+
+    plan_status = snapshot.values.get("plan_status", "completed")
+    is_waiting  = bool(snapshot.next) and "human_review_gate" in snapshot.next
+
+    gate_items = snapshot.values.get("pending_gate_items", []) if is_waiting else []
+    return is_waiting, gate_items, plan_status
+
+
+# ══════════════════════════════════════════════════════
+# ★ 新增：流式消费的公共逻辑，chat_stream 和 resume_stream 共用
+# ══════════════════════════════════════════════════════
+#
+# 这段本来整块写死在 chat_stream.generate() 里，只认"新提问"这一种场景。
+# 但它其实跟"这次 ainvoke 到底是普通提问还是 Command(resume=...)"完全无关，
+# 只关心两件事：
+#   1) 从 queue 里把 final_answer_node 推过来的 token 逐个吐给客户端
+#   2) invoke_task 跑完之后，判断是"正常结束"还是"又被 interrupt 冻结"，
+#      发对应的 SSE 事件
+# 所以直接抽出来，两个端点各自负责"怎么发起这次 ainvoke"，
+# 发起之后的消费逻辑完全复用，不用维护两份几乎一样的代码。
+async def _stream_graph_run(
+    invoke_task: "asyncio.Task",
+    q: "asyncio.Queue",
+    raw_tid: str,
+) -> AsyncGenerator[str, None]:
+    while True:
+        get_task = asyncio.ensure_future(q.get())
+        done, _pending = await asyncio.wait(
+            {get_task, invoke_task},
+            timeout=120.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not done:
+            get_task.cancel()
+            yield "data: [ERROR] 等待超时（120s）\n\n"
+            invoke_task.cancel()
+            return
+
+        if get_task in done:
+            token = get_task.result()
+            if token is None:
+                # final_answer_node 的 llm.astream() 吐完文本了（正常收尾路径）
+                break
+            safe_token = str(token).replace("\n", " ")
+            yield f"data: {safe_token}\n\n"
+            continue
+
+        # invoke_task 先完成 —— 说明图没有走到 final_answer 就结束了，
+        # 最典型的原因是被 human_review_gate 的 interrupt() 冻结，
+        # 根本没有 token 会被推进 queue。取消还没用上的 get_task。
+        get_task.cancel()
+        break
+
+    try:
+        result = await invoke_task
+    except Exception as exc:
+        yield f"data: [ERROR] {exc}\n\n"
+        return
+
+    # 区分"正常跑完"和"被 interrupt 冻结"两种收尾
+    # （resume_stream 场景下，"又被冻结"意味着这一批决策提交后又产生了新的
+    #   pending_gate_items，客户端要再调一次 resume/stream 处理下一批）
+    interrupted = bool(result.get("__interrupt__")) or result.get("plan_status") == "waiting_human"
+    if interrupted:
+        gate_items = result.get("pending_gate_items", [])
+        payload = json.dumps({
+            "plan_status":        result.get("plan_status", "waiting_human"),
+            "pending_gate_items": gate_items,
+        }, ensure_ascii=False)
+        yield f"event: interrupted\ndata: {payload}\n\n"
+        yield f"data: [WAITING_HUMAN:{raw_tid}]\n\n"
+    else:
+        yield f"data: [DONE:{raw_tid}]\n\n"
+
+
+def _snapshot_to_state_response(user_id: str, raw_tid: str, snapshot) -> "TaskPlanStateResponse":
+    values      = snapshot.values or {} if snapshot else {}
+    plan_status = values.get("plan_status", "completed")
+    is_waiting  = bool(snapshot and snapshot.next and "human_review_gate" in snapshot.next)
+    return TaskPlanStateResponse(
+        user_id            = user_id,
+        thread_id          = raw_tid,
+        plan_status        = plan_status,
+        is_awaiting_human  = is_waiting,
+        task_plan          = values.get("task_plan", []),
+        pending_gate_items = values.get("pending_gate_items", []) if is_waiting else [],
+    )
+
+
+# ══════════════════════════════════════════════════════
 # 4. 核心接口：POST /chat（普通对话）
 # ══════════════════════════════════════════════════════
 
@@ -356,6 +539,22 @@ async def chat(req: ChatRequest) -> ChatResponse:
     start_ms = time.time()
     # ★ 同一个 thread_id 排队执行，避免和另一个并发请求互相踩 checkpoint
     async with _get_thread_lock(internal_tid):
+        # ★ HITL 改动：如果上一轮还冻结在 human_review_gate 等人工决策，
+        #   这里直接拒绝新消息（否则 planner 会覆盖生成一份全新 task_plan，
+        #   等于悄悄丢弃了上一轮未处理完的人工审核事项）。
+        awaiting, gate_items, plan_status = await _check_awaiting_human(config)
+        if awaiting:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "当前会话存在待人工处理的任务，请先调用 "
+                               "POST /session/{user_id}/{thread_id}/resume 处理完，"
+                               "或调用 DELETE /session/{user_id}/{thread_id}/abort 放弃后再发新消息。",
+                    "plan_status":        plan_status,
+                    "pending_gate_items": gate_items,
+                },
+            )
+
         try:
             result = await agent_module.graph.ainvoke(
                 {"messages": [HumanMessage(content=req.question)]},
@@ -364,16 +563,34 @@ async def chat(req: ChatRequest) -> ChatResponse:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Agent 执行失败：{exc}") from exc
 
-        answer    = agent_module._get_message_content(result["messages"][-1])
+        # ★ HITL 改动：本轮执行途中被 interrupt() 冻结了（出现了 needs_human/
+        #   pending_approval），result 里不会有新的 AI 回复消息——图根本还没
+        #   跑到 final_answer。这时不能像原来那样直接取 messages[-1]。
+        plan_status = result.get("plan_status", "completed")
+        gate_items  = result.get("pending_gate_items", [])
+        interrupted = bool(result.get("__interrupt__")) or plan_status == "waiting_human"
+
+        if interrupted:
+            answer = (
+                f"本次请求中有 {len(gate_items)} 个任务需要人工确认后才能继续"
+                "（自动重试已耗尽，或涉及高风险操作），请查看 pending_gate_items 并调用 "
+                "/resume 提交决策。"
+            )
+        else:
+            answer = agent_module._get_message_content(result["messages"][-1])
+
         duration  = (time.time() - start_ms) * 1000
         msg_count = await _get_checkpoint_message_count(config)
 
     return ChatResponse(
-        answer        = answer,
-        user_id       = user_id,
-        thread_id     = raw_tid,
-        message_count = msg_count,
-        duration_ms   = round(duration, 1),
+        answer             = answer,
+        user_id            = user_id,
+        thread_id          = raw_tid,
+        message_count      = msg_count,
+        duration_ms        = round(duration, 1),
+        plan_status        = plan_status,
+        is_awaiting_human  = interrupted,
+        pending_gate_items = gate_items,
     )
 
 
@@ -435,6 +652,17 @@ async def chat_stream(
             await lock.acquire()
             lock_acquired = True
 
+            # ★ HITL 改动：同 /chat，先检查是否还冻结在上一轮的人工审核上
+            awaiting, gate_items, plan_status = await _check_awaiting_human(config)
+            if awaiting:
+                payload = json.dumps({
+                    "message": "当前会话存在待人工处理的任务，请先调用 /resume 处理完再发新消息。",
+                    "plan_status": plan_status,
+                    "pending_gate_items": gate_items,
+                }, ensure_ascii=False)
+                yield f"event: rejected\ndata: {payload}\n\n"
+                return
+
             invoke_task = asyncio.create_task(
                 agent_module.graph.ainvoke(
                     # ★ 修复3：state 只传 messages，去掉 _thread_id
@@ -443,38 +671,337 @@ async def chat_stream(
                 )
             )
 
-            while True:
-                try:
-                    token = await asyncio.wait_for(q.get(), timeout=120.0)
-                except asyncio.TimeoutError:
-                    yield "data: [ERROR] 等待超时（120s）\n\n"
-                    invoke_task.cancel()
-                    return
+            # ★ 改动：消费逻辑抽成了 _stream_graph_run，resume/stream 端点
+            #   跑的是同一份逻辑，只是发起 ainvoke 的方式不同（见该函数）。
+            async for chunk in _stream_graph_run(invoke_task, q, raw_tid):
+                yield chunk
+        finally:
+            agent_module._stream_queues.pop(request_id, None)  # 兜底清理
+            if lock_acquired:
+                lock.release()
 
-                if token is None:
-                    # ★ 修复"[DONE] 提前于 checkpoint 落盘"的竞态：
-                    #   token=None 只代表 final_answer_node 里 llm.astream()
-                    #   把回答文本吐完了，但摘要更新 + checkpoint 落盘是在这之后
-                    #   才做的（还没 return，图还没跑完）。旧代码在这里立刻
-                    #   yield [DONE]，客户端一看到 DONE 就可能立刻发下一轮，
-                    #   下一轮的 ainvoke 会读到"AI回复还没写进去、摘要还没更新"
-                    #   的旧 checkpoint 快照，两轮各自基于旧快照往前推，谁后
-                    #   写盘谁生效，中间这一轮的结果就被无声覆盖丢失。
-                    #   现在改成：先等 invoke_task 真正跑完（图 return、
-                    #   checkpoint 已落盘），再 yield [DONE]，让 [DONE]
-                    #   真正代表"这一轮已经彻底结束，可以放心发下一轮"。
-                    break
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-User-Id":         resolved_uid,
+            "X-Thread-Id":       raw_tid,
+        },
+    )
 
-                safe_token = str(token).replace("\n", " ")
-                yield f"data: {safe_token}\n\n"
 
-            try:
-                await invoke_task
-            except Exception as exc:
-                yield f"data: [ERROR] {exc}\n\n"
+# ══════════════════════════════════════════════════════
+# 5b. ★ HITL 改动：任务状态查询 + 人工决策恢复接口
+# ══════════════════════════════════════════════════════
+
+@app.get(
+    "/session/{user_id}/{thread_id}/state",
+    response_model=TaskPlanStateResponse,
+    summary="查询任务计划当前状态（含待人工处理事项）",
+    description=(
+        "返回当前 task_plan 的完整状态快照。前端可以据此渲染任务时间线/进度图，"
+        "以及在 is_awaiting_human=True 时展示 pending_gate_items 供用户决策。\n\n"
+        "直接读取 LangGraph checkpoint（graph.aget_state），不需要额外的存储层——"
+        "interrupt() 冻结时已经把完整 state 落盘了，这里查到的就是最新真相，"
+        "哪怕客户端断线重连、换个进程查询都一样准确。"
+    ),
+)
+async def get_task_plan_state(user_id: str, thread_id: str) -> TaskPlanStateResponse:
+    resolved_uid = _normalize_user_id(user_id)
+    internal_tid = _make_internal_thread_id(resolved_uid, thread_id)
+    _, raw_tid   = _split_internal_thread_id(internal_tid)
+    config       = {"configurable": {"thread_id": internal_tid, "user_id": resolved_uid}}
+
+    snapshot = await agent_module.graph.aget_state(config)
+    if not snapshot or not snapshot.values:
+        raise HTTPException(status_code=404, detail="会话不存在或尚未产生任何任务计划")
+
+    return _snapshot_to_state_response(resolved_uid, raw_tid, snapshot)
+
+
+@app.post(
+    "/session/{user_id}/{thread_id}/resume",
+    response_model=ResumeResponse,
+    summary="提交人工决策，恢复被中断的任务计划",
+    description=(
+        "会话冻结在 human_review_gate（is_awaiting_human=True）时调用此接口。\n\n"
+        "**一次性批量提交**：decisions 数组里包含针对本批 pending_gate_items 的"
+        "全部决策，一次提交即可（不需要逐个任务分别调用）。\n\n"
+        "action 取值：\n"
+        "- `retry` / `approve`：原样重新执行该任务\n"
+        "- `edit_and_retry`：patch.description 修改任务描述后重新执行\n"
+        "- `skip` / `reject`：跳过该任务，可选 patch.manual_result 提供替代结果\n"
+        "- `abort_all`：终止整个任务计划（task_id 随便填一个即可，此动作是全局的）\n\n"
+        "恢复后如果又出现了新一批待处理事项（比如刚重试的任务又失败了），"
+        "会在响应的 pending_gate_items 里返回，此时 is_awaiting_human 仍为 True，"
+        "需要再调用一次本接口处理新一批。"
+    ),
+)
+async def resume_task_plan(user_id: str, thread_id: str, req: ResumeRequest) -> ResumeResponse:
+    resolved_uid = _normalize_user_id(user_id)
+    internal_tid = _make_internal_thread_id(resolved_uid, thread_id)
+    _, raw_tid   = _split_internal_thread_id(internal_tid)
+    config       = {"configurable": {"thread_id": internal_tid, "user_id": resolved_uid}}
+
+    start_ms = time.time()
+    async with _get_thread_lock(internal_tid):
+        awaiting, _gate_items, plan_status = await _check_awaiting_human(config)
+        if not awaiting:
+            raise HTTPException(
+                status_code=409,
+                detail=f"当前会话不处于等待人工处理状态（plan_status={plan_status}），无需调用 /resume。",
+            )
+
+        decisions_payload = [d.model_dump() for d in req.decisions]
+        try:
+            # ★ HITL 核心：Command(resume=decisions_payload) 会被喂给冻结在
+            #   human_review_gate 里那次 interrupt() 调用，作为它的返回值，
+            #   图从冻结点精确继续执行——不会重新跑 planner，也不会重复执行
+            #   已经 done 的任务。
+            result = await agent_module.graph.ainvoke(
+                Command(resume=decisions_payload),
+                config=config,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"恢复执行失败：{exc}") from exc
+
+        new_plan_status = result.get("plan_status", "completed")
+        gate_items       = result.get("pending_gate_items", [])
+        still_waiting    = bool(result.get("__interrupt__")) or new_plan_status == "waiting_human"
+
+        answer = None
+        if not still_waiting:
+            # plan_status 变成了 completed 或 aborted，图已经跑到 final_answer 了
+            answer = agent_module._get_message_content(result["messages"][-1])
+
+        duration = (time.time() - start_ms) * 1000
+
+    return ResumeResponse(
+        user_id            = resolved_uid,
+        thread_id          = raw_tid,
+        plan_status        = new_plan_status,
+        is_awaiting_human  = still_waiting,
+        answer             = answer,
+        pending_gate_items = gate_items,
+        duration_ms        = round(duration, 1),
+    )
+
+
+@app.post(
+    "/session/{user_id}/{thread_id}/resume/stream",
+    summary="提交人工决策，以流式（SSE）方式恢复执行",
+    description=(
+        "语义跟 /resume 完全一样（提交 decisions，从 human_review_gate 冻结点精确恢复），"
+        "唯一区别：如果恢复后图一路跑到了 final_answer_node，会用 SSE 逐 token 推送"
+        "最终回答，而不是等生成完毕再一次性返回整段 answer。\n\n"
+        "如果这批决策提交后又产生了新的 pending_gate_items（比如刚重试的任务又失败了），"
+        "会收到 `event: interrupted`，跟 /chat/stream 遇到中断时的事件格式完全一致，"
+        "此时需要再调一次本接口处理下一批，直到收到 `[DONE:...]`。\n\n"
+        "⚠️ 前端注意：这是 POST 接口，浏览器原生 `EventSource` 不支持带 body 的 POST，"
+        "请用 `fetch()` + 手动读 `ReadableStream` 解析 SSE，不要用 `new EventSource(...)`。\n\n"
+        "事件格式（跟 /chat/stream 一致）：\n"
+        "- `data: <token>` — 回答文本 token\n"
+        "- `event: interrupted` + `data: {plan_status, pending_gate_items}` — 又冻结了\n"
+        "- `data: [WAITING_HUMAN:<thread_id>]` — 冻结收尾标记\n"
+        "- `data: [DONE:<thread_id>]` — 本轮真正跑完\n"
+        "- `event: rejected` — 该会话当前根本不处于等待人工态，无需调用本接口\n"
+        "- `data: [ERROR] ...` — 执行出错或等待超时"
+    ),
+)
+async def resume_task_plan_stream(
+    user_id: str,
+    thread_id: str,
+    req: ResumeRequest,
+) -> StreamingResponse:
+    resolved_uid = _normalize_user_id(user_id)
+    internal_tid = _make_internal_thread_id(resolved_uid, thread_id)
+    _, raw_tid   = _split_internal_thread_id(internal_tid)
+    request_id   = f"{internal_tid}_{uuid.uuid4().hex[:8]}"
+    # ★ 跟 chat_stream 一样：config 里塞 _stream_request_id，
+    #   final_answer_node 才会走 llm.astream() 那条流式分支
+    #   （否则就是我们上面确认过的、tid="" 触发的非流式兜底分支）
+    config = {
+        "configurable": {
+            "thread_id":          internal_tid,
+            "user_id":            resolved_uid,
+            "_stream_request_id": request_id,
+        }
+    }
+    decisions_payload = [d.model_dump() for d in req.decisions]
+
+    async def generate() -> AsyncGenerator[str, None]:
+        q: asyncio.Queue = asyncio.Queue()
+        agent_module._stream_queues[request_id] = q
+
+        # 跟 /resume 用同一把锁：同一个 thread_id 排队，
+        # 避免和另一个并发请求互相踩同一份 checkpoint
+        lock = _get_thread_lock(internal_tid)
+        lock_acquired = False
+
+        try:
+            await lock.acquire()
+            lock_acquired = True
+
+            awaiting, _gate_items, plan_status = await _check_awaiting_human(config)
+            if not awaiting:
+                payload = json.dumps({
+                    "message": (
+                        f"当前会话不处于等待人工处理状态（plan_status={plan_status}），"
+                        "无需调用 /resume/stream。"
+                    ),
+                    "plan_status": plan_status,
+                }, ensure_ascii=False)
+                yield f"event: rejected\ndata: {payload}\n\n"
                 return
 
-            yield f"data: [DONE:{raw_tid}]\n\n"
+            # ★ HITL 核心：跟非流式版 /resume 完全一样的 Command(resume=...)，
+            #   只是这里用 create_task 让它在后台跑，好让下面能同时消费 queue
+            invoke_task = asyncio.create_task(
+                agent_module.graph.ainvoke(
+                    Command(resume=decisions_payload),
+                    config=config,
+                )
+            )
+
+            async for chunk in _stream_graph_run(invoke_task, q, raw_tid):
+                yield chunk
+        finally:
+            agent_module._stream_queues.pop(request_id, None)  # 兜底清理
+            if lock_acquired:
+                lock.release()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-User-Id":         resolved_uid,
+            "X-Thread-Id":       raw_tid,
+        },
+    )
+
+
+@app.post(
+    "/session/{user_id}/{thread_id}/abort",
+    response_model=ResumeResponse,
+    summary="放弃当前中断，直接终止整个任务计划",
+    description="等价于对 /resume 提交一个 action=abort_all 的决策，不需要知道具体待办事项的 task_id。",
+)
+async def abort_task_plan(user_id: str, thread_id: str) -> ResumeResponse:
+    resolved_uid = _normalize_user_id(user_id)
+    internal_tid = _make_internal_thread_id(resolved_uid, thread_id)
+    _, raw_tid   = _split_internal_thread_id(internal_tid)
+    config       = {"configurable": {"thread_id": internal_tid, "user_id": resolved_uid}}
+
+    start_ms = time.time()
+    async with _get_thread_lock(internal_tid):
+        awaiting, gate_items, plan_status = await _check_awaiting_human(config)
+        if not awaiting:
+            raise HTTPException(
+                status_code=409,
+                detail=f"当前会话不处于等待人工处理状态（plan_status={plan_status}），无需终止。",
+            )
+
+        # abort_all 是全局动作，task_id 随便取第一个待办事项的即可（node 内部不校验存在性）
+        placeholder_tid = gate_items[0]["task_id"] if gate_items else 0
+        try:
+            result = await agent_module.graph.ainvoke(
+                Command(resume=[{"task_id": placeholder_tid, "action": "abort_all"}]),
+                config=config,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"终止失败：{exc}") from exc
+
+        answer   = agent_module._get_message_content(result["messages"][-1])
+        duration = (time.time() - start_ms) * 1000
+
+    return ResumeResponse(
+        user_id            = resolved_uid,
+        thread_id          = raw_tid,
+        plan_status        = result.get("plan_status", "aborted"),
+        is_awaiting_human  = False,
+        answer             = answer,
+        pending_gate_items = [],
+        duration_ms        = round(duration, 1),
+    )
+
+
+@app.post(
+    "/session/{user_id}/{thread_id}/abort/stream",
+    summary="放弃当前中断，以流式（SSE）方式终止整个任务计划",
+    description=(
+        "语义跟 /abort 完全一样（等价于提交一个 action=abort_all 的决策，不需要知道"
+        "具体待办事项的 task_id），唯一区别：abort_all 会让图直接路由到 "
+        "final_answer_node（gate_route 里 plan_status==\"aborted\" 时不会再回 "
+        "human_review_gate），这里改用 SSE 逐 token 推送最终的收尾回答，而不是"
+        "等生成完毕再一次性返回整段 answer。\n\n"
+        "⚠️ 前端注意：这是 POST 接口，浏览器原生 `EventSource` 不支持带 body 的 POST，"
+        "请用 `fetch()` + 手动读 `ReadableStream` 解析 SSE，不要用 `new EventSource(...)`。\n\n"
+        "事件格式（跟 /chat/stream、/resume/stream 一致）：\n"
+        "- `data: <token>` — 收尾回答文本 token\n"
+        "- `data: [DONE:<thread_id>]` — 终止流程真正跑完\n"
+        "- `event: rejected` — 该会话当前根本不处于等待人工态，无需调用本接口\n"
+        "- `data: [ERROR] ...` — 执行出错或等待超时\n\n"
+        "（理论上不会收到 event: interrupted——abort_all 会让 plan_status 直接"
+        "变成 aborted，gate_route 只会路由到 final_answer，不会再产生新一批 "
+        "pending_gate_items；这里复用 _stream_graph_run 只是为了跟 /resume/stream "
+        "共用同一套消费逻辑，多一层保险。）"
+    ),
+)
+async def abort_task_plan_stream(user_id: str, thread_id: str) -> StreamingResponse:
+    resolved_uid = _normalize_user_id(user_id)
+    internal_tid = _make_internal_thread_id(resolved_uid, thread_id)
+    _, raw_tid   = _split_internal_thread_id(internal_tid)
+    request_id   = f"{internal_tid}_{uuid.uuid4().hex[:8]}"
+    # 跟 chat_stream / resume_stream 一样：config 里塞 _stream_request_id，
+    # final_answer_node 才会走 llm.astream() 那条流式分支
+    config = {
+        "configurable": {
+            "thread_id":          internal_tid,
+            "user_id":            resolved_uid,
+            "_stream_request_id": request_id,
+        }
+    }
+
+    async def generate() -> AsyncGenerator[str, None]:
+        q: asyncio.Queue = asyncio.Queue()
+        agent_module._stream_queues[request_id] = q
+
+        # 跟 /abort 用同一把锁：同一个 thread_id 排队，
+        # 避免和另一个并发请求（比如同时在提交决策）互相踩同一份 checkpoint
+        lock = _get_thread_lock(internal_tid)
+        lock_acquired = False
+
+        try:
+            await lock.acquire()
+            lock_acquired = True
+
+            awaiting, gate_items, plan_status = await _check_awaiting_human(config)
+            if not awaiting:
+                payload = json.dumps({
+                    "message": (
+                        f"当前会话不处于等待人工处理状态（plan_status={plan_status}），"
+                        "无需终止。"
+                    ),
+                    "plan_status": plan_status,
+                }, ensure_ascii=False)
+                yield f"event: rejected\ndata: {payload}\n\n"
+                return
+
+            # abort_all 是全局动作，task_id 随便取第一个待办事项的即可（node 内部不校验存在性）
+            placeholder_tid = gate_items[0]["task_id"] if gate_items else 0
+            invoke_task = asyncio.create_task(
+                agent_module.graph.ainvoke(
+                    Command(resume=[{"task_id": placeholder_tid, "action": "abort_all"}]),
+                    config=config,
+                )
+            )
+
+            async for chunk in _stream_graph_run(invoke_task, q, raw_tid):
+                yield chunk
         finally:
             agent_module._stream_queues.pop(request_id, None)  # 兜底清理
             if lock_acquired:

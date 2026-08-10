@@ -171,6 +171,16 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 
+# ★ HITL 改动1：interrupt / Command 用于人工介入断点
+#
+# interrupt(payload)：在节点函数内部调用，会把 payload 存进 checkpoint 并
+#   冻结图的执行（依赖已有的 AsyncSqliteSaver，天然支持跨进程恢复）。
+# Command(resume=value)：恢复时用它替代普通的 state dict 传给 graph.ainvoke()，
+#   value 会成为对应 interrupt() 调用的返回值，从冻结点精确继续执行。
+#
+# 需要较新版本的 langgraph（pip install -U langgraph）才有 langgraph.types.interrupt。
+from langgraph.types import interrupt, Command
+
 # ★ CHECKPOINT 持久化升级：MemorySaver → AsyncSqliteSaver
 #
 # AsyncSqliteSaver 把 checkpoint 写入本地 SQLite 文件（checkpoints.db）。
@@ -382,6 +392,27 @@ class TaskInput(TypedDict):
     from_task: int
     field: str
 
+
+# ★ HITL 改动2：Task 状态机扩展
+#
+# 旧状态：pending / in_progress / done / failed（4个，failed 会被"硬跑"给下游）
+# 新状态机（8个，每个都有明确的下一步动作，failed 不再是终态）：
+#
+#   pending           → 计划里，还未调度
+#   pending_approval  → 高风险操作（写文件/写数据库等），执行前需人工批准
+#   in_progress       → 正在执行
+#   done              → 成功
+#   failed            → 瞬时态：仅在一次执行尝试失败的那一刻短暂出现，
+#                        本节点内部立刻会被重新分类成 pending（可自动重试）
+#                        或 needs_human（不可重试/重试耗尽），不会被返回给
+#                        上层持久化为终态。
+#   blocked           → 依赖链上有 needs_human/pending_approval/blocked 任务，
+#                        暂时无法解析 inputs，不会被调度执行
+#   needs_human       → 自动重试耗尽，或错误不可重试，等待人工决策
+#   skipped           → 人工决定跳过（不影响其他任务，下游拿到占位结果）
+#
+# 注意：不设 "aborted" 任务状态——是否终止整个计划是全局态
+# （AgentState.plan_status == "aborted"），不是某个任务的属性。
 class Task(TypedDict):
     task_id: int
     description: str
@@ -391,6 +422,70 @@ class Task(TypedDict):
     status: str
     result: str
     _resolved_description: str
+    retry_count: int        # ★ 新增：已自动重试次数
+    max_retries: int        # ★ 新增：最多自动重试几次（默认见 DEFAULT_MAX_RETRIES）
+    last_error: str         # ★ 新增：最近一次失败的错误信息（needs_human 时展示给用户）
+    high_risk: bool         # ★ 新增：planner 可显式标记高风险任务；未标记时由启发式规则兜底判断
+
+
+# ★ HITL 改动3：人工介入相关的数据结构
+#
+# GateItem：parallel_executor_node 产出的"待办事项"，交给 human_review_gate
+#   节点打包进 interrupt() payload，前端据此渲染决策 UI。
+class GateItem(TypedDict):
+    task_id: int
+    reason: str                  # "needs_human" | "pending_approval"
+    description: str             # 任务描述，前端展示用
+    error: str | None            # needs_human 时的失败原因
+    risk_type: str | None        # pending_approval 时标注是哪个 agent 触发的风险
+    downstream_blocked: list[int]  # 被这个任务连带 blocked 的下游任务 id 列表
+
+
+# HumanDecision：前端针对某个 GateItem 提交的决策，一次性批量提交一个数组。
+class HumanDecision(TypedDict):
+    task_id: int
+    action: str        # "retry" | "edit_and_retry" | "skip" | "approve" | "reject" | "abort_all"
+    patch: dict | None  # edit_and_retry 时可带 {"description": "..."}；
+                         # skip 时可选带 {"manual_result": "..."} 由人工提供替代结果
+
+
+# 自动重试策略的默认参数（可按需调整，或未来改成从 Task 里读取每任务自定义值）
+DEFAULT_MAX_RETRIES = 2
+_RETRY_BACKOFF_SECONDS = 2.0
+
+# 判定"可自动重试"的错误特征（网络/超时/限流类，通常是瞬时故障）
+_RETRYABLE_ERROR_HINTS = (
+    "timeout", "timed out", "connection", "connect", "temporarily",
+    "rate limit", "429", "503", "502", "overloaded", "socket", "eof",
+)
+
+
+def _classify_failure(exc: BaseException | None) -> str:
+    """判定一次任务失败是 'retryable'（值得自动重试）还是 'permanent'（不值得，直接转人工）。"""
+    if exc is None:
+        return "permanent"
+    if isinstance(exc, (asyncio.TimeoutError, ConnectionError, ConnectionResetError, ConnectionRefusedError)):
+        return "retryable"
+    msg = str(exc).lower()
+    return "retryable" if any(h in msg for h in _RETRYABLE_ERROR_HINTS) else "permanent"
+
+
+# 高风险任务判定：agent 命中集合 + description/_resolved_description 含风险关键词。
+# 这是一个启发式兜底规则，可通过 Task["high_risk"]=True 让 planner 显式标注覆盖它。
+_HIGH_RISK_AGENTS = {"file_agent", "db_agent"}
+_HIGH_RISK_KEYWORDS = (
+    "写入", "删除", "更新", "修改", "覆盖", "移动", "创建目录",
+    "write", "delete", "update", "insert", "move_file", "execute_db", "create_directory",
+)
+
+
+def _is_high_risk_task(task: "Task") -> bool:
+    if task.get("high_risk"):
+        return True
+    if task.get("agent") not in _HIGH_RISK_AGENTS:
+        return False
+    text = f"{task.get('description', '')} {task.get('_resolved_description', '')}".lower()
+    return any(kw.lower() in text for kw in _HIGH_RISK_KEYWORDS)
 
 
 # ★ CHECKPOINT 改动3/6：AgentState 的 messages 字段加 Annotated + add_messages
@@ -435,6 +530,28 @@ class AgentState(TypedDict):
     summary_turn_count: int     # 已摘要到的消息条数索引，初始为 0
     # _thread_id 已移至 config["configurable"]["_stream_request_id"]
     # 不再污染 state，LangSmith Input/Output 只显示 messages
+
+    # ★ HITL 改动4：AgentState 新增三个字段，支撑断点续传 + 人工介入
+    #
+    # plan_status：全局态，描述"整个任务计划"处于什么阶段。
+    #   "running"        → 正常执行中
+    #   "waiting_human"  → parallel_executor 遇到 needs_human/pending_approval，
+    #                       已 interrupt()，等待前端提交决策
+    #   "completed"      → 本轮所有任务都到达终态（done/skipped）
+    #   "aborted"        → 用户在人工审核环节选择终止整个计划
+    #
+    #   注意：这是"计划"的宏观状态，不是任务状态。是否终止整个流程
+    #   属于全局决策，因此 aborted 只出现在这里，不出现在 Task.status 里。
+    plan_status: str
+
+    # pending_gate_items：当前这一批待人工处理的事项（GateItem 列表）。
+    #   由 parallel_executor_node 产出，human_review_gate_node 消费。
+    #   human_review_gate 处理完当批决策后会清空为 []。
+    pending_gate_items: list[GateItem]
+
+    # decision_log：人工决策审计轨迹（HumanDecision 历史记录），可选但建议保留，
+    #   方便前端展示"这个任务之前被人工重试过几次/何时被跳过"。
+    decision_log: list[HumanDecision]
 
 
 # ══════════════════════════════════════════════════════
@@ -1351,6 +1468,17 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
     #   这是 LangGraph 原生支持的特性，不需要修改图结构。
     await _ensure_registry()
 
+    # ★ HITL 防御性检查：正常情况下，只要 api.py 按规范先查询 /state 再决定
+    #   是走 /resume 还是发新消息，就不会出现"上一轮还卡在 waiting_human，
+    #   这一轮又直接发了新问题"的情况（graph.ainvoke 遇到 pending interrupt
+    #   时不会自动帮你续上，而是从 planner 重新起跑，等于放弃了上一轮未决的
+    #   人工审核）。这里只做日志提醒，不阻断执行——真正的阻断建议放在
+    #   api.py 层（见 _reject_if_awaiting_human），因为那里能在调用 graph
+    #   之前就返回明确的 409，体验更好。
+    if state.get("plan_status") == "waiting_human":
+        print("  ⚠️ [Planner] 检测到上一轮仍处于 waiting_human 状态却收到了新规划请求，"
+              "上一轮未处理完的人工审核事项将被放弃，本轮将生成全新的 task_plan。")
+
     msgs = state.get("messages", [])
     
     # ── 修复：messages 为空 → 生成错误消息任务，而不是直接 FINISH ──
@@ -1364,10 +1492,15 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
             "status": "done",   # ← done 状态让 parallel_executor 跳过执行
             "result": "您好，我没有收到您的消息，请重新提问。",
             "_resolved_description": "",
+            "retry_count": 0, "max_retries": DEFAULT_MAX_RETRIES, "last_error": "", "high_risk": False,
         }
         return {
             "next_agent": "",          # ← 不为 "FINISH"，路由到 parallel_executor
             "task_plan": [error_task],
+            # ★ HITL 改动：每次重新规划都显式重置全局态，避免上一轮遗留的
+            #   waiting_human/aborted 污染新的一轮（这两个字段是普通覆盖字段，不会自动清空）。
+            "plan_status": "running",
+            "pending_gate_items": [],
         }
 
     # 取最后一条 HumanMessage 作为当前问题
@@ -1387,10 +1520,13 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
             "status": "done",
             "result": "抱歉，我没有理解您的问题，请重新描述。",
             "_resolved_description": "",
+            "retry_count": 0, "max_retries": DEFAULT_MAX_RETRIES, "last_error": "", "high_risk": False,
         }
         return {
             "next_agent": "",
             "task_plan": [error_task],
+            "plan_status": "running",
+            "pending_gate_items": [],
         }
 
     user_msg = _get_message_content(last_human_msg)
@@ -1541,6 +1677,11 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                 t.setdefault("_resolved_description", "")
                 t.setdefault("inputs", {})
                 t.setdefault("depends_on", [])
+                # ★ HITL 改动：新增字段的默认值（planner 的 LLM 输出不会包含这几个字段）
+                t.setdefault("retry_count", 0)
+                t.setdefault("max_retries", DEFAULT_MAX_RETRIES)
+                t.setdefault("last_error", "")
+                t.setdefault("high_risk", False)
 
             # inputs 格式校验
             fmt_errors: list[str] = []
@@ -1599,15 +1740,24 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                     "status": "done",
                     "result": f"抱歉，任务规划失败（已重试 {max_retries} 次）。错误信息：{e}。请重新描述您的需求，或换一种方式提问。",
                     "_resolved_description": "",
+                    "retry_count": 0, "max_retries": DEFAULT_MAX_RETRIES, "last_error": "", "high_risk": False,
                 }
                 return {
                     "task_plan":       [error_task],
                     "next_agent":      "",   # ← 路由到 parallel_executor
+                    "plan_status":     "running",
+                    "pending_gate_items": [],
                 }
 
     return {
         "task_plan":       task_plan,
         "next_agent":      "",   # ← 路由到 parallel_executor
+        # ★ HITL 改动：新一轮规划开始，显式重置全局态和待办清单。
+        #   防止上一轮如果是被用户中途放弃的 waiting_human/aborted 状态
+        #   残留到这一轮（这两个字段是普通覆盖字段，checkpoint 恢复后
+        #   不会自动清空，必须每次规划时显式重置）。
+        "plan_status":        "running",
+        "pending_gate_items": [],
     }
 # ══════════════════════════════════════════════════════
 # 8. 并行调度核心
@@ -1642,6 +1792,101 @@ def _topo_layers(tasks: list[Task], pre_done: set[int] | None = None) -> list[li
         remaining = [t for t in remaining if t not in layer]
 
     return layers
+
+
+def _resync_blocking(task_plan: list[Task]) -> None:
+    """
+    ★ HITL 改动5：级联阻塞收敛（双向），就地修改 task_plan。
+
+    【★ 修复】这是一个纯同步计算（只读写内存里的 task_plan 列表，没有任何
+    I/O），不应该是 async def。之前误标成了 async def，而两处调用点都是
+    普通调用（没有 await），导致这个函数实际上从未被真正执行过——Python
+    只会创建一个协程对象然后静默丢弃（垃圾回收时最多打一条
+    "coroutine was never awaited" 警告，不会报错、不会挂起），
+    级联阻塞逻辑等于完全失效。现在改回 def，两处调用点无需改动。
+
+    "坏状态" = needs_human / pending_approval / blocked —— 这些任务目前都
+    没有可用的 result，依赖它们的下游任务不能安全解析 inputs。
+
+    双向收敛，循环到不动点：
+      pending → blocked：任务的某个依赖处于坏状态，还不能跑，标记阻塞。
+      blocked → pending：任务原本被阻塞，但阻塞它的依赖已经全部脱离坏状态
+                          （比如人工把上游任务 retry 成功/skip 了），解除阻塞，
+                          重新变成可调度。
+
+    ★ 设计取舍：skipped 不计入"坏状态"。
+      人工选择跳过一个任务后，该任务会带着一个占位 result（见
+      human_review_gate_node），下游任务可以正常拿到这个占位值继续跑——
+      这与现有代码"部分任务失败不影响其他任务汇报"的设计哲学一致，
+      也避免了"永久跳过 → 下游永远 blocked 没有出路"的死循环。
+
+    ★ 是否会死循环？不会。每轮的 bad_ids 都是基于上一轮结束时状态的
+      一次性快照（标准的"标签传播/松弛迭代"模式，类似 Bellman-Ford），
+      即使某个任务中途短暂"抖动"（blocked→pending→blocked），也保证在
+      有限轮内收敛到不动点后 changed=False 退出。唯一的风险场景是
+      task_plan 里存在真正的循环依赖（planner 的 LLM 输出畸形，比如
+      A 依赖 B、B 又依赖 A）——这种情况下算法仍会收敛（不会无限循环），
+      但收敛到的结果可能是"永久死锁"（A、B 都卡在 blocked，且没有
+      needs_human/pending_approval 触发 interrupt 提醒人工）。
+      下面加了一个迭代次数上限作为保险丝：即使未来代码改动引入了真正的
+      死循环风险，也会在有限步内主动跳出并打印警告，而不是静默挂起。
+
+    调用时机：
+      1. parallel_executor_node 每层执行结束后（把新产生的失败/风险任务的
+         下游标记为 blocked）
+      2. human_review_gate_node 应用完人工决策后（把已解决的 blocked 任务
+         解除阻塞，恢复成 pending 以便下一轮调度）
+    """
+    # 迭代上限：正常情况下最多需要 len(task_plan) 轮就能收敛
+    #（每轮至少把"坏状态"沿依赖链传播/回收一跳），+5 留一点安全余量。
+    max_iterations = len(task_plan) + 5
+    changed = True
+    iterations = 0
+    while changed:
+        iterations += 1
+        if iterations > max_iterations:
+            print(f"  ⚠️ [_resync_blocking] 超过 {max_iterations} 轮仍未收敛，"
+                  f"疑似 task_plan 存在循环依赖，强制停止收敛（可能导致部分"
+                  f"任务的 blocked 状态不准确，建议检查 planner 生成的 depends_on）")
+            break
+        changed = False
+        bad_ids = {
+            t["task_id"] for t in task_plan
+            if t.get("status") in ("needs_human", "pending_approval", "blocked")
+        }
+        for t in task_plan:
+            deps = t.get("depends_on", [])
+            has_bad_dep = any(d in bad_ids for d in deps)
+            if t.get("status") == "pending" and has_bad_dep:
+                t["status"] = "blocked"
+                changed = True
+            elif t.get("status") == "blocked" and not has_bad_dep:
+                t["status"] = "pending"
+                changed = True
+
+
+def _transitive_dependents(task_plan: list[Task], root_id: int) -> list[int]:
+    """找出 task_plan 中所有直接或间接依赖 root_id 的任务 id（BFS，沿 depends_on 反向遍历）。"""
+    result: set[int] = set()
+    frontier = {root_id}
+    while frontier:
+        next_frontier: set[int] = set()
+        for t in task_plan:
+            tid = t["task_id"]
+            if tid == root_id or tid in result:
+                continue
+            if any(d in frontier for d in t.get("depends_on", [])):
+                result.add(tid)
+                next_frontier.add(tid)
+        frontier = next_frontier
+    return sorted(result)
+
+
+def _fill_downstream_blocked(task_plan: list[Task], gate_items: list[GateItem]) -> None:
+    """给每个 GateItem 补上"它连带阻塞了哪些下游任务"，前端展示影响范围用。就地修改。"""
+    for item in gate_items:
+        if not item.get("downstream_blocked"):
+            item["downstream_blocked"] = _transitive_dependents(task_plan, item["task_id"])
 
 
 async def _spawn_session_for(
@@ -1920,172 +2165,390 @@ def _use_sse() -> bool:
 
 async def parallel_executor_node(state: AgentState) -> AgentState:
     """
-    核心并行调度节点。
+    核心并行调度节点（★ HITL 改造版）。
 
-    checkpoint 失败恢复机制：
-      task["status"] == "done" 的任务会被跳过，不重复执行。
-      如果上次执行中途失败（比如某个 MCP server 超时），
-      重新 invoke 同一个 thread_id 时，已完成的任务不会重跑。
+    整体流程（每次调用只处理"当前能处理的部分"，处理不完就交给 human_review_gate）：
+      对每一层（拓扑排序得到）：
+        Step A 高风险预批准：本层里的高风险任务摘出来，标记 pending_approval，
+                不参与本层执行；同层其余任务照常并行执行（不因为兄弟任务要审批而等待）。
+        Step B 执行 + 分类 + 层内自动重试：gather 执行 → 按错误类型分类 →
+                可自动重试的原地重跑（带退避），重试耗尽/不可重试的转 needs_human。
+        Step C 级联阻塞收敛：本层结束后重新计算哪些下游任务因为上游进了
+                needs_human/pending_approval/blocked 而无法继续。
+        若本轮出现任何 needs_human/pending_approval → 停止推进后续层，
+        整理成 pending_gate_items，交给 human_review_gate 节点。
+
+    checkpoint 失败恢复机制（延续原设计，含义已扩展）：
+      status 为 done/skipped 的任务会被跳过，不重复执行；
+      blocked/needs_human/pending_approval 的任务不会被本轮调度
+      （blocked 等待级联解除，needs_human/pending_approval 等待人工决策）。
     """
     task_plan: list[Task] = state.get("task_plan", [])
 
     if not task_plan:
         print("\n🏁 [ParallelExecutor] task_plan 为空 → 跳过")
-        return {"next_agent": "FINISH"}
+        return {"next_agent": "FINISH", "plan_status": "completed"}
 
-    # ── checkpoint 失败恢复：过滤掉已完成的任务 ──────────────────────
-    # 什么时候会有 status=="done" 的任务？
-    #   场景：上次执行完成了任务0和任务1，但任务2失败了，整个 graph 报错退出。
-    #   下次用同一个 thread_id 重新 invoke，checkpoint 恢复了上次的 state，
-    #   task_plan 里任务0和任务1的 status 已经是 "done"。
-    #   这里过滤掉它们，只执行 pending/failed 的任务。
-    pending_tasks = [t for t in task_plan if t.get("status") != "done"]
+    # 兼容旧 checkpoint：老数据里的任务可能没有这几个新字段
+    for t in task_plan:
+        t.setdefault("retry_count", 0)
+        t.setdefault("max_retries", DEFAULT_MAX_RETRIES)
+        t.setdefault("last_error", "")
+        t.setdefault("high_risk", False)
 
-    if not pending_tasks:
-        print("\n🏁 [ParallelExecutor] 所有任务已完成（从 checkpoint 恢复）→ 直接汇总")
-        return {"next_agent": "FINISH"}
+    # ── 已到终态（done/skipped）的任务不再需要处理 ──────────────────────
+    unresolved = [t for t in task_plan if t.get("status") not in ("done", "skipped")]
+    if not unresolved:
+        print("\n🏁 [ParallelExecutor] 所有任务已到终态（done/skipped）→ 直接汇总")
+        return {"next_agent": "FINISH", "plan_status": "completed"}
 
-    skipped = len(task_plan) - len(pending_tasks)
-    if skipped > 0:
-        print(f"\n⏭️  [ParallelExecutor] 跳过 {skipped} 个已完成任务（checkpoint 恢复）")
+    already_resolved = len(task_plan) - len(unresolved)
+    if already_resolved > 0:
+        print(f"\n⏭️  [ParallelExecutor] 跳过 {already_resolved} 个已到终态的任务（checkpoint 恢复）")
 
-    # 分拓扑层（只对 pending 任务分层，但把已完成任务的 ID 作为初始 done 集合传入）
-    # ★ 修复Bug3：checkpoint 恢复时，已完成任务的 task_id 必须计入 done_ids，
-    #   否则依赖它们的 pending 任务永远无法满足依赖，触发强制入队乱序。
-    already_done_ids = {t["task_id"] for t in task_plan if t.get("status") == "done"}
-    layers = _topo_layers(pending_tasks, pre_done=already_done_ids)
-    total  = len(pending_tasks)
-    print(f"\n🚀 [ParallelExecutor] 共 {total} 个待执行任务，分 {len(layers)} 层")
+    # ★ 关键：只对 status=="pending" 的任务参与本轮拓扑分层。
+    #   blocked/needs_human/pending_approval 不参与——它们要么在等级联解除，
+    #   要么在等人工决策，绝不能被"强制硬跑"（这正是本次改造要修的根因）。
+    already_done_ids = {t["task_id"] for t in task_plan if t.get("status") in ("done", "skipped")}
+    schedulable = [t for t in task_plan if t.get("status") == "pending"]
+    layers = _topo_layers(schedulable, pre_done=already_done_ids)
+    total  = len(task_plan)
+    done_count = len(already_done_ids)
+
+    print(f"\n🚀 [ParallelExecutor] 本轮 {len(schedulable)} 个可调度任务，分 {len(layers)} 层"
+          f"（整体进度 {done_count}/{total}）")
     for i, layer in enumerate(layers):
         print(f"   层 {i}: {[t['task_id'] for t in layer]}")
 
-    done_count = 0
+    pending_gate_items: list[GateItem] = list(state.get("pending_gate_items", []))
 
     # ★ 修复：_exec_one 定义在 for 循环外部，避免在循环体内反复重新定义函数。
     #   task 作为参数显式传入（而非闭包捕获），消除 late-binding 风险。
-    #   task["agent"] 的修改是安全的：每个协程操作自己的 task 对象，dict 独立。
-    #   失败路径（BaseException）由 gather(return_exceptions=True) 处理，
-    #   status 回滚在 gather 结果收集阶段处理。
     async def _exec_one(task: Task) -> tuple[int, str]:
         agent = task.get("agent", "default_agent")
 
-        # ★ 修复4 — 第一层（执行前）：检查 registry 里该 agent 是否有工具
-        #   如果一个非 direct 的 agent 在 registry 里根本没有注册工具，
-        #   提前改为 default_agent，避免 spawn session 后再失败。
-        #   注意：math_agent 等会独立 spawn session，registry 里可能没有对应工具，
-        #   这种情况不应该 fallback，所以只对"registry 确实有工具但 agent 写错了"
-        #   的情况做前置检查。
-        #   判断依据：registry 里总工具数 > 0，但该 agent 的工具数 == 0
+        # 第一层（执行前）：检查 registry 里该 agent 是否有工具，没有就前置 fallback。
         if (agent not in ("direct",)
-                and _registry.agents          # registry 已就绪
-                and agent not in _registry.agents  # 该 agent 根本没注册
+                and _registry.agents
+                and agent not in _registry.agents
         ):
-            print(f"  ⚠️ [{agent}] 不在 registry 中，"
-                  f"前置 fallback → default_agent")
+            print(f"  ⚠️ [{agent}] 不在 registry 中，前置 fallback → default_agent")
             task["agent"] = "default_agent"
             agent = "default_agent"
 
-        try:
-            if agent == "direct":
-                result = await _run_direct_task(task, state)
-            else:
-                system_prompt = AGENT_SYSTEM_PROMPTS.get(agent, DEFAULT_AGENT_SYSTEM_PROMPT)
-                result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
-            return task["task_id"], result
-        except Exception as exc:
-            # ★ 修复：执行失败时把 status 回滚到 "failed"（而非 "in_progress"），
-            #   确保 checkpoint 恢复时不会将失败任务误判为"正在运行"。
-            task["status"] = "failed"
-            raise exc
+        if agent == "direct":
+            result = await _run_direct_task(task, state)
+        else:
+            system_prompt = AGENT_SYSTEM_PROMPTS.get(agent, DEFAULT_AGENT_SYSTEM_PROMPT)
+            result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
+        return task["task_id"], result
 
     for layer_idx, layer in enumerate(layers):
-        # ── 解析运行时 inputs（依赖上一层的结果）──────────────────────
+        # ── Step A：高风险预批准过滤（执行前拦截，不进入本层的 gather）──────
+        auto_run: list[Task] = []
         for task in layer:
-            inputs         = task.get("inputs", {})
-            resolved_parts = []
+            if _is_high_risk_task(task):
+                task["status"] = "pending_approval"
+                print(f"  🛑 [层 {layer_idx}] 任务[{task['task_id']}] 判定为高风险操作"
+                      f"（agent={task.get('agent')}），暂停等待人工批准")
+                pending_gate_items.append({
+                    "task_id": task["task_id"],
+                    "reason": "pending_approval",
+                    "description": task.get("description", ""),
+                    "error": None,
+                    "risk_type": task.get("agent"),
+                    "downstream_blocked": [],
+                })
+            else:
+                auto_run.append(task)
 
-            declared_src_ids: set = set()
-            for param_name, task_input in inputs.items():
-                if isinstance(task_input, dict):
-                    src_id = task_input.get("from_task")
-                    field  = task_input.get("field", "result")
-                elif isinstance(task_input, int):
-                    src_id = task_input
-                    field  = "result"
+        if auto_run:
+            # ── 解析运行时 inputs（依赖前面层/已完成任务的结果）──────────────
+            for task in auto_run:
+                inputs         = task.get("inputs", {})
+                resolved_parts = []
+
+                declared_src_ids: set = set()
+                for param_name, task_input in inputs.items():
+                    if isinstance(task_input, dict):
+                        src_id = task_input.get("from_task")
+                        field  = task_input.get("field", "result")
+                    elif isinstance(task_input, int):
+                        src_id = task_input
+                        field  = "result"
+                    else:
+                        print(f"  ⚠️ inputs[{param_name}] 格式异常，跳过")
+                        continue
+                    if src_id is not None:
+                        declared_src_ids.add(src_id)
+                    src = next((t for t in task_plan if t["task_id"] == src_id), None)
+                    val = src.get(field, "") if src else ""
+                    resolved_parts.append(f"【{param_name}】= {val}")
+
+                for dep_id in task.get("depends_on", []):
+                    if dep_id not in declared_src_ids:
+                        src = next((t for t in task_plan if t["task_id"] == dep_id), None)
+                        if src:
+                            val = src.get("result", "")
+                            resolved_parts.append(f"【任务{dep_id}的结果】= {val}")
+
+                # ★ 保留 planner 注入的JSON：以 _resolved_description 为基础，追加运行时参数
+                base_desc = task.get("_resolved_description") or task["description"]
+                resolved_desc = base_desc
+                if resolved_parts:
+                    resolved_desc += "\n\n【运行时参数】\n" + "\n".join(resolved_parts)
+                task["_resolved_description"] = resolved_desc
+                task["status"] = "in_progress"
+
+            # ── Step B：并行执行 + 分类 + 层内自动重试（带退避）──────────────
+            print(f"\n▶ [层 {layer_idx}] 并行执行 {len(auto_run)} 个任务："
+                  f"{[t['task_id'] for t in auto_run]}")
+            t_layer_start = time.perf_counter()
+
+            current_batch = auto_run
+            while current_batch:
+                # return_exceptions=True：防止单任务异常拖垮整批
+                raw_results = await asyncio.gather(
+                    *[_exec_one(t) for t in current_batch],
+                    return_exceptions=True,
+                )
+
+                retry_next: list[Task] = []
+                for task, r in zip(current_batch, raw_results):
+                    if isinstance(r, BaseException):
+                        task["last_error"] = str(r)
+                        kind = _classify_failure(r)
+                        if kind == "retryable" and task["retry_count"] < task["max_retries"]:
+                            task["retry_count"] += 1
+                            print(f"  🔁 [层 {layer_idx}] 任务[{task['task_id']}] 失败"
+                                  f"（{kind}，第 {task['retry_count']}/{task['max_retries']} 次重试）："
+                                  f"{task['last_error'][:120]}")
+                            retry_next.append(task)
+                        else:
+                            task["status"] = "needs_human"
+                            if task.get("result", "") == "":
+                                task["result"] = "（执行异常，等待人工处理）"
+                            print(f"  ⏸️ [层 {layer_idx}] 任务[{task['task_id']}] 转人工审核"
+                                  f"（{kind}，已重试 {task['retry_count']} 次）："
+                                  f"{task['last_error'][:120]}")
+                            pending_gate_items.append({
+                                "task_id": task["task_id"],
+                                "reason": "needs_human",
+                                "description": task.get("description", ""),
+                                "error": task["last_error"],
+                                "risk_type": None,
+                                "downstream_blocked": [],
+                            })
+                    else:
+                        task_id, result = r
+                        task["status"] = "done"
+                        task["result"] = result
+                        task["last_error"] = ""
+                        done_count += 1
+
+                if retry_next:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+                    for task in retry_next:
+                        task["status"] = "in_progress"
+                    current_batch = retry_next
                 else:
-                    print(f"  ⚠️ inputs[{param_name}] 格式异常，跳过")
-                    continue
-                if src_id is not None:
-                    declared_src_ids.add(src_id)
-                src = next((t for t in task_plan if t["task_id"] == src_id), None)
-                val = src.get(field, "") if src else ""
-                resolved_parts.append(f"【{param_name}】= {val}")
+                    current_batch = []
 
-            for dep_id in task.get("depends_on", []):
-                if dep_id not in declared_src_ids:
-                    src = next((t for t in task_plan if t["task_id"] == dep_id), None)
-                    if src:
-                        val = src.get("result", "")
-                        resolved_parts.append(f"【任务{dep_id}的结果】= {val}")
+            layer_elapsed = time.perf_counter() - t_layer_start
+            print(f"◀ [层 {layer_idx}] 结束，耗时 {layer_elapsed:.2f}s，"
+                  f"整体进度 {done_count}/{total}")
 
-            # ★ 保留 planner 注入的JSON：以 _resolved_description 为基础，追加运行时参数
-            base_desc = task.get("_resolved_description") or task["description"]
-            resolved_desc = base_desc
-            if resolved_parts:
-                resolved_desc += "\n\n【运行时参数】\n" + "\n".join(resolved_parts)
-            task["_resolved_description"] = resolved_desc
-            task["status"] = "in_progress"
+        # ── Step C：本层结束，重新计算级联阻塞（不管 auto_run 是否为空都要做）──
+        _resync_blocking(task_plan)
 
-        # ── 并行执行当前层所有任务 ─────────────────────────────────────
-        print(f"\n▶ [层 {layer_idx}] 并行执行 {len(layer)} 个任务："
-              f"{[t['task_id'] for t in layer]}")
-        t_layer_start = time.perf_counter()
+        if pending_gate_items:
+            # 出现了需要人工处理的事项：不再推进到下一层
+            #（下一层可能依赖本层还没跑完/被拦截的任务，继续跑会读到空结果）。
+            _fill_downstream_blocked(task_plan, pending_gate_items)
+            print(f"\n⏸️ [ParallelExecutor] 出现 {len(pending_gate_items)} 项待人工处理事项，"
+                  f"暂停后续层，路由到 human_review_gate")
+            break
 
-        # ★ 修复Bug1：return_exceptions=True，防止单任务异常拖垮整层
-        #   return_exceptions=False（默认）下，任何一个任务抛异常，
-        #   gather 立即向上抛出，整层其他任务的结果全部丢失。
-        #   改为 True 后，异常会作为结果元素返回，其他任务正常收集。
-        raw_results = await asyncio.gather(
-            *[_exec_one(t) for t in layer],
-            return_exceptions=True,
-        )
+    # ★ 修复（第二层保险）：判断"是否完成"不能只看本轮新产生的 pending_gate_items，
+    #   还要检查 task_plan 里是否残留 needs_human/pending_approval 的孤儿任务——
+    #   例如 human_review_gate 收到未知 action 后把任务转回 needs_human，
+    #   但由于某种疏漏没能重新纳入 pending_gate_items（本次已在 gate 节点修复，
+    #   但这里的兜底能防止未来类似疏漏再次导致任务被静默吞掉、误判为 completed）。
+    orphaned = [
+        t for t in task_plan
+        if t.get("status") in ("needs_human", "pending_approval")
+    ]
+    if orphaned and not pending_gate_items:
+        print(f"\n⚠️ [ParallelExecutor] 发现 {len(orphaned)} 个孤儿任务"
+              f"（状态为 needs_human/pending_approval 但本轮未产生对应 gate_item），"
+              f"重新打包成待办事项，避免被误判为 completed：")
+        for t in orphaned:
+            print(f"   task_id={t['task_id']} status={t.get('status')}")
+            pending_gate_items.append({
+                "task_id":            t["task_id"],
+                "reason":             t.get("status"),
+                "description":        t.get("description", ""),
+                "error":              t.get("last_error", ""),
+                "risk_type":          t.get("agent") if t.get("status") == "pending_approval" else None,
+                "downstream_blocked": [],
+            })
+        _fill_downstream_blocked(task_plan, pending_gate_items)  
 
-        # ── 将结果写回 task_plan ───────────────────────────────────────
-        result_map: dict[int, str] = {}
-        success_ids: set[int] = set()   # 记录真正成功的 task_id
-        for r in raw_results:
-            if isinstance(r, BaseException):
-                print(f"  ❌ [gather] 某任务抛出未捕获异常：{r}")
-                # 异常已经在 _exec_one 里被改为 "failed" 了，这里保持即可
-            else:
-                task_id, result = r
-                result_map[task_id] = result
-                success_ids.add(task_id)
+    if pending_gate_items:
+        plan_status = "waiting_human"
+        next_agent  = ""   # 路由改由 plan_status 驱动（见 executor_route），next_agent 不再使用
+    else:
+        plan_status = "completed"
+        next_agent  = "FINISH"
+        print(f"\n🏁 [ParallelExecutor] 全部 {total} 个任务处理完毕（含 done/skipped）")
 
-        for task in layer:
-            if task["task_id"] in success_ids:
-                task["status"] = "done"
-                task["result"] = result_map[task["task_id"]]
-                done_count += 1   # ← 新增这一行
-            else:
-                # ★ 关键修复：保留 _exec_one 里设置的 "failed" 状态，不改写！
-                # task["status"] 已经是 "failed"（在 _exec_one 的 except 里设置的）
-                # 只需确保 result 有值即可（_exec_one 里可能还没来得及设置 result）
-                if task.get("result", "") == "":
-                    task["result"] = "（执行异常，无结果）"
-
-        layer_elapsed = time.perf_counter() - t_layer_start
-        print(f"◀ [层 {layer_idx}] 全部完成，耗时 {layer_elapsed:.2f}s，"
-              f"进度 {done_count}/{total}")
-
-    print(f"\n🏁 [ParallelExecutor] 全部 {total} 个任务执行完毕")
-    # ★ 修复：只返回需要更新的字段，不展开 **state。
-    #   messages 是 Annotated[list, add_messages]，展开 **state 会把完整历史
-    #   再追加一遍，导致每经过本节点消息数翻倍。
-    #   task_plan 已被就地修改（task["status"] = "done" 等），直接返回引用。
     return {
-        "task_plan":  task_plan,
-        "next_agent": "FINISH",
+        "task_plan":           task_plan,
+        "pending_gate_items":  pending_gate_items,
+        "plan_status":         plan_status,
+        "next_agent":          next_agent,
+    }
+
+
+# ══════════════════════════════════════════════════════
+# 10b. human_review_gate_node —— 人工介入断点（★ HITL 核心新增节点）
+# ══════════════════════════════════════════════════════
+
+async def human_review_gate_node(state: AgentState) -> AgentState:
+    """
+    职责很薄，只做两件事：
+      1. 把 parallel_executor 产出的 pending_gate_items 一次性打包，
+         调用 interrupt() 冻结图执行，等待前端一次性提交决策数组。
+      2. 恢复后，把决策写回 task_plan（不做任何执行逻辑），
+         调用 _resync_blocking 解除因决策而不再受阻的下游任务。
+
+    为什么是"批量一次性"而不是逐个 interrupt()？
+      一次 interrupt() 冻结一次 checkpoint，多个待办事项打包成一个数组一起
+      展示、一起提交，用户体验上是"一次决策会话"，而不是好几轮来回等待。
+      新一批待办事项（比如刚才 retry 的任务又失败了）会在 parallel_executor
+      下一次运行时产生，属于新一轮 pending_gate_items，走的是新一次
+      interrupt() 调用，不是同一批事项被拆开来回问。
+    """
+    gate_items: list[GateItem] = state.get("pending_gate_items", [])
+    task_plan:  list[Task]     = state.get("task_plan", [])
+
+    if not gate_items:
+        # 安全兜底：正常路由不会在没有待办事项时进入这个节点
+        return {"plan_status": "running"}
+
+    # ★ interrupt() 调用点：LangGraph 会把这个 payload 连同当前完整 state
+    #   一起写入 AsyncSqliteSaver 的 checkpoint，图在此冻结。
+    #   前端可随时通过 graph.aget_state(config) 读到同样的 payload（见 api.py 的
+    #   GET /session/{user_id}/{thread_id}/state）。
+    #   恢复时调用方用 Command(resume=decisions) 传入的 decisions 就是这里的返回值。
+    decisions: list[HumanDecision] = interrupt({
+        "type":  "task_review_batch",
+        "items": gate_items,
+    }) or []
+
+    print(f"\n👤 [HumanReviewGate] 收到 {len(decisions)} 条人工决策")
+
+    by_id = {t["task_id"]: t for t in task_plan}
+    # ★ 修复（安全校验）：记录这一批 interrupt() 实际交出去问人的 task_id 集合。
+    #   如果不做这层校验，只要 task_id 在 task_plan 里存在就会被套用决策——
+    #   这在多标签页/请求重放/客户端持有过期快照（比如刷新前拿到的旧
+    #   pending_gate_items）等场景下，会把一个早就已经 done/skipped 的任务
+    #   错误地重新打回 pending 并再跑一次，可能有副作用（发消息、下单等）。
+    #   只允许对"确实还在等这批人工决策"的任务应用决策，其余一律忽略。
+    gate_task_ids = {g["task_id"] for g in gate_items}
+    decision_log = list(state.get("decision_log", []))
+    plan_status  = "running"
+    # ★ 修复：不再无条件返回 []，而是收集"处理完这批决策后仍然需要
+    #   人工再看一眼"的事项（目前只有 else 分支的未知 action 会产生）。
+    unresolved_gate_items: list[GateItem] = []
+
+    for d in decisions:
+        tid    = d.get("task_id")
+        action = d.get("action")
+
+        decision_log.append({
+            "task_id":   tid,
+            "action":    action,
+            "patch":     d.get("patch"),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+
+        # ★ abort_all 是全局动作，不依赖某个具体 task_id 存在，单独处理
+        if action == "abort_all":
+            plan_status = "aborted"
+            print(f"  🛑 人工选择终止整个任务计划（决策携带的 task_id={tid}，仅作参考）")
+            continue
+
+        # ★ 修复：task_id 必须属于本轮 interrupt() 交出去的那批，
+        #   否则视为过期/无关决策，忽略并打日志，不去动这个任务的状态。
+        if tid not in gate_task_ids:
+            print(f"  ⚠️ [HumanReviewGate] 决策引用的 task_id={tid} 不在本轮待办事项中"
+                  f"（可能是过期快照或重复提交），忽略")
+            continue
+
+        task = by_id.get(tid)
+        if task is None:
+            print(f"  ⚠️ [HumanReviewGate] 决策引用了不存在的 task_id={tid}，忽略")
+            continue
+
+        if action in ("retry", "edit_and_retry", "approve"):
+            patch = d.get("patch") or {}
+            if action == "edit_and_retry":
+                if "description" in patch:
+                    task["description"] = patch["description"]
+                    # 修改了任务描述，运行时 inputs 需要重新解析，清空旧的 _resolved_description
+                    task["_resolved_description"] = ""
+            task["status"]      = "pending"
+            task["retry_count"] = 0
+            task["last_error"]  = ""
+            print(f"  ▶️ 任务[{tid}] {action} → 重新排入调度")
+
+        elif action in ("skip", "reject"):
+            task["status"] = "skipped"
+            manual_result = (d.get("patch") or {}).get("manual_result")
+            task["result"] = manual_result or "（该任务已被人工跳过，无可用结果）"
+            print(f"  ⏭️ 任务[{tid}] 已跳过"
+                  f"{'（含人工提供的替代结果）' if manual_result else ''}")
+
+        else:
+            print(f"  ⚠️ 未知 action='{action}'（task_id={tid}），保守转回 needs_human")
+            task["status"] = "needs_human"
+            # ★ 修复：之前这里只改了状态，却没有把任务重新塞回 gate_items，
+            #   导致函数末尾统一返回的 pending_gate_items 硬编码为 []，
+            #   这个任务就变成了"状态是 needs_human，但没人再问"的孤儿——
+            #   下一轮 parallel_executor 不会调度它（非 pending），
+            #   也不会把它重新纳入 pending_gate_items（它没有"刚失败"），
+            #   如果本轮恰好没有别的新待办事项，plan_status 就会被误判为
+            #   completed，图直接结束，这个任务永远得不到人工再次决策。
+            unresolved_gate_items.append({
+                "task_id":            tid,
+                "reason":             "needs_human",
+                "description":        task.get("description", ""),
+                "error":              task.get("last_error", "") or f"未知的人工决策 action: {action}",
+                "risk_type":          None,
+                "downstream_blocked": [],
+            })
+
+    if plan_status != "aborted":
+        # 解除因为决策而不再受阻的下游任务；abort 时不需要，final_answer 会统一报告
+        _resync_blocking(task_plan)
+
+    # ★ 修复：plan_status 不再无条件设为 "running"（那是函数开头的初始值），
+    #   而是取决于本轮结束后是否还有未解决的 gate_items——
+    #   如果有（比如上面 else 分支新产生的），必须留在 waiting_human，
+    #   让 gate_route 把图重新路由回 human_review_gate 再问一轮，
+    #   而不是放行到 parallel_executor / final_answer。
+    if plan_status != "aborted":
+        plan_status = "waiting_human" if unresolved_gate_items else "running"
+        
+    if unresolved_gate_items:
+        _fill_downstream_blocked(task_plan, unresolved_gate_items)  
+
+    return {
+        "task_plan":          task_plan,
+        "pending_gate_items": unresolved_gate_items,
+        "plan_status":        plan_status,
+        "decision_log":       decision_log,
     }
 
 
@@ -2100,6 +2563,24 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
     tid = (config or {}).get("configurable", {}).get("_stream_request_id", "")
     print(f"  🔍 [final_answer] _stream_request_id={tid} queues={list(_stream_queues.keys())}")
     task_plan: list[Task] = state.get("task_plan", [])
+    plan_status: str = state.get("plan_status", "completed")
+
+    # ★ HITL 改动：状态标签映射扩展到全部 8 个任务状态，
+    #   之前只有 done/❌ 两档，failed 会被误判成"失败"永久展示（现在 failed
+    #   已经是瞬时态，几乎不会出现在这里，仍保留兜底文案以防万一）。
+    _STATUS_LABELS = {
+        "done":              "✅已完成",
+        "skipped":           "⏭️已跳过（人工决定）",
+        "blocked":           "⛔未执行（依赖任务未就绪）",
+        "needs_human":       "⏸️等待人工处理",
+        "pending_approval":  "⏸️等待人工审批（高风险操作）",
+        "pending":           "⏳未执行",
+        "in_progress":       "⏳执行中",
+        "failed":            "❌失败",
+    }
+
+    def _status_label(t: Task) -> str:
+        return _STATUS_LABELS.get(t.get("status", ""), f"❓{t.get('status')}")
 
     tool_tasks   = [t for t in task_plan if t.get("agent") != "direct"]
     direct_tasks = [t for t in task_plan if t.get("agent") == "direct"]
@@ -2108,21 +2589,25 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
     if direct_tasks:
         all_results_lines.append("【直接回答任务】")
         for t in direct_tasks:
-            status_tag = "✅已完成" if t.get("status") == "done" else "❌失败"
             all_results_lines.append(
-                f"  任务[{t['task_id']}]（{t['description']}）[{status_tag}]：{t['result']}"
+                f"  任务[{t['task_id']}]（{t['description']}）[{_status_label(t)}]：{t['result']}"
             )
 
     if tool_tasks:
         all_results_lines.append("【工具执行任务（以下为工具实际返回值，必须以此为准）】")
         for t in tool_tasks:
-            status_tag = "✅已完成" if t.get("status") == "done" else "❌失败"
             all_results_lines.append(
-                f"  任务[{t['task_id']}]（{t['description']}）[{status_tag}]：{t['result']}"
+                f"  任务[{t['task_id']}]（{t['description']}）[{_status_label(t)}]：{t['result']}"
             )
 
+    if plan_status == "aborted":
+        all_results_lines.append(
+            "\n【计划状态】用户在人工审核环节主动终止了本次任务计划，"
+            "以上未到达'已完成/已跳过'状态的任务均未执行。"
+        )
+
     results_text = "\n".join(all_results_lines)
-    print(f"\n  📝 汇总所有任务结果：\n{results_text}")
+    print(f"\n  📝 汇总所有任务结果（plan_status={plan_status}）：\n{results_text}")
 
     msgs = state.get("messages", [])
 
@@ -2181,7 +2666,11 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         "   严禁因为某个子任务失败就忽略其他已成功子任务的结果——\n"
         "   每个任务的结果独立汇报，成功的如实展示，失败的说明原因，不互相影响。\n"
         "7. 【关键】如果多个子任务中只有部分失败，其他成功任务的结果仍须完整呈现，\n"
-        "   不能以'第N步失败导致后续无法执行'为由跳过已经执行并有结果的任务。"
+        "   不能以'第N步失败导致后续无法执行'为由跳过已经执行并有结果的任务。\n"
+        "8. 若某任务标记为'等待人工处理'或'等待人工审批'，如实告知用户该任务正在"
+        "等待人工确认，不要编造它已经完成或已经失败。\n"
+        "9. 若【计划状态】提示用户主动终止了计划，简洁说明哪些任务已完成、"
+        "哪些因为用户中止而未执行，不要过度解释原因。"
     )
 
     # ── 流式 vs 非流式：根据 _stream_queue 是否已注入来决定 ────────────
@@ -2373,8 +2862,19 @@ DEFAULT_AGENT_SYSTEM_PROMPT = AGENT_SYSTEM_PROMPTS["default_agent"]
 #   - 不需要修改任何图结构，完全透明
 def build_graph(checkpointer=None, store=None) -> Any:
     """
-    图结构（极简）：
-        planner → parallel_executor → final_answer → END
+    图结构（★ HITL 改造后）：
+
+        planner → parallel_executor ──(plan_status=="waiting_human")──→ human_review_gate
+                        ↑                                                     │
+                        │                    (plan_status=="running"，恢复继续跑)│
+                        └─────────────────────────────────────────────────────┘
+                        │
+                        └──(plan_status in "completed"/"aborted")──→ final_answer → END
+
+    human_review_gate 内部调用 interrupt()，图在此冻结并把 payload+完整 state
+    落盘到 checkpointer；前端通过 Command(resume=decisions) 恢复。
+    parallel_executor ↔ human_review_gate 之间可能来回多轮
+    （每轮处理一批 pending_gate_items），直到不再产生新的待办事项或用户选择终止。
     """
 
     def planner_route(state: AgentState) -> str:
@@ -2382,10 +2882,26 @@ def build_graph(checkpointer=None, store=None) -> Any:
             return "END"
         return "parallel_executor"
 
+    def executor_route(state: AgentState) -> str:
+        if state.get("plan_status") == "waiting_human":
+            return "human_review_gate"
+        return "final_answer"
+
+    def gate_route(state: AgentState) -> str:
+        ps = state.get("plan_status", "running")
+        if ps == "aborted":
+            return "final_answer"
+        if ps == "waiting_human":
+            # 安全兜底：正常不会出现（human_review_gate 一次性处理完当批事项），
+            # 万一出现（比如决策数组没能覆盖所有 gate_items），留在原地再问一轮。
+            return "human_review_gate"
+        return "parallel_executor"
+
     g = StateGraph(AgentState)
-    g.add_node("planner",           planner_node)
-    g.add_node("parallel_executor", parallel_executor_node)
-    g.add_node("final_answer",      final_answer_node)
+    g.add_node("planner",            planner_node)
+    g.add_node("parallel_executor",  parallel_executor_node)
+    g.add_node("human_review_gate",  human_review_gate_node)
+    g.add_node("final_answer",       final_answer_node)
 
     g.set_entry_point("planner")
 
@@ -2394,8 +2910,18 @@ def build_graph(checkpointer=None, store=None) -> Any:
         "parallel_executor": "parallel_executor",
     })
 
-    g.add_edge("parallel_executor", "final_answer")
-    g.add_edge("final_answer",      END)
+    g.add_conditional_edges("parallel_executor", executor_route, {
+        "human_review_gate": "human_review_gate",
+        "final_answer":      "final_answer",
+    })
+
+    g.add_conditional_edges("human_review_gate", gate_route, {
+        "parallel_executor":  "parallel_executor",
+        "human_review_gate":  "human_review_gate",
+        "final_answer":       "final_answer",
+    })
+
+    g.add_edge("final_answer", END)
 
     # CLI 模式：checkpointer=MemorySaver, store=InMemoryStore
     # webapp 模式：checkpointer=AsyncSqliteSaver, store=AsyncSqliteStore
