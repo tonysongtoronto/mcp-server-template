@@ -211,6 +211,22 @@ from pathlib import Path
 _dotenv_path = Path(__file__).parent.parent / ".env"
 load_dotenv(str(_dotenv_path), override=False)
 
+# ★ HITL 测试专用模块（独立文件：src/hitl_test_scenarios.py）
+#
+# 只在这里做一次性导入 + 极小的旁路判断，所有测试场景定义、失败模拟、
+# 确定性汇总文本都在独立文件里维护，不污染本文件的正常调度逻辑。
+# 用 try/except 包一层：即使这个文件被误删/损坏，也只是让 "/hitl_test ..."
+# 指令退化成一次普通对话请求（Planner 会把它当成一句正常用户输入去规划），
+# 不会导致整个服务起不来。
+try:
+    import hitl_test_scenarios as _hitl_test
+except ImportError:
+    _hitl_test = None
+
+# test_agent 这个 agent 名字专供 HITL 测试场景使用，调度逻辑里有两处需要
+# 识别它、不要把它当成真实 MCP agent 处理（见下方 _exec_one 里的两处引用）。
+_TEST_AGENT_NAME = getattr(_hitl_test, "TEST_AGENT_NAME", "test_agent")
+
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -1532,6 +1548,39 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
     user_msg = _get_message_content(last_human_msg)
     print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
 
+    # ★ HITL 测试专用钩子（见 src/hitl_test_scenarios.py）
+    #
+    # 当用户消息以 "/hitl_test " 开头时，完全跳过真实 LLM 规划，直接用
+    # hitl_test_scenarios.build_scenario_task_plan() 产出一份手工编排好的
+    # task_plan（agent 全部标记为 "test_agent"）。后续 parallel_executor /
+    # human_review_gate / final_answer 的调度逻辑不受任何影响，走的还是
+    # 真实代码路径——被跳过的只是"规划"和"最终自然语言汇总"这两步会
+    # 用到真实 LLM 的环节，方便在没有 LLM API Key / 无法出网的环境
+    # （比如 CI）里也能对 HITL 断点续传机制做完整的自动化回归测试。
+    if _hitl_test is not None and _hitl_test.is_test_command(user_msg):
+        scenario_name = _hitl_test.parse_scenario_name(user_msg)
+        try:
+            test_task_plan = _hitl_test.build_scenario_task_plan(scenario_name)
+        except KeyError as e:
+            test_task_plan = [{
+                "task_id": 0,
+                "description": "报告未知的 HITL 测试场景名",
+                "agent": "direct",
+                "inputs": {}, "depends_on": [],
+                "status": "done", "result": str(e),
+                "_resolved_description": "",
+                "retry_count": 0, "max_retries": DEFAULT_MAX_RETRIES,
+                "last_error": "", "high_risk": False,
+            }]
+        print(f"  🧪 [Planner] 命中 HITL 测试指令，场景={scenario_name!r}，"
+              f"跳过真实 LLM 规划，任务数={len(test_task_plan)}")
+        return {
+            "task_plan":          test_task_plan,
+            "next_agent":         "",
+            "plan_status":        "running",
+            "pending_gate_items": [],
+        }
+
     # ── 调试：打印 msgs 全貌，确认跨轮历史是否被平台恢复 ────────────────
     print(f"  🔍 [Planner-debug] msgs 共 {len(msgs)} 条：")
     for i, m in enumerate(msgs):
@@ -2228,7 +2277,11 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
         agent = task.get("agent", "default_agent")
 
         # 第一层（执行前）：检查 registry 里该 agent 是否有工具，没有就前置 fallback。
-        if (agent not in ("direct",)
+        # ★ HITL 测试钩子：test_agent 跟 direct 一样是"虚拟 agent"，不挂真实
+        #   MCP 工具，registry 里天然找不到它，必须和 direct 一起排除在这个
+        #   fallback 判断之外，否则测试任务会被误改写成 default_agent，
+        #   跑真实（且未 mock 的）MCP 工具调用。
+        if (agent not in ("direct", _TEST_AGENT_NAME)
                 and _registry.agents
                 and agent not in _registry.agents
         ):
@@ -2238,6 +2291,11 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
 
         if agent == "direct":
             result = await _run_direct_task(task, state)
+        elif agent == _TEST_AGENT_NAME and _hitl_test is not None:
+            # ★ HITL 测试钩子（见 src/hitl_test_scenarios.py）：
+            #   确定性地返回成功文本，或抛出异常模拟 retryable/permanent 失败，
+            #   走的仍是本函数外层 asyncio.gather + 分类重试的真实调度逻辑。
+            result = await _hitl_test.run_test_agent(task, state)
         else:
             system_prompt = AGENT_SYSTEM_PROMPTS.get(agent, DEFAULT_AGENT_SYSTEM_PROMPT)
             result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
@@ -2498,6 +2556,15 @@ async def human_review_gate_node(state: AgentState) -> AgentState:
                     task["description"] = patch["description"]
                     # 修改了任务描述，运行时 inputs 需要重新解析，清空旧的 _resolved_description
                     task["_resolved_description"] = ""
+            # ★ Bug 修复：approve 之前只把 status 改回 "pending"，没有清除
+            #   high_risk 标记。parallel_executor_node 每轮调度前都会用
+            #   _is_high_risk_task() 重新判定——high_risk 仍为 True 时，
+            #   任务会在还没真正执行前就又被 Step A 打回 "pending_approval"，
+            #   形成"批准 → 重新调度 → 又被判定为高风险 → 又要审批"的死循环，
+            #   人工批准实际上永远无法让任务真正跑起来。
+            #   这里显式清掉 high_risk，代表"已经被人工批准过，这一次不用再拦"。
+            if action == "approve":
+                task["high_risk"] = False
             task["status"]      = "pending"
             task["retry_count"] = 0
             task["last_error"]  = ""
@@ -2618,6 +2685,23 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         (m for m in reversed(msgs) if isinstance(m, HumanMessage)),
         HumanMessage(content="")
     )
+
+    # ★ HITL 测试专用钩子（见 src/hitl_test_scenarios.py）
+    #
+    # 当这一轮的用户消息以 "/hitl_test " 开头时，跳过真实 LLM 汇总调用，
+    # 直接用 hitl_test_scenarios.build_final_answer() 拼一份基于任务结果的
+    # 确定性文本。这一步是整条链路里唯一必须调用真实 LLM 的环节
+    # （规划已经在 planner_node 里被同样的钩子跳过了），跳过它之后，
+    # 整个 "/hitl_test scenario_xxx" 请求可以在完全没有 LLM API Key /
+    # 无法访问外部 LLM 服务的环境下端到端跑完，方便自动化回归测试。
+    if _hitl_test is not None and _hitl_test.is_test_command(_get_message_content(last_human)):
+        test_answer = _hitl_test.build_final_answer(task_plan, plan_status)
+        print(f"  🧪 [FinalAnswer] 命中 HITL 测试指令，跳过真实 LLM 汇总")
+        return {
+            "messages":             [AIMessage(content=test_answer)],
+            "conversation_summary": state.get("conversation_summary", ""),
+            "summary_turn_count":   state.get("summary_turn_count", 0),
+        }
 
     # ── 构建"摘要前缀"────────────────────────────────────────────────
     # ★ conversation_summary 是 JSON 字符串：conv_summary 保留原始字符串
