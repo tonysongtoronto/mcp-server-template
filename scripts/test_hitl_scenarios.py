@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+
+uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1
+
+uv run python scripts/test_hitl_scenarios.py
 scripts/test_hitl_scenarios.py
 
 HITL（人工介入断点续传）功能自动化回归测试脚本
 ────────────────────────────────────────────────────────
 直接调用 api.py 的真实 HTTP 接口，端到端跑一遍 HITL 断点续传机制的
-场景1-6 + 场景8（并发保护），每一步都带断言，跑完打印汇总报告。
+场景1-6 + 场景8（并发保护），每一步都带断言，跑完打印汇总报告，
+并且把整个过程的详细日志（每一次 HTTP 请求/响应 + 每一条断言）
+落盘成一份带时间戳的 JSON 文件，方便事后追踪分析。
 
 依赖的服务端配合（见 src/hitl_test_scenarios.py + src/langgraph_parallel_agent.py
 里三处极小的旁路钩子）：
@@ -22,6 +28,12 @@ HITL（人工介入断点续传）功能自动化回归测试脚本
     python scripts/test_hitl_scenarios.py
     API_BASE=http://localhost:8000 python scripts/test_hitl_scenarios.py
 
+    # 自定义日志输出目录（默认 scripts/logs/，跟脚本同目录下的子文件夹）
+    HITL_TEST_LOG_DIR=/tmp/my_logs python scripts/test_hitl_scenarios.py
+
+    # 不想生成日志文件时可以关掉
+    HITL_TEST_LOG_ENABLED=0 python scripts/test_hitl_scenarios.py
+
 前置条件：
     - api.py 已经在跑（默认 http://localhost:8000，见 /health）
     - src/hitl_test_scenarios.py 存在（HITL 测试专用模块，独立文件）
@@ -30,9 +42,13 @@ HITL（人工介入断点续传）功能自动化回归测试脚本
 ────────────────────────────────────────────────────────
 """
 
+import json
 import os
 import sys
+import time
 import uuid
+from datetime import datetime, timezone
+
 import requests
 
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000").rstrip("/")
@@ -41,32 +57,182 @@ USER_ID  = "hitl_test_user"
 PASS, FAIL = [], []
 
 
-# ── HTTP 封装 ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════
+# 日志子系统（独立函数，不侵入上面已有的测试逻辑）
+# ────────────────────────────────────────────────────────
+# 设计目标：
+#   - 每次运行脚本都单独生成一份 JSON 日志文件，文件名带时间戳，
+#     天然按时间顺序排列，不覆盖历史记录。
+#   - 记录粒度到"每一次 HTTP 请求 + 响应"和"每一条断言"，方便事后
+#     追溯某个场景到底哪一步、哪个字段跟预期不一样。
+#   - 跟现有 check() / chat() / get_state() / resume() / abort() 的
+#     调用方式完全不变——通过给这几个函数加一层很薄的记录逻辑来实现，
+#     不需要改动 test_scenario_xxx() 里的任何一行断言代码。
+# ══════════════════════════════════════════════════════
+
+LOG_ENABLED = os.environ.get("HITL_TEST_LOG_ENABLED", "1") != "0"
+LOG_DIR = os.environ.get(
+    "HITL_TEST_LOG_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
+)
+
+_RUN_STARTED_AT = datetime.now(timezone.utc)
+_RUN_ID = _RUN_STARTED_AT.strftime("%Y%m%d_%H%M%S")
+
+# 当前正在跑的场景名（由每个 test_scenario_xxx() 在开头调用 _enter_scenario() 设置），
+# 用来给下面记录的每一次 HTTP 调用 / 断言自动打上场景标签，调用方不用每次手动传。
+_CURRENT_SCENARIO = {"name": None}
+
+# 原始事件流水账：调用发生的先后顺序，一条不漏。
+_CALL_LOG: list[dict] = []
+_CHECK_LOG: list[dict] = []
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _enter_scenario(name: str) -> None:
+    """标记"从现在起，后续的 HTTP 调用/断言都归属于这个场景"，供日志分组用。"""
+    _CURRENT_SCENARIO["name"] = name
+
+
+def _record_call(method: str, url: str, request_body, status_code, response_body, elapsed_ms: float) -> None:
+    _CALL_LOG.append({
+        "seq":          len(_CALL_LOG) + 1,
+        "scenario":     _CURRENT_SCENARIO["name"],
+        "timestamp":    _now_iso(),
+        "method":       method,
+        "url":          url,
+        "request":      request_body,
+        "status_code":  status_code,
+        "response":     response_body,
+        "elapsed_ms":   round(elapsed_ms, 1),
+    })
+
+
+def _record_check(scenario: str, desc: str, passed: bool, extra: str) -> None:
+    _CHECK_LOG.append({
+        "seq":       len(_CHECK_LOG) + 1,
+        "scenario":  scenario,
+        "timestamp": _now_iso(),
+        "desc":      desc,
+        "passed":    passed,
+        "extra":     extra if not passed else "",
+    })
+
+
+def build_run_log(exit_code: int) -> dict:
+    """
+    汇总本次运行的完整日志结构。独立函数，纯读 _CALL_LOG / _CHECK_LOG /
+    PASS / FAIL 这几个模块级列表，不产生副作用，方便单独单元测试或者
+    在其它脚本里复用（比如自己再包一层多次运行取平均耗时之类的分析）。
+    """
+    finished_at = datetime.now(timezone.utc)
+
+    # 按场景把 checks / calls 重新分组一份，方便人工浏览某个场景的完整过程，
+    # 不用在扁平的 checks/calls 数组里自己按 scenario 字段过滤。
+    scenarios: dict[str, dict] = {}
+    for c in _CHECK_LOG:
+        bucket = scenarios.setdefault(c["scenario"], {"checks": [], "calls": []})
+        bucket["checks"].append(c)
+    for c in _CALL_LOG:
+        bucket = scenarios.setdefault(c["scenario"], {"checks": [], "calls": []})
+        bucket["calls"].append(c)
+    for name, bucket in scenarios.items():
+        bucket["passed"] = sum(1 for x in bucket["checks"] if x["passed"])
+        bucket["failed"] = sum(1 for x in bucket["checks"] if not x["passed"])
+
+    total = len(_CHECK_LOG)
+    passed = len(PASS)
+    failed = len(FAIL)
+
+    return {
+        "meta": {
+            "run_id":            _RUN_ID,
+            "api_base":          API_BASE,
+            "user_id":           USER_ID,
+            "started_at":        _RUN_STARTED_AT.isoformat(timespec="milliseconds"),
+            "finished_at":       finished_at.isoformat(timespec="milliseconds"),
+            "duration_seconds":  round((finished_at - _RUN_STARTED_AT).total_seconds(), 3),
+            "python_version":    sys.version.split()[0],
+            "exit_code":         exit_code,
+        },
+        "summary": {
+            "total_checks":  total,
+            "passed":        passed,
+            "failed":        failed,
+            "pass_rate":     f"{(passed / total * 100):.1f}%" if total else "N/A",
+            "scenarios_run": sorted(s for s in scenarios if s is not None),
+            "failed_checks": list(FAIL),
+        },
+        "scenarios":  scenarios,   # 按场景分组，人工浏览用
+        "calls":      _CALL_LOG,   # 完整时间顺序流水账，机器分析/回放用
+        "checks":     _CHECK_LOG,
+    }
+
+
+def save_run_log(log: dict) -> str | None:
+    """
+    把 build_run_log() 产出的字典落盘成 JSON 文件，文件名带时间戳，
+    每次运行都是一份新文件，天然按时间顺序排列（文件名可直接按字符串排序）。
+    返回写入的文件路径；HITL_TEST_LOG_ENABLED=0 时跳过写入，返回 None。
+    """
+    if not LOG_ENABLED:
+        return None
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        path = os.path.join(LOG_DIR, f"hitl_test_log_{_RUN_ID}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception as e:
+        print(f"  ⚠️ 日志写入失败（不影响测试结果）：{e}")
+        return None
+
+
+# ── HTTP 封装（在原有基础上加了一层调用记录，接口签名/返回值完全不变）──
 
 def chat(question: str, thread_id: str) -> dict:
     """POST /chat —— 非流式 JSON 接口，直接拿完整 ChatResponse。"""
-    res = requests.post(f"{API_BASE}/chat", json={
-        "question": question, "user_id": USER_ID, "thread_id": thread_id,
-    })
-    return {"status_code": res.status_code, "body": _safe_json(res)}
+    payload = {"question": question, "user_id": USER_ID, "thread_id": thread_id}
+    t0 = time.perf_counter()
+    res = requests.post(f"{API_BASE}/chat", json=payload)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    body = _safe_json(res)
+    _record_call("POST", f"{API_BASE}/chat", payload, res.status_code, body, elapsed_ms)
+    return {"status_code": res.status_code, "body": body}
 
 
 def get_state(thread_id: str) -> dict:
-    res = requests.get(f"{API_BASE}/session/{USER_ID}/{thread_id}/state")
-    return {"status_code": res.status_code, "body": _safe_json(res)}
+    url = f"{API_BASE}/session/{USER_ID}/{thread_id}/state"
+    t0 = time.perf_counter()
+    res = requests.get(url)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    body = _safe_json(res)
+    _record_call("GET", url, None, res.status_code, body, elapsed_ms)
+    return {"status_code": res.status_code, "body": body}
 
 
 def resume(thread_id: str, decisions: list[dict]) -> dict:
-    res = requests.post(
-        f"{API_BASE}/session/{USER_ID}/{thread_id}/resume",
-        json={"decisions": decisions},
-    )
-    return {"status_code": res.status_code, "body": _safe_json(res)}
+    url = f"{API_BASE}/session/{USER_ID}/{thread_id}/resume"
+    payload = {"decisions": decisions}
+    t0 = time.perf_counter()
+    res = requests.post(url, json=payload)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    body = _safe_json(res)
+    _record_call("POST", url, payload, res.status_code, body, elapsed_ms)
+    return {"status_code": res.status_code, "body": body}
 
 
 def abort(thread_id: str) -> dict:
-    res = requests.post(f"{API_BASE}/session/{USER_ID}/{thread_id}/abort")
-    return {"status_code": res.status_code, "body": _safe_json(res)}
+    url = f"{API_BASE}/session/{USER_ID}/{thread_id}/abort"
+    t0 = time.perf_counter()
+    res = requests.post(url)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    body = _safe_json(res)
+    _record_call("POST", url, None, res.status_code, body, elapsed_ms)
+    return {"status_code": res.status_code, "body": body}
 
 
 def _safe_json(res):
@@ -91,6 +257,7 @@ def task_status(state_body: dict, task_id: int) -> str | None:
 
 def check(scenario: str, desc: str, condition: bool, extra: str = ""):
     label = f"[{scenario}] {desc}"
+    _record_check(scenario, desc, bool(condition), extra)
     if condition:
         print(f"  \u2705 {label}")
         PASS.append(label)
@@ -104,6 +271,7 @@ def check(scenario: str, desc: str, condition: bool, extra: str = ""):
 # ══════════════════════════════════════════════════════
 def test_scenario1_autoretry():
     s = "场景1-自动重试"
+    _enter_scenario(s)
     print(f"\n=== {s} ===")
     tid = new_thread()
 
@@ -124,6 +292,7 @@ def test_scenario1_autoretry():
 # ══════════════════════════════════════════════════════
 def test_scenario2_retry_exhausted():
     s = "场景2-重试耗尽"
+    _enter_scenario(s)
     print(f"\n=== {s} ===")
     tid = new_thread()
 
@@ -157,6 +326,7 @@ def test_scenario2_retry_exhausted():
 # ══════════════════════════════════════════════════════
 def test_scenario3_cascade():
     s = "场景3-级联阻塞"
+    _enter_scenario(s)
     print(f"\n=== {s} ===")
     tid = new_thread()
 
@@ -184,6 +354,7 @@ def test_scenario3_cascade():
 # ══════════════════════════════════════════════════════
 def test_scenario4_high_risk():
     s = "场景4-高风险审批"
+    _enter_scenario(s)
     print(f"\n=== {s} ===")
     tid = new_thread()
 
@@ -212,6 +383,7 @@ def test_scenario4_high_risk():
 # ══════════════════════════════════════════════════════
 def test_scenario5_abort():
     s = "场景5-终止计划"
+    _enter_scenario(s)
     print(f"\n=== {s} ===")
 
     # 方式A：通过 resume 提交 abort_all
@@ -235,6 +407,7 @@ def test_scenario5_abort():
 # ══════════════════════════════════════════════════════
 def test_scenario6_batch_mixed():
     s = "场景6-混合批量"
+    _enter_scenario(s)
     print(f"\n=== {s} ===")
     tid = new_thread()
 
@@ -263,6 +436,7 @@ def test_scenario6_batch_mixed():
 # ══════════════════════════════════════════════════════
 def test_scenario8_concurrent_rejection():
     s = "场景8-并发保护"
+    _enter_scenario(s)
     print(f"\n=== {s} ===")
     tid = new_thread()
 
@@ -299,27 +473,30 @@ def main():
         try:
             fn()
         except Exception as e:
+            _enter_scenario(fn.__name__)
             FAIL.append(f"[{fn.__name__}] 测试执行本身抛出异常：{e}")
+            _record_check(fn.__name__, "测试执行本身未抛异常", False, str(e))
             print(f"  💥 [{fn.__name__}] 执行异常：{e}")
 
     print("\n" + "=" * 60)
     print(f"通过：{len(PASS)}    失败：{len(FAIL)}")
+    exit_code = 0
     if FAIL:
         print("\n失败详情：")
         for f in FAIL:
             print(f"  - {f}")
-        sys.exit(1)
+        exit_code = 1
     else:
         print("🎉 全部通过")
-        sys.exit(0)
+
+    log = build_run_log(exit_code)
+    log_path = save_run_log(log)
+    if log_path:
+        print(f"\n📄 详细日志已保存：{log_path}")
+        print(f"   （本次运行共记录 {len(_CALL_LOG)} 次 HTTP 调用、{len(_CHECK_LOG)} 条断言）")
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
     main()
-
-
-# uv run uvicorn src.api:app --host 0.0.0.0 --port 8000 --workers 1
-
-# 另开一个终端，跑 HITL 测试
-
-# uv run python scripts/test_hitl_scenarios.py
