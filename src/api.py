@@ -184,6 +184,9 @@ class TaskPlanStateResponse(BaseModel):
     is_awaiting_human:      bool               = Field(..., description="图当前是否正冻结在 human_review_gate 等待决策")
     task_plan:              list[TaskInfo]     = Field(default_factory=list)
     pending_gate_items:      list[GateItemModel] = Field(default_factory=list)
+    # ★ Bugfix：之前完全没有这个字段，导致「刷新状态」（GET /state）只能
+    #   看到任务计划的状态数据，看不到真正的最终回答文本。
+    answer:                 str | None = Field(None, description="最新一轮的最终回答文本；仍冻结在 human_review_gate（is_awaiting_human=True）时为 None")
 
 
 class HumanDecisionIn(BaseModel):
@@ -461,7 +464,20 @@ async def _stream_graph_run(
             if token is None:
                 # final_answer_node 的 llm.astream() 吐完文本了（正常收尾路径）
                 break
-            safe_token = str(token).replace("\n", " ")
+            # ★ Bugfix v2（推翻上一版"多行 data: 帧"的方案）：
+            #   上一版为了不丢换行，把一个 token 拆成多行 data: + 一个空行，
+            #   一个 token 从 1 次 yield 变成 2 次 yield，客户端也从"读到
+            #   一行就立刻派发"改成"必须等到空行才能确认消息结束"。这在
+            #   真实 LLM 逐 token 流场景下，给本该逐字实时显示的内容凭空
+            #   多引入了一个 await send() 调度点/一次"等下一行"的等待，
+            #   牺牲了原本"读到即发"的实时性——不该为了修多行文本的格式
+            #   丢失问题，动了单行 token 的高频热路径。
+            #   改用换行转义：\u2028（Unicode 行分隔符，不会出现在正常
+            #   文本里，也不会跟下面 [DONE]/[ERROR]/[WAITING_HUMAN] 的
+            #   前缀判断冲突）替换 token 里的真实 \n。仍然是一个 token
+            #   一行 data:、一次 yield，读到即发，完全恢复原有实时性；
+            #   客户端拿到后再把 \u2028 还原成真正的换行用于渲染。
+            safe_token = str(token).replace("\n", "\u2028")
             yield f"data: {safe_token}\n\n"
             continue
 
@@ -497,6 +513,23 @@ def _snapshot_to_state_response(user_id: str, raw_tid: str, snapshot) -> "TaskPl
     values      = snapshot.values or {} if snapshot else {}
     plan_status = values.get("plan_status", "completed")
     is_waiting  = bool(snapshot and snapshot.next and "human_review_gate" in snapshot.next)
+
+    # ★ Bugfix：之前这里完全不读 messages，answer 永远拿不到，前端「刷新
+    #   状态」只能瞎拼占位文案。跟 /chat、/resume 等接口一样，直接从
+    #   checkpoint 里取最后一条 AIMessage 作为 answer。
+    #   is_waiting=True 时刻意留空：这时最后一条消息大概率还是用户当轮
+    #   提问（图还没跑到 final_answer_node），把上一轮的旧回答当成"本轮
+    #   结果"展示出来反而会误导用户。
+    answer = None
+    if not is_waiting:
+        msgs = values.get("messages", [])
+        last_ai = next(
+            (m for m in reversed(msgs) if isinstance(m, agent_module.AIMessage)),
+            None,
+        )
+        if last_ai is not None:
+            answer = agent_module._get_message_content(last_ai)
+
     return TaskPlanStateResponse(
         user_id            = user_id,
         thread_id          = raw_tid,
@@ -504,6 +537,7 @@ def _snapshot_to_state_response(user_id: str, raw_tid: str, snapshot) -> "TaskPl
         is_awaiting_human  = is_waiting,
         task_plan          = values.get("task_plan", []),
         pending_gate_items = values.get("pending_gate_items", []) if is_waiting else [],
+        answer             = answer,
     )
 
 

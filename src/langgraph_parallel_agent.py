@@ -2697,6 +2697,20 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
     if _hitl_test is not None and _hitl_test.is_test_command(_get_message_content(last_human)):
         test_answer = _hitl_test.build_final_answer(task_plan, plan_status)
         print(f"  🧪 [FinalAnswer] 命中 HITL 测试指令，跳过真实 LLM 汇总")
+        # ★ Bugfix：之前这里直接 return，完全没有往 _stream_queues[tid] 推送
+        #   任何内容。api.py 的 _stream_graph_run 是靠"队列里能不能收到
+        #   token"来判断本轮有没有正文可流式推送的——而这个分支完全不调用
+        #   真实 LLM，graph 的 invoke_task 几乎瞬间完成，于是
+        #   _stream_graph_run 里 asyncio.wait(get_task, invoke_task) 总是
+        #   invoke_task 先就绪，直接走"没有中断→yield [DONE]"分支，
+        #   一个 token 都没推过。前端因此收到一个空答案，AI 气泡一直是空的
+        #   （就是"测试对话成功但收不到返回消息"那个现象）。
+        #   这里补上跟下面 `async for chunk in llm.astream(...)` 完全同一套
+        #   协议：有队列就把内容推进去，最后放哨兵 None 通知流结束。
+        q = _stream_queues.get(tid) if tid else None
+        if q is not None:
+            await q.put(test_answer)
+            await q.put(None)
         return {
             "messages":             [AIMessage(content=test_answer)],
             "conversation_summary": state.get("conversation_summary", ""),
