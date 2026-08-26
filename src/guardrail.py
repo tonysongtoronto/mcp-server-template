@@ -137,6 +137,28 @@ RULE_CATEGORIES: dict[str, str] = {
 # 触发 LLM 语义复核的 agent（工具调用风险面最大的三个）
 _SEMANTIC_REVIEW_AGENTS = {"db_agent", "file_agent", "http_agent"}
 
+# ──────────────────────────────────────────────────────────────────────────
+# 2b. 高危分级：单用户/内部工具场景不做"审批人与请求人隔离"，但不能让
+#     所有风险都走同一个一键 approve——正则精确命中、且基本没有合理业务
+#     场景的这几类（无条件 UPDATE/DELETE、DROP/TRUNCATE 等、路径穿越/敏感
+#     路径、SSRF 到内网/云元数据），approve 时要求人工把确认短语原样输入，
+#     而不是点一下按钮就放行。见 langgraph_parallel_agent.py 里
+#     requires_confirm_phrase 的用法。
+#
+#     ★ 不把 sensitive_content / 旧启发式关键词规则 / LLM 语义复核 纳入
+#     这个集合：这几类本身误报率较高（比如"更新"命中启发式关键词），
+#     强制二次确认只会增加噪音而不增加安全性，普通 approve 已经足够。
+# ──────────────────────────────────────────────────────────────────────────
+HARD_RISK_CATEGORIES = {"dangerous_sql", "path_traversal", "ssrf"}
+
+
+def is_hard_risk(risk_type: Optional[str], rule_hits: list[dict]) -> bool:
+    """判断这次判定是否命中"高危、需要二次确认"的类别。
+    优先看 rule_hits（可能不止一条），risk_type 是兜底（只有一条命中时两者等价）。"""
+    if any(h.get("category") in HARD_RISK_CATEGORIES for h in (rule_hits or [])):
+        return True
+    return risk_type in HARD_RISK_CATEGORIES
+
 
 def _run_sql_rules(text: str) -> list[dict]:
     hits = []

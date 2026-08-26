@@ -176,6 +176,16 @@ class GateItemModel(BaseModel):
     error:                str | None          = None
     risk_type:            str | None          = None
     downstream_blocked:   list[int]           = Field(default_factory=list)
+    # ★ 安全修复同步：requires_confirm_phrase 非空时，前端必须让人工把这个
+    #   字符串原样输入进 approve 决策的 patch.confirm_text 里，服务端才会
+    #   真正放行（human_review_gate_node 里做的校验）。这里如果不补上这个
+    #   字段，GateItemModel 会把它悄悄丢掉——SSE 流式接口是直接透传原始
+    #   dict、不受影响，但 GET /state 和非流式 /resume 走的正是这个模型，
+    #   会导致前端拿到的待办事项里少了"需要二次确认"这条信息，人工完全
+    #   不知道要多输入一步，一直 approve 失败也不知道为什么。
+    requires_confirm_phrase: str | None       = Field(
+        None, description="非空时，approve 必须在 patch.confirm_text 里原样带上这个短语才会生效（高危操作二次确认）"
+    )
 
 
 class TaskPlanStateResponse(BaseModel):
@@ -193,7 +203,14 @@ class TaskPlanStateResponse(BaseModel):
 class HumanDecisionIn(BaseModel):
     task_id: int
     action:   str            = Field(..., description="retry / edit_and_retry / skip / approve / reject / abort_all")
-    patch:    dict | None    = Field(None, description="edit_and_retry 时可带 {'description': '...'}；skip 时可带 {'manual_result': '...'}")
+    patch:    dict | None    = Field(
+        None,
+        description=(
+            "edit_and_retry 时可带 {'description': '...'}；skip 时可带 {'manual_result': '...'}；"
+            "approve 对应的 GateItem 若带有 requires_confirm_phrase（高危操作二次确认），"
+            "必须带 {'confirm_text': '<原样抄下 requires_confirm_phrase 的值>'}，否则本次 approve 不生效"
+        ),
+    )
 
 
 class ResumeRequest(BaseModel):

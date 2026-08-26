@@ -466,6 +466,13 @@ class GateItem(TypedDict):
     error: str | None            # needs_human 时的失败原因
     risk_type: str | None        # pending_approval 时标注是哪个 agent 触发的风险
     downstream_blocked: list[int]  # 被这个任务连带 blocked 的下游任务 id 列表
+    # ★ 安全修复（高危操作二次确认）：非 None 时，前端必须让人工把这个字符串
+    #   原样输入（不能是预填的一键 approve），随决策一起提交在
+    #   patch.confirm_text 里，human_review_gate_node 才会真正放行。
+    #   只对"规则引擎精确命中、且几乎没有合理业务场景"的高危类别
+    #   （见 guardrail.HARD_RISK_CATEGORIES）设置，避免把这份摩擦力
+    #   摊到所有 pending_approval 上、变成新的"一键点过"。
+    requires_confirm_phrase: str | None
 
 
 # HumanDecision：前端针对某个 GateItem 提交的决策，一次性批量提交一个数组。
@@ -1631,6 +1638,7 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                 "error":              None,
                 "risk_type":          _ig_verdict.get("risk_type"),
                 "downstream_blocked": [],
+                "requires_confirm_phrase": None,
             }
             return {
                 "plan_status":                 "waiting_human",
@@ -2475,9 +2483,65 @@ async def parallel_executor_node(state: AgentState, config: RunnableConfig = Non
             _guardrail_user_id = _raw_tid.split("__", 1)[0]
 
     for layer_idx, layer in enumerate(layers):
+        # ── Step 0：解析运行时 inputs（依赖前面层/已完成任务的结果）──────────
+        #    ★ 安全修复：这一步必须放在 Step A 的 guardrail 判定之前，而且要
+        #    对本层「全部」待调度任务解析——不能像原来那样只解析已经通过判定
+        #    的 auto_run 任务。原因：
+        #      1）guardrail 的规则引擎 / LLM 复核读的是 description +
+        #         _resolved_description。放在判定之后的话，第一次判定时
+        #         _resolved_description 还是空的，规则/LLM 看到的只是
+        #         planner 写的静态模板文本，看不到真正会拼进工具调用里的
+        #         运行时参数（比如从上游任务结果里取出来的文件路径 / SQL
+        #         条件 / URL——这些恰恰是危险操作最可能藏身的地方）；
+        #      2）人工审批时 GateItem.description 用的是同一份静态文本，
+        #         人工等于在批准一段自己看不全的操作；
+        #      3）一旦 approve，task["guardrail_approved"]=True 会让后续
+        #         调度直接跳过判定（这是为了避免"批准→重新判定→又被拦"的
+        #         死循环），而运行时参数恰恰是在这之后才第一次被解析、
+        #         真正喂给 agent 执行的——判定和审批过的是草稿，执行的是
+        #         另一份从没被检查过的正文。
+        #    把解析动作提前到这里，保证 Step A 判定和人工看到的内容，
+        #    就是即将真正执行的那份内容，"过了两层审核"才名副其实。
+        for task in layer:
+            inputs         = task.get("inputs", {})
+            resolved_parts = []
+
+            declared_src_ids: set = set()
+            for param_name, task_input in inputs.items():
+                if isinstance(task_input, dict):
+                    src_id = task_input.get("from_task")
+                    field  = task_input.get("field", "result")
+                elif isinstance(task_input, int):
+                    src_id = task_input
+                    field  = "result"
+                else:
+                    print(f"  ⚠️ inputs[{param_name}] 格式异常，跳过")
+                    continue
+                if src_id is not None:
+                    declared_src_ids.add(src_id)
+                src = next((t for t in task_plan if t["task_id"] == src_id), None)
+                val = src.get(field, "") if src else ""
+                resolved_parts.append(f"【{param_name}】= {val}")
+
+            for dep_id in task.get("depends_on", []):
+                if dep_id not in declared_src_ids:
+                    src = next((t for t in task_plan if t["task_id"] == dep_id), None)
+                    if src:
+                        val = src.get("result", "")
+                        resolved_parts.append(f"【任务{dep_id}的结果】= {val}")
+
+            # ★ 保留 planner 注入的JSON：以 _resolved_description 为基础，追加运行时参数
+            base_desc = task.get("_resolved_description") or task["description"]
+            resolved_desc = base_desc
+            if resolved_parts:
+                resolved_desc += "\n\n【运行时参数】\n" + "\n".join(resolved_parts)
+            task["_resolved_description"] = resolved_desc
+
         # ── Step A：Guardrail 风险判定（规则引擎 + LLM 语义复核，执行前拦截，
         #    不进入本层的 gather）。原 _is_high_risk_task() 逻辑已并入
-        #    guardrail.evaluate_task_risk() 内部作为兜底规则，见该函数实现。──
+        #    guardrail.evaluate_task_risk() 内部作为兜底规则，见该函数实现。
+        #    ★ 此时 text 已经包含 Step 0 解析出的真实运行时参数，规则引擎 /
+        #    LLM 复核审的是"即将真正执行的内容"，而不是静态模板。──
         _risk_verdicts = await asyncio.gather(*[
             guardrail.evaluate_task_risk(
                 task, user_id=_guardrail_user_id, thread_id=_guardrail_thread_id,
@@ -2490,55 +2554,36 @@ async def parallel_executor_node(state: AgentState, config: RunnableConfig = Non
             if verdict["is_risk"]:
                 task["status"] = "pending_approval"
                 task["guardrail_verdict"] = verdict  # 供前端/调试查看命中详情
+                # ★ 安全修复（高危操作二次确认）：dangerous_sql / path_traversal / ssrf
+                #   这几类是正则精确命中、基本没有合理业务场景的操作，approve 不能
+                #   是一个可以无脑连点的按钮——要求人工把这条确认短语原样输进去，
+                #   前端拿不到"预填好直接提交"的偷懒空间。短语里带 task_id，
+                #   避免人工在同一批待办里把 A 任务的确认粘贴给 B 任务。
+                _is_hard = guardrail.is_hard_risk(verdict["risk_type"], verdict["rule_hits"])
+                _confirm_phrase = (
+                    f"确认执行-{verdict['risk_type'] or task.get('agent')}-{task['task_id']}"
+                    if _is_hard else None
+                )
                 print(f"  🛑 [层 {layer_idx}] 任务[{task['task_id']}] 判定为高风险操作"
-                      f"（agent={task.get('agent')}，risk_type={verdict['risk_type']}），暂停等待人工批准")
+                      f"（agent={task.get('agent')}，risk_type={verdict['risk_type']}"
+                      f"{'，需二次确认' if _is_hard else ''}），暂停等待人工批准")
                 pending_gate_items.append({
                     "task_id": task["task_id"],
                     "reason": "pending_approval",
-                    "description": task.get("description", ""),
+                    # ★ 安全修复：给人工看的也是解析后的真实内容（含运行时参数），
+                    #   而不是 planner 写的静态模板——人工批准的应该是"即将
+                    #   真正执行的操作"，不是这个操作的一份不完整摘要。
+                    "description": task.get("_resolved_description") or task.get("description", ""),
                     "error": None,
                     "risk_type": verdict["risk_type"] or task.get("agent"),
                     "downstream_blocked": [],
+                    "requires_confirm_phrase": _confirm_phrase,
                 })
             else:
                 auto_run.append(task)
 
         if auto_run:
-            # ── 解析运行时 inputs（依赖前面层/已完成任务的结果）──────────────
             for task in auto_run:
-                inputs         = task.get("inputs", {})
-                resolved_parts = []
-
-                declared_src_ids: set = set()
-                for param_name, task_input in inputs.items():
-                    if isinstance(task_input, dict):
-                        src_id = task_input.get("from_task")
-                        field  = task_input.get("field", "result")
-                    elif isinstance(task_input, int):
-                        src_id = task_input
-                        field  = "result"
-                    else:
-                        print(f"  ⚠️ inputs[{param_name}] 格式异常，跳过")
-                        continue
-                    if src_id is not None:
-                        declared_src_ids.add(src_id)
-                    src = next((t for t in task_plan if t["task_id"] == src_id), None)
-                    val = src.get(field, "") if src else ""
-                    resolved_parts.append(f"【{param_name}】= {val}")
-
-                for dep_id in task.get("depends_on", []):
-                    if dep_id not in declared_src_ids:
-                        src = next((t for t in task_plan if t["task_id"] == dep_id), None)
-                        if src:
-                            val = src.get("result", "")
-                            resolved_parts.append(f"【任务{dep_id}的结果】= {val}")
-
-                # ★ 保留 planner 注入的JSON：以 _resolved_description 为基础，追加运行时参数
-                base_desc = task.get("_resolved_description") or task["description"]
-                resolved_desc = base_desc
-                if resolved_parts:
-                    resolved_desc += "\n\n【运行时参数】\n" + "\n".join(resolved_parts)
-                task["_resolved_description"] = resolved_desc
                 task["status"] = "in_progress"
 
             # ── Step B：并行执行 + 分类 + 层内自动重试（带退避）──────────────
@@ -2579,6 +2624,7 @@ async def parallel_executor_node(state: AgentState, config: RunnableConfig = Non
                                 "error": task["last_error"],
                                 "risk_type": None,
                                 "downstream_blocked": [],
+                                "requires_confirm_phrase": None,
                             })
                     else:
                         task_id, result = r
@@ -2625,13 +2671,30 @@ async def parallel_executor_node(state: AgentState, config: RunnableConfig = Non
               f"重新打包成待办事项，避免被误判为 completed：")
         for t in orphaned:
             print(f"   task_id={t['task_id']} status={t.get('status')}")
+            # ★ 安全修复：孤儿 pending_approval 任务如果原来命中的是高危类别，
+            #   重新打包成待办事项时必须把 requires_confirm_phrase 带回来——
+            #   否则从这条兜底路径重新进入人工审核的高危任务，会退化成
+            #   可以一键点过的普通 approve，等于给二次确认开了个后门。
+            #   优先用 Step A 存下来的 guardrail_verdict 重算，兜底才退回
+            #   t.get("agent")（跟原来的行为一致）。
+            _orphan_verdict = t.get("guardrail_verdict") or {}
+            _orphan_risk_type = (
+                _orphan_verdict.get("risk_type")
+                or (t.get("agent") if t.get("status") == "pending_approval" else None)
+            )
+            _orphan_confirm_phrase = None
+            if t.get("status") == "pending_approval" and guardrail.is_hard_risk(
+                _orphan_verdict.get("risk_type"), _orphan_verdict.get("rule_hits") or []
+            ):
+                _orphan_confirm_phrase = f"确认执行-{_orphan_risk_type}-{t['task_id']}"
             pending_gate_items.append({
                 "task_id":            t["task_id"],
                 "reason":             t.get("status"),
-                "description":        t.get("description", ""),
+                "description":        t.get("_resolved_description") or t.get("description", ""),
                 "error":              t.get("last_error", ""),
-                "risk_type":          t.get("agent") if t.get("status") == "pending_approval" else None,
+                "risk_type":          _orphan_risk_type,
                 "downstream_blocked": [],
+                "requires_confirm_phrase": _orphan_confirm_phrase,
             })
         _fill_downstream_blocked(task_plan, pending_gate_items)  
 
@@ -2744,10 +2807,35 @@ async def human_review_gate_node(state: AgentState, config: RunnableConfig = Non
             print(f"  ⚠️ [HumanReviewGate] 决策引用了不存在的 task_id={tid}，忽略")
             continue
 
+        _origin_gate_item = _gate_items_by_id.get(tid)
+
+        # ★ 安全修复（高危操作二次确认）：requires_confirm_phrase 非空时，
+        #   这是正则精确命中、基本没有合理业务场景的高危操作（无条件
+        #   UPDATE/DELETE、DROP/TRUNCATE、路径穿越/敏感路径、SSRF 到内网
+        #   或云元数据）。approve 必须在 patch.confirm_text 里原样带上这个
+        #   短语才算数——校验放在服务端而不是只让前端弹个确认框，因为
+        #   前端体验层面的确认可以被跳过/绕过/自动化脚本一键提交，只有
+        #   这里（真正决定任务是否放行的地方）做校验才靠得住。
+        #   没通过校验就当这条决策没生效：task 状态不动（继续留在
+        #   pending_approval），把它重新放回 unresolved_gate_items 等下一轮
+        #   人工重新提交，同时不记 guardrail.log_decision（避免把"没批准
+        #   成功的一次尝试"误记成"approved"）。
+        _required_phrase = (_origin_gate_item or {}).get("requires_confirm_phrase")
+        if action == "approve" and _required_phrase:
+            _submitted = (d.get("patch") or {}).get("confirm_text", "")
+            if _submitted != _required_phrase:
+                print(f"  🚫 [HumanReviewGate] 任务[{tid}] 是高危操作，approve 需要输入确认短语"
+                      f"「{_required_phrase}」，收到的是「{_submitted}」，未匹配，本次决策不生效，"
+                      f"继续等待人工重新提交")
+                unresolved_gate_items.append({
+                    **_origin_gate_item,
+                    "error": f"需要在确认框中原样输入「{_required_phrase}」才能批准执行，请重新提交",
+                })
+                continue
+
         # ★ Guardrail 改造：只对"由 guardrail 判定触发"的待办事项（reason ==
         #   pending_approval）记审计日志，普通失败重试（needs_human）不属于
         #   guardrail 范畴，不记这张表，避免把两类完全不同性质的人工介入混在一起。
-        _origin_gate_item = _gate_items_by_id.get(tid)
         if _origin_gate_item and _origin_gate_item.get("reason") == "pending_approval":
             await guardrail.log_decision(
                 user_id=_guardrail_user_id, thread_id=_guardrail_thread_id,
@@ -2777,6 +2865,15 @@ async def human_review_gate_node(state: AgentState, config: RunnableConfig = Non
                 #   是同一类 bug）。这里同样显式打一个"已获人工批准"标记，
                 #   guardrail.evaluate_task_risk() 命中此标记时直接放行，不再重复判定。
                 task["guardrail_approved"] = True
+                # ★ 安全修复（配合 Step 0 提前解析的改动）：runtime inputs 解析现在
+                #   在 Step A 之前就跑过一次，_resolved_description 里已经拼了一份
+                #   "【运行时参数】"。approve 之后任务回到 pending，会在下一轮重新
+                #   进入 Step 0——如果不清空，resolve 逻辑会以"已经带着运行时参数的
+                #   旧文本"为 base 再拼一次，参数块越滚越长（而且万一上游结果在这之间
+                #   有变化，人工看到的和最终执行的还可能对不上）。清空后下一轮会用
+                #   当前最新的上游结果干净地重新解析一次，保证人工批准时看到的内容
+                #   和真正执行时喂给 agent 的内容一致。
+                task["_resolved_description"] = ""
             task["status"]      = "pending"
             task["retry_count"] = 0
             task["last_error"]  = ""
@@ -2806,6 +2903,7 @@ async def human_review_gate_node(state: AgentState, config: RunnableConfig = Non
                 "error":              task.get("last_error", "") or f"未知的人工决策 action: {action}",
                 "risk_type":          None,
                 "downstream_blocked": [],
+                "requires_confirm_phrase": None,
             })
 
     if plan_status != "aborted":
@@ -3102,6 +3200,7 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
                 "error":              None,
                 "risk_type":          "sensitive_content",
                 "downstream_blocked": [],
+                "requires_confirm_phrase": None,
             }
             return {
                 "plan_status":            "waiting_human",

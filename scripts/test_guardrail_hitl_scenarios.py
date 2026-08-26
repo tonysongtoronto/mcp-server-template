@@ -514,6 +514,133 @@ async def test_scenario6_input_semantic_review():
 
 
 # ══════════════════════════════════════════════════════
+# 场景7：human_review_gate_node —— 高危操作二次确认（requires_confirm_phrase）
+# ══════════════════════════════════════════════════════
+async def test_scenario7_hard_risk_confirm_phrase():
+    s = "场景7-高危操作二次确认"
+    _enter_scenario(s)
+    print(f"\n=== {s} ===")
+
+    def _fresh_task_plan() -> list[dict]:
+        # 模拟 parallel_executor_node Step A 已经判定过、打上
+        # pending_approval + guardrail_verdict 的一个 db_agent 高危任务
+        # （无 WHERE 的 DELETE，命中 dangerous_sql，属于 HARD_RISK_CATEGORIES）。
+        return [{
+            "task_id": 0,
+            "description": "清空订单表",
+            "agent": "db_agent",
+            "inputs": {},
+            "depends_on": [],
+            "status": "pending_approval",
+            "result": "",
+            "_resolved_description": "DELETE FROM orders",
+            "retry_count": 0,
+            "max_retries": 2,
+            "last_error": "",
+            "high_risk": True,
+            "guardrail_approved": False,
+            "guardrail_verdict": {
+                "is_risk": True,
+                "risk_type": "dangerous_sql",
+                "rule_hits": [{"category": "dangerous_sql", "detail": "UPDATE/DELETE 未检测到 WHERE 条件"}],
+                "llm_verdict": None,
+            },
+        }]
+
+    def _gate_item(confirm_phrase: str) -> dict:
+        return {
+            "task_id": 0, "reason": "pending_approval",
+            "description": "DELETE FROM orders", "error": None,
+            "risk_type": "dangerous_sql", "downstream_blocked": [],
+            "requires_confirm_phrase": confirm_phrase,
+        }
+
+    confirm_phrase = "确认执行-dangerous_sql-0"
+    config = make_config("scn7_user", "scn7_thread")
+
+    # 7.1 approve 但不带 confirm_text → 不应该真正放行
+    task_plan = _fresh_task_plan()
+    state = {
+        "task_plan": task_plan,
+        "pending_gate_items": [_gate_item(confirm_phrase)],
+        "decision_log": [],
+    }
+    agent_module.interrupt = make_decisions_fn([{"task_id": 0, "action": "approve", "patch": None}])
+    r1 = await agent_module.human_review_gate_node(state, config)
+    check(s, "不带confirm_text → 任务状态原地留在pending_approval（未被放行）",
+          task_plan[0]["status"] == "pending_approval", str(task_plan[0]))
+    check(s, "不带confirm_text → guardrail_approved未被置True", task_plan[0].get("guardrail_approved") is False, str(task_plan[0]))
+    check(s, "不带confirm_text → plan_status仍为waiting_human", r1.get("plan_status") == "waiting_human", str(r1))
+    r1_items = r1.get("pending_gate_items") or []
+    check(s, "不带confirm_text → 重新回到待办队列，且仍带着requires_confirm_phrase",
+          bool(r1_items) and r1_items[0].get("requires_confirm_phrase") == confirm_phrase, str(r1_items))
+    check(s, "不带confirm_text → error里提示了需要输入的短语",
+          bool(r1_items) and confirm_phrase in (r1_items[0].get("error") or ""), str(r1_items))
+
+    # 7.2 approve 但 confirm_text 输错 → 同样不应该放行
+    task_plan2 = _fresh_task_plan()
+    state2 = {
+        "task_plan": task_plan2,
+        "pending_gate_items": [_gate_item(confirm_phrase)],
+        "decision_log": [],
+    }
+    agent_module.interrupt = make_decisions_fn(
+        [{"task_id": 0, "action": "approve", "patch": {"confirm_text": "确认执行-dangerous_sql-999"}}]
+    )
+    r2 = await agent_module.human_review_gate_node(state2, config)
+    check(s, "confirm_text输错 → 任务状态原地留在pending_approval",
+          task_plan2[0]["status"] == "pending_approval", str(task_plan2[0]))
+
+    # 7.3 approve 且 confirm_text 完全一致 → 应该真正放行
+    task_plan3 = _fresh_task_plan()
+    state3 = {
+        "task_plan": task_plan3,
+        "pending_gate_items": [_gate_item(confirm_phrase)],
+        "decision_log": [],
+    }
+    agent_module.interrupt = make_decisions_fn(
+        [{"task_id": 0, "action": "approve", "patch": {"confirm_text": confirm_phrase}}]
+    )
+    r3 = await agent_module.human_review_gate_node(state3, config)
+    check(s, "confirm_text正确 → 任务状态变回pending（真正放行）",
+          task_plan3[0]["status"] == "pending", str(task_plan3[0]))
+    check(s, "confirm_text正确 → guardrail_approved=True", task_plan3[0].get("guardrail_approved") is True, str(task_plan3[0]))
+    check(s, "confirm_text正确 → high_risk清空为False", task_plan3[0].get("high_risk") is False, str(task_plan3[0]))
+    check(s, "confirm_text正确 → 清空了旧的_resolved_description（避免approve后重复拼运行时参数）",
+          task_plan3[0].get("_resolved_description") == "", str(task_plan3[0]))
+    check(s, "confirm_text正确 → plan_status回到running（无残留待办）", r3.get("plan_status") == "running", str(r3))
+
+    # 7.4 非高危（requires_confirm_phrase=None）→ 不受影响，普通approve照常一次通过
+    task_plan4 = [{
+        "task_id": 1, "description": "查询用户信息", "agent": "db_agent",
+        "inputs": {}, "depends_on": [], "status": "pending_approval", "result": "",
+        "_resolved_description": "SELECT * FROM users WHERE id=1",
+        "retry_count": 0, "max_retries": 2, "last_error": "",
+        "high_risk": True, "guardrail_approved": False,
+        "guardrail_verdict": {"is_risk": True, "risk_type": "heuristic:db_agent", "rule_hits": [], "llm_verdict": None},
+    }]
+    state4 = {
+        "task_plan": task_plan4,
+        "pending_gate_items": [{
+            "task_id": 1, "reason": "pending_approval", "description": "查询用户信息",
+            "error": None, "risk_type": "heuristic:db_agent", "downstream_blocked": [],
+            "requires_confirm_phrase": None,
+        }],
+        "decision_log": [],
+    }
+    agent_module.interrupt = make_decisions_fn([{"task_id": 1, "action": "approve", "patch": None}])
+    r4 = await agent_module.human_review_gate_node(state4, config)
+    check(s, "非高危任务 → 不带confirm_text照常放行（未被新逻辑误伤）",
+          task_plan4[0]["status"] == "pending", str(task_plan4[0]))
+
+    # 审计日志核对：7.1/7.2 的失败尝试不应该被记成approved；7.3才应该被记
+    events = await guardrail.list_events(thread_id="scn7_user__scn7_thread", stage="decision", limit=50)
+    approved_task0_count = sum(1 for e in events if e["task_id"] == 0 and e["action"] == "approved")
+    check(s, "confirm_text不匹配的两次尝试(7.1/7.2)都没有被记进approved审计",
+          approved_task0_count == 1, f"approved_task0_count={approved_task0_count}, events={events}")
+
+
+# ══════════════════════════════════════════════════════
 
 def main():
     print("Guardrail 输入/输出侧 HITL 阻断扩展 —— 自动化测试开始")
@@ -526,6 +653,7 @@ def main():
         test_scenario4_output_review_gate_node,
         test_scenario5_final_answer_node,
         test_scenario6_input_semantic_review,
+        test_scenario7_hard_risk_confirm_phrase,
     )
 
     async def _run_all():
