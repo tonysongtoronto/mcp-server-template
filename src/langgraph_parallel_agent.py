@@ -241,6 +241,16 @@ llm = ChatOpenAI(
 )
 
 # ══════════════════════════════════════════════════════
+# 1.1 Guardrail（安全防护模块，见 src/guardrail.py）
+# ══════════════════════════════════════════════════════
+# 复用同一个 llm 实例做语义复核，避免多开一份模型配置；
+# 用 set_llm_client() 注入而不是让 guardrail.py 反向 import 本模块，
+# 防止循环 import（guardrail.py 是被本模块 import 的）。
+import guardrail
+
+guardrail.set_llm_client(llm)
+
+# ══════════════════════════════════════════════════════
 # 2. MCP server 路径 & 启动参数
 # ══════════════════════════════════════════════════════
 SERVER_PATH    = Path(__file__).parent / "mcp_server_template" / "server.py"
@@ -442,6 +452,7 @@ class Task(TypedDict):
     max_retries: int        # ★ 新增：最多自动重试几次（默认见 DEFAULT_MAX_RETRIES）
     last_error: str         # ★ 新增：最近一次失败的错误信息（needs_human 时展示给用户）
     high_risk: bool         # ★ 新增：planner 可显式标记高风险任务；未标记时由启发式规则兜底判断
+    guardrail_approved: bool  # ★ Guardrail 新增：人工批准后置 True，避免重复判定死循环（默认 False，字典缺省 get() 亦为假值）
 
 
 # ★ HITL 改动3：人工介入相关的数据结构
@@ -568,6 +579,30 @@ class AgentState(TypedDict):
     # decision_log：人工决策审计轨迹（HumanDecision 历史记录），可选但建议保留，
     #   方便前端展示"这个任务之前被人工重试过几次/何时被跳过"。
     decision_log: list[HumanDecision]
+
+    # ══════════════════════════════════════════════════════
+    # ★ Guardrail 改造（输入/输出侧完整版）新增字段
+    # ══════════════════════════════════════════════════════
+    #
+    # input_guardrail_bypass_once：input_review_gate_node 批准放行后打上
+    #   True，回到 planner_node 时消费掉（用完立刻重置回 False），让这一次
+    #   重新规划跳过输入侧检测，避免"批准→重新进 planner→又被拦→又要批准"
+    #   的死循环。只在这一次重规划里生效，不会影响同一 thread 后续新消息。
+    input_guardrail_bypass_once: bool
+
+    # input_guardrail_rejected / input_guardrail_reject_info：
+    #   input_review_gate_node 判定人工拒绝后设置，final_answer_node 读到
+    #   input_guardrail_rejected=True 时直接生成一句委婉拒绝，不再走正常的
+    #   LLM 汇总逻辑（因为这一轮根本没有 task_plan 可汇总）。
+    #   final_answer_node 用完会显式重置为 False/None，避免残留到下一轮。
+    input_guardrail_rejected: bool
+    input_guardrail_reject_info: dict
+
+    # pending_output_answer：final_answer_node 非流式路径生成的候选回答，
+    #   命中输出侧 sensitive_content 规则、需要人工审核时，先把候选回答存
+    #   在这里，等 output_review_gate_node 里人工 approve/reject 后再决定
+    #   是原样发出还是替换成委婉说明。
+    pending_output_answer: str
 
 
 # ══════════════════════════════════════════════════════
@@ -1546,6 +1581,63 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
         }
 
     user_msg = _get_message_content(last_human_msg)
+
+    # ══════════════════════════════════════════════════════
+    # ★ Guardrail 改造（输入侧，完整版）：规则命中 prompt_injection /
+    #   sensitive_content 时，走跟执行侧一样的 HITL 阻断——不再只是
+    #   "检测+记录"，而是真的 interrupt() 冻结图执行，等人工 approve/reject。
+    #
+    #   实现方式：这里不直接调用 interrupt()（调用点在这里的话，暂停时
+    #   checkpoint 里的 pending_gate_items 还是上一轮的旧值，前端
+    #   GET .../state 读到的会是脏数据——api.py 是从 state["pending_gate_items"]
+    #   这个 channel 读的，不是从 interrupt() 的 payload 读的）。
+    #   所以采用和 parallel_executor→human_review_gate 完全一致的两段式：
+    #     ① planner_node 检测到风险 → 正常 return（不 interrupt），把
+    #        pending_gate_items/plan_status="waiting_human" 提交进 checkpoint；
+    #     ② 专门新增的 input_review_gate_node 下一步运行，这时候
+    #        state["pending_gate_items"] 已经是提交过的新值了，再在那里
+    #        调用 interrupt() ——前端拿到的数据就是对的。
+    #   approve 后由 input_review_gate_node 把 plan_status 设成
+    #   "replanning"，图路由回 planner_node 重新走一遍（这次带
+    #   input_guardrail_bypass_once=True，跳过重复判定，不会死循环）。
+    #   reject 则直接终止，转 final_answer_node 生成一句委婉拒绝。
+    # ══════════════════════════════════════════════════════
+    _configurable_ig = (config or {}).get("configurable", {})
+    _ig_user_id = _configurable_ig.get("user_id", "")
+    _ig_thread_id = _configurable_ig.get("thread_id", "")
+    if not _ig_user_id and "__" in _ig_thread_id:
+        _ig_user_id = _ig_thread_id.split("__", 1)[0]
+
+    # 人工刚批准过这句话（从 input_review_gate_node 绕回来）→ 消费掉标记，
+    # 跳过本轮检测，直接往下走真正的规划逻辑；HITL 测试指令本来就不该被
+    # guardrail 干扰，同样跳过。
+    _bypass_input_guardrail = bool(state.get("input_guardrail_bypass_once"))
+    _is_hitl_test_cmd = _hitl_test is not None and _hitl_test.is_test_command(user_msg)
+
+    if not _bypass_input_guardrail and not _is_hitl_test_cmd:
+        try:
+            _ig_verdict = await guardrail.evaluate_input(user_msg, user_id=_ig_user_id, thread_id=_ig_thread_id)
+        except Exception as _e:
+            print(f"  ⚠️ [Guardrail] 输入侧检测异常（忽略，按无风险处理，不影响规划）：{_e}")
+            _ig_verdict = {"is_risk": False, "risk_type": None}
+
+        if _ig_verdict.get("is_risk"):
+            print(f"  🛑 [Planner] 输入侧命中 Guardrail 规则（risk_type={_ig_verdict.get('risk_type')}），"
+                  f"暂停等待人工审批，不进入正式规划")
+            gate_item: GateItem = {
+                "task_id":            -1,
+                "reason":             "input_guardrail",
+                "description":        user_msg[:500],
+                "error":              None,
+                "risk_type":          _ig_verdict.get("risk_type"),
+                "downstream_blocked": [],
+            }
+            return {
+                "plan_status":                 "waiting_human",
+                "pending_gate_items":           [gate_item],
+                "input_guardrail_bypass_once":  False,
+            }
+
     print(f"\n📋 [Planner] 规划任务：{user_msg[:80]}")
 
     # ★ HITL 测试专用钩子（见 src/hitl_test_scenarios.py）
@@ -1579,6 +1671,7 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
             "next_agent":         "",
             "plan_status":        "running",
             "pending_gate_items": [],
+            "input_guardrail_bypass_once": False,
         }
 
     # ── 调试：打印 msgs 全貌，确认跨轮历史是否被平台恢复 ────────────────
@@ -1796,11 +1889,13 @@ async def planner_node(state: AgentState, *, store=None, config: RunnableConfig 
                     "next_agent":      "",   # ← 路由到 parallel_executor
                     "plan_status":     "running",
                     "pending_gate_items": [],
+                    "input_guardrail_bypass_once": False,
                 }
 
     return {
         "task_plan":       task_plan,
         "next_agent":      "",   # ← 路由到 parallel_executor
+        "input_guardrail_bypass_once": False,
         # ★ HITL 改动：新一轮规划开始，显式重置全局态和待办清单。
         #   防止上一轮如果是被用户中途放弃的 waiting_human/aborted 状态
         #   残留到这一轮（这两个字段是普通覆盖字段，checkpoint 恢复后
@@ -2205,6 +2300,75 @@ async def _run_direct_task(task: Task, state: AgentState) -> str:
 
 
 # ══════════════════════════════════════════════════════
+# 9b. input_review_gate_node（★ Guardrail 输入侧人工审批节点）
+# ══════════════════════════════════════════════════════
+
+async def input_review_gate_node(state: AgentState, config: RunnableConfig = None) -> AgentState:
+    """
+    输入侧 Guardrail 的人工审批节点。只有 planner_node 检测到用户消息命中
+    prompt_injection / sensitive_content 规则、并且已经把 pending_gate_items
+    + plan_status="waiting_human" 提交进 checkpoint 之后，图才会路由到这里
+    （见 planner_route）。
+
+    职责很薄，跟 human_review_gate_node 的设计哲学一致：
+      1. interrupt() 冻结图执行，等前端提交一条 approve/reject 决策
+         （输入侧一次只会有 1 条待办事项，不像执行侧可能一批好几条）。
+      2. 恢复后：
+         approve → plan_status="replanning"，打上
+                   input_guardrail_bypass_once=True，图路由回 planner_node
+                   用同一句用户消息正式规划（这次会跳过输入侧检测）。
+         reject（含未知 action，保守按拒绝处理）
+                → plan_status="completed"，input_guardrail_rejected=True，
+                   转 final_answer_node 生成一句委婉拒绝，不进入正式规划。
+    """
+    gate_items = state.get("pending_gate_items", [])
+    if not gate_items:
+        # 安全兜底：正常路由不会在没有待办事项时进入这个节点
+        return {"plan_status": "running"}
+
+    _configurable = (config or {}).get("configurable", {})
+    _user_id = _configurable.get("user_id", "")
+    _thread_id = _configurable.get("thread_id", "")
+    if not _user_id and "__" in _thread_id:
+        _user_id = _thread_id.split("__", 1)[0]
+
+    decisions: list[HumanDecision] = interrupt({
+        "type":  "input_review",
+        "items": gate_items,
+    }) or []
+
+    print(f"\n👤 [InputReviewGate] 收到 {len(decisions)} 条人工决策")
+
+    item = gate_items[0]  # 输入侧一次只会有 1 条待办事项
+    decision = decisions[0] if decisions else {}
+    action = decision.get("action", "reject")  # 缺省保守处理为拒绝
+
+    await guardrail.log_decision(
+        user_id=_user_id, thread_id=_thread_id, task_id=item["task_id"],
+        action=action, risk_type=item.get("risk_type"),
+    )
+
+    if action == "approve":
+        print("  ✅ [InputReviewGate] 人工批准：继续为该消息生成任务计划")
+        return {
+            "plan_status":                  "replanning",
+            "pending_gate_items":            [],
+            "input_guardrail_bypass_once":   True,
+        }
+    else:
+        print(f"  🚫 [InputReviewGate] 人工拒绝（action={action}）：终止本次请求，不进入正式规划")
+        return {
+            "plan_status":                  "completed",
+            "pending_gate_items":            [],
+            "input_guardrail_rejected":      True,
+            "input_guardrail_reject_info": {
+                "risk_type":   item.get("risk_type"),
+                "description": item.get("description"),
+            },
+        }
+
+
+# ══════════════════════════════════════════════════════
 # 10. parallel_executor_node（替代原 supervisor_node）
 # ══════════════════════════════════════════════════════
 
@@ -2212,9 +2376,9 @@ def _use_sse() -> bool:
     return os.environ.get("MCP_USE_SSE", "0") == "1"
 
 
-async def parallel_executor_node(state: AgentState) -> AgentState:
+async def parallel_executor_node(state: AgentState, config: RunnableConfig = None) -> AgentState:
     """
-    核心并行调度节点（★ HITL 改造版）。
+    核心并行调度节点（★ HITL 改造版 + ★ Guardrail 改造版）。
 
     整体流程（每次调用只处理"当前能处理的部分"，处理不完就交给 human_review_gate）：
       对每一层（拓扑排序得到）：
@@ -2301,20 +2465,39 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
             result = await run_agent_isolated(task, system_prompt, use_sse=_use_sse())
         return task["task_id"], result
 
+    # ★ Guardrail 改造：取 user_id/thread_id 用于审计日志（做法与 planner_node 一致）
+    _configurable = (config or {}).get("configurable", {})
+    _guardrail_user_id = _configurable.get("user_id", "")
+    _guardrail_thread_id = _configurable.get("thread_id", "")
+    if not _guardrail_user_id:
+        _raw_tid = _configurable.get("thread_id", "")
+        if "__" in _raw_tid:
+            _guardrail_user_id = _raw_tid.split("__", 1)[0]
+
     for layer_idx, layer in enumerate(layers):
-        # ── Step A：高风险预批准过滤（执行前拦截，不进入本层的 gather）──────
+        # ── Step A：Guardrail 风险判定（规则引擎 + LLM 语义复核，执行前拦截，
+        #    不进入本层的 gather）。原 _is_high_risk_task() 逻辑已并入
+        #    guardrail.evaluate_task_risk() 内部作为兜底规则，见该函数实现。──
+        _risk_verdicts = await asyncio.gather(*[
+            guardrail.evaluate_task_risk(
+                task, user_id=_guardrail_user_id, thread_id=_guardrail_thread_id,
+            )
+            for task in layer
+        ])
+
         auto_run: list[Task] = []
-        for task in layer:
-            if _is_high_risk_task(task):
+        for task, verdict in zip(layer, _risk_verdicts):
+            if verdict["is_risk"]:
                 task["status"] = "pending_approval"
+                task["guardrail_verdict"] = verdict  # 供前端/调试查看命中详情
                 print(f"  🛑 [层 {layer_idx}] 任务[{task['task_id']}] 判定为高风险操作"
-                      f"（agent={task.get('agent')}），暂停等待人工批准")
+                      f"（agent={task.get('agent')}，risk_type={verdict['risk_type']}），暂停等待人工批准")
                 pending_gate_items.append({
                     "task_id": task["task_id"],
                     "reason": "pending_approval",
                     "description": task.get("description", ""),
                     "error": None,
-                    "risk_type": task.get("agent"),
+                    "risk_type": verdict["risk_type"] or task.get("agent"),
                     "downstream_blocked": [],
                 })
             else:
@@ -2472,7 +2655,7 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
 # 10b. human_review_gate_node —— 人工介入断点（★ HITL 核心新增节点）
 # ══════════════════════════════════════════════════════
 
-async def human_review_gate_node(state: AgentState) -> AgentState:
+async def human_review_gate_node(state: AgentState, config: RunnableConfig = None) -> AgentState:
     """
     职责很薄，只做两件事：
       1. 把 parallel_executor 产出的 pending_gate_items 一次性打包，
@@ -2489,6 +2672,18 @@ async def human_review_gate_node(state: AgentState) -> AgentState:
     """
     gate_items: list[GateItem] = state.get("pending_gate_items", [])
     task_plan:  list[Task]     = state.get("task_plan", [])
+
+    # ★ Guardrail 改造：取 user_id/thread_id，用于把"人工最终决策"也落进
+    #   guardrail 审计日志（与 evaluate_task_risk() 记录的判定事件用同一
+    #   thread_id/task_id 串联，前端可以拼出"为什么拦→谁批的"时间线）
+    _configurable = (config or {}).get("configurable", {})
+    _guardrail_user_id = _configurable.get("user_id", "")
+    _guardrail_thread_id = _configurable.get("thread_id", "")
+    if not _guardrail_user_id:
+        _raw_tid = _configurable.get("thread_id", "")
+        if "__" in _raw_tid:
+            _guardrail_user_id = _raw_tid.split("__", 1)[0]
+    _gate_items_by_id = {g["task_id"]: g for g in gate_items}
 
     if not gate_items:
         # 安全兜底：正常路由不会在没有待办事项时进入这个节点
@@ -2549,6 +2744,16 @@ async def human_review_gate_node(state: AgentState) -> AgentState:
             print(f"  ⚠️ [HumanReviewGate] 决策引用了不存在的 task_id={tid}，忽略")
             continue
 
+        # ★ Guardrail 改造：只对"由 guardrail 判定触发"的待办事项（reason ==
+        #   pending_approval）记审计日志，普通失败重试（needs_human）不属于
+        #   guardrail 范畴，不记这张表，避免把两类完全不同性质的人工介入混在一起。
+        _origin_gate_item = _gate_items_by_id.get(tid)
+        if _origin_gate_item and _origin_gate_item.get("reason") == "pending_approval":
+            await guardrail.log_decision(
+                user_id=_guardrail_user_id, thread_id=_guardrail_thread_id,
+                task_id=tid, action=action, risk_type=_origin_gate_item.get("risk_type"),
+            )
+
         if action in ("retry", "edit_and_retry", "approve"):
             patch = d.get("patch") or {}
             if action == "edit_and_retry":
@@ -2565,6 +2770,13 @@ async def human_review_gate_node(state: AgentState) -> AgentState:
             #   这里显式清掉 high_risk，代表"已经被人工批准过，这一次不用再拦"。
             if action == "approve":
                 task["high_risk"] = False
+                # ★ Guardrail 改造：approve 之前只清了 high_risk（旧启发式规则的开关），
+                #   但 guardrail.evaluate_task_risk() 每轮调度前都会重新跑一遍规则引擎+
+                #   LLM 复核——只要任务描述文本没变，规则/LLM 大概率还会再次命中同一个
+                #   risk_type，重现"批准 → 又被拦 → 又要批准"的死循环（跟 high_risk 那次
+                #   是同一类 bug）。这里同样显式打一个"已获人工批准"标记，
+                #   guardrail.evaluate_task_risk() 命中此标记时直接放行，不再重复判定。
+                task["guardrail_approved"] = True
             task["status"]      = "pending"
             task["retry_count"] = 0
             task["last_error"]  = ""
@@ -2624,6 +2836,34 @@ async def human_review_gate_node(state: AgentState) -> AgentState:
 # ══════════════════════════════════════════════════════
 
 async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    # ★ Guardrail 改造（输入侧）：input_review_gate_node 判定人工拒绝后会把
+    #   input_guardrail_rejected 置 True 并转到这个节点——这一轮根本没有
+    #   task_plan 可汇总，必须最先处理，直接生成一句委婉拒绝就返回，不走
+    #   下面任何 LLM 汇总 / 流式推送逻辑。
+    if state.get("input_guardrail_rejected"):
+        _reject_info = state.get("input_guardrail_reject_info") or {}
+        _risk_type = _reject_info.get("risk_type")
+        decline_text = (
+            "抱歉，你刚才这条消息触发了安全策略"
+            + (f"（命中规则：{_risk_type}）" if _risk_type else "")
+            + "，已经交由人工审核并被拒绝，我不能按这个内容继续处理。"
+            "如果这是误判，或者你想换个方式重新描述你的需求，我很乐意重新试一次。"
+        )
+        print(f"  🚫 [FinalAnswer] 输入侧 Guardrail 已拒绝该消息（risk_type={_risk_type}），"
+              f"直接返回委婉说明")
+        # ★ 流式路径也要往队列推一下，否则 SSE 前端收不到任何文本（跟
+        #   /hitl_test 分支同一个 bug 类别，见下方那段注释）
+        _tid_ig = (config or {}).get("configurable", {}).get("_stream_request_id", "")
+        _q_ig = _stream_queues.get(_tid_ig) if _tid_ig else None
+        if _q_ig is not None:
+            await _q_ig.put(decline_text)
+            await _q_ig.put(None)
+        return {
+            "messages":                    [AIMessage(content=decline_text)],
+            "input_guardrail_rejected":    False,   # 消费掉标记，避免残留到下一轮
+            "input_guardrail_reject_info": None,
+        }
+
     # ★ 修复：从 config["configurable"] 读取 request_id，不再污染 state
     #   旧：state.get("_thread_id") → 导致 LangSmith Input 显示 UUID 而非问题内容
     #   新：config["configurable"].get("_stream_request_id") → state 干净，LangSmith 正常
@@ -2801,11 +3041,75 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         finally:
             await q.put(None)                        # 哨兵：通知流结束
             _stream_queues.pop(tid, None)            # 用完清理，避免内存泄漏
-        new_ai_msg = AIMessage(content=full_content)
+
+        # ★ Guardrail 改造（输出侧）：SSE 流式场景下 token 已经边生成边推送给
+        #   前端，此刻做脱敏已经来不及影响用户实际看到的内容——这里的脱敏只
+        #   保证"存进对话历史 checkpoint 的版本"是脱敏过的（影响后续多轮引用
+        #   该回答时不会又把 PII 带回上下文），并把命中情况记入审计日志。
+        #   若要做到真正的流式脱敏，需要牺牲实时性（攒够一段/整句再推），
+        #   属于产品取舍，见 guardrail.evaluate_output() docstring，先不在这版做。
+        _configurable_og = (config or {}).get("configurable", {})
+        _og_user_id = _configurable_og.get("user_id", "")
+        _og_thread_id = _configurable_og.get("thread_id", "")
+        if not _og_user_id and "__" in _og_thread_id:
+            _og_user_id = _og_thread_id.split("__", 1)[0]
+        try:
+            masked_full_content, _ = await guardrail.evaluate_output(
+                full_content, user_id=_og_user_id, thread_id=_og_thread_id,
+            )
+        except Exception as _e:
+            print(f"  ⚠️ [Guardrail] 输出侧检测异常（忽略，使用原始内容落历史）：{_e}")
+            masked_full_content = full_content
+        new_ai_msg = AIMessage(content=masked_full_content)
     else:
-        # ── 非流式路径（CLI 模式，行为不变）────────────────────────────
+        # ── 非流式路径（CLI 模式）────────────────────────────────────
         response = await llm.ainvoke(msgs_for_llm)
-        new_ai_msg = AIMessage(content=_extract_llm_content(response))
+        raw_answer = _extract_llm_content(response)
+
+        # ★ Guardrail 改造（输出侧）：非流式路径可以做到"生成完 → 过一遍
+        #   Guardrail → 再返回给调用方"，PII 会被自动脱敏后再返回。
+        _configurable_og = (config or {}).get("configurable", {})
+        _og_user_id = _configurable_og.get("user_id", "")
+        _og_thread_id = _configurable_og.get("thread_id", "")
+        if not _og_user_id and "__" in _og_thread_id:
+            _og_user_id = _og_thread_id.split("__", 1)[0]
+        try:
+            masked_answer, _og_verdict = await guardrail.evaluate_output(
+                raw_answer, user_id=_og_user_id, thread_id=_og_thread_id,
+            )
+        except Exception as _e:
+            print(f"  ⚠️ [Guardrail] 输出侧检测异常（忽略，使用原始内容）：{_e}")
+            masked_answer = raw_answer
+            _og_verdict = {"rule_hits": []}
+
+        # ★ Guardrail 改造（输出侧，完整版）：非流式路径下答案还没有发给任何
+        #   人看，可以做到真正拦截——命中 sensitive_content 时不直接把
+        #   masked_answer 塞进 new_ai_msg，而是先把它存进
+        #   pending_output_answer，转 output_review_gate_node 走一遍
+        #   interrupt()/人工决策，approve 才真正发出、reject 换成委婉说明。
+        #   PII 命中不在此列：PII 已经在 evaluate_output() 里自动脱敏过了，
+        #   脱敏后的文本本身就是"安全的"，不需要再额外等人工确认。
+        _output_sensitive_hit = any(
+            h.get("category") == "sensitive_content" for h in (_og_verdict.get("rule_hits") or [])
+        )
+        if _output_sensitive_hit:
+            print(f"  🛑 [FinalAnswer] 输出内容命中 sensitive_content 规则，"
+                  f"暂停等待人工审核后再决定是否发出")
+            output_gate_item: GateItem = {
+                "task_id":            -2,
+                "reason":             "output_guardrail",
+                "description":        masked_answer[:500],
+                "error":              None,
+                "risk_type":          "sensitive_content",
+                "downstream_blocked": [],
+            }
+            return {
+                "plan_status":            "waiting_human",
+                "pending_gate_items":     [output_gate_item],
+                "pending_output_answer":  masked_answer,
+            }
+
+        new_ai_msg = AIMessage(content=masked_answer)
 
     # ── 触发摘要更新（每4条新消息更新一次，约每2轮）────────────────────
     #
@@ -2846,6 +3150,78 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         "messages":            [new_ai_msg],
         "conversation_summary": new_summary,
         "summary_turn_count":   new_summary_turn_count,
+    }
+
+
+# ══════════════════════════════════════════════════════
+# 11b. output_review_gate_node（★ Guardrail 输出侧人工审批节点）
+# ══════════════════════════════════════════════════════
+
+async def output_review_gate_node(state: AgentState, config: RunnableConfig = None) -> AgentState:
+    """
+    输出侧 Guardrail 的人工审批节点。只有 final_answer_node 的【非流式】
+    路径生成完候选回答、命中 sensitive_content 规则时，图才会路由到这里
+    （见 final_answer_route）。
+
+    ★ 为什么只有非流式路径会触发：流式（SSE）路径下 token 是边生成边推给
+      前端的，等这里判定完，用户早就已经看到内容了，真正意义上的"拦截"
+      已经来不及——流式路径维持原有行为（PII 自动脱敏 + sensitive_content
+      仅记审计日志），见 guardrail.evaluate_output() 和 final_answer_node
+      里流式分支的注释。这是一个已知的、经过取舍的范围限制，不是遗漏。
+
+    职责：
+      1. interrupt() 冻结图执行，等前端提交一条 approve/reject 决策。
+      2. 恢复后：
+         approve → 把 pending_output_answer 原样作为最终回答发出。
+         reject（含未知 action）→ 换成一句委婉说明，不发出原始候选内容。
+      两种情况都会把 plan_status 设回 "completed" 并直接结束（见
+      build_graph 里 output_review_gate → END 是无条件边，不会再绕回
+      final_answer_node 重新生成一遍，避免重复触发 Guardrail 判定/重复
+      调用 LLM）。
+    """
+    gate_items = state.get("pending_gate_items", [])
+    pending_answer = state.get("pending_output_answer", "")
+    if not gate_items:
+        # 安全兜底：正常路由不会在没有待办事项时进入这个节点
+        return {"plan_status": "completed"}
+
+    _configurable = (config or {}).get("configurable", {})
+    _user_id = _configurable.get("user_id", "")
+    _thread_id = _configurable.get("thread_id", "")
+    if not _user_id and "__" in _thread_id:
+        _user_id = _thread_id.split("__", 1)[0]
+
+    decisions: list[HumanDecision] = interrupt({
+        "type":  "output_review",
+        "items": gate_items,
+    }) or []
+
+    print(f"\n👤 [OutputReviewGate] 收到 {len(decisions)} 条人工决策")
+
+    item = gate_items[0]  # 输出侧一次只会有 1 条待办事项
+    decision = decisions[0] if decisions else {}
+    action = decision.get("action", "reject")  # 缺省保守处理为拒绝
+
+    await guardrail.log_decision(
+        user_id=_user_id, thread_id=_thread_id, task_id=item["task_id"],
+        action=action, risk_type=item.get("risk_type"),
+    )
+
+    if action == "approve":
+        print("  ✅ [OutputReviewGate] 人工批准：按原样发出这条回答")
+        final_text = pending_answer
+    else:
+        print(f"  🚫 [OutputReviewGate] 人工拒绝（action={action}）：改用委婉说明替代原回答")
+        final_text = (
+            "抱歉，这条回答涉及敏感内容，已被人工审核拦截，暂时无法展示给你。"
+            "如果你能换个角度重新描述问题，我很乐意再试一次。"
+        )
+
+    return {
+        "messages":               [AIMessage(content=final_text)],
+        "plan_status":            "completed",
+        "pending_gate_items":     [],
+        "pending_output_answer":  "",
     }
 
 
@@ -2960,25 +3336,49 @@ DEFAULT_AGENT_SYSTEM_PROMPT = AGENT_SYSTEM_PROMPTS["default_agent"]
 #   - 不需要修改任何图结构，完全透明
 def build_graph(checkpointer=None, store=None) -> Any:
     """
-    图结构（★ HITL 改造后）：
+    图结构（★ HITL 改造 + ★ Guardrail 输入/输出侧改造后）：
 
-        planner → parallel_executor ──(plan_status=="waiting_human")──→ human_review_gate
-                        ↑                                                     │
-                        │                    (plan_status=="running"，恢复继续跑)│
-                        └─────────────────────────────────────────────────────┘
-                        │
-                        └──(plan_status in "completed"/"aborted")──→ final_answer → END
+        planner ──(输入侧命中风险)──→ input_review_gate ──(approve)──→ planner（重新规划）
+           │                                 │
+           │                                 └──(reject)──→ final_answer → END
+           │
+           └──(正常)──→ parallel_executor ──(waiting_human)──→ human_review_gate
+                              ↑                                       │
+                              │              (running，恢复继续跑)      │
+                              └───────────────────────────────────────┘
+                              │
+                              └──(completed/aborted)──→ final_answer
+                                                              │
+                                            (非流式路径命中输出侧敏感内容)
+                                                              │
+                                                              ▼
+                                                     output_review_gate → END
+                                                              │
+                                            （其余情况，含流式路径全部）
+                                                              ▼
+                                                             END
 
-    human_review_gate 内部调用 interrupt()，图在此冻结并把 payload+完整 state
-    落盘到 checkpointer；前端通过 Command(resume=decisions) 恢复。
-    parallel_executor ↔ human_review_gate 之间可能来回多轮
-    （每轮处理一批 pending_gate_items），直到不再产生新的待办事项或用户选择终止。
+    interrupt() 调用点固定在 input_review_gate / human_review_gate /
+    output_review_gate 这三个"审批节点"里，不会直接写在 planner/
+    parallel_executor/final_answer 这些"产出节点"里——原因是 LangGraph
+    interrupt() 暂停时落盘的 state 是"进入当前节点之前"的已提交值，
+    审批节点能读到正确的 pending_gate_items，靠的是它的上一个节点已经把
+    数据通过正常 return 提交进 checkpoint 了。三组"产出→审批"节点对
+    （planner→input_review_gate、parallel_executor→human_review_gate、
+    final_answer→output_review_gate）都遵循同一个两段式约定。
     """
 
     def planner_route(state: AgentState) -> str:
+        if state.get("plan_status") == "waiting_human":
+            return "input_review_gate"
         if state.get("next_agent") == "FINISH":
             return "END"
         return "parallel_executor"
+
+    def input_gate_route(state: AgentState) -> str:
+        if state.get("plan_status") == "replanning":
+            return "planner"
+        return "final_answer"
 
     def executor_route(state: AgentState) -> str:
         if state.get("plan_status") == "waiting_human":
@@ -2995,17 +3395,34 @@ def build_graph(checkpointer=None, store=None) -> Any:
             return "human_review_gate"
         return "parallel_executor"
 
+    def final_answer_route(state: AgentState) -> str:
+        # ★ Guardrail 改造（输出侧）：final_answer_node 非流式路径命中
+        #   sensitive_content 时会把 plan_status 设成 "waiting_human"
+        #   （而不是走完正常流程直接给 messages 追加最终回答），
+        #   这里据此转去 output_review_gate 而不是直接 END。
+        if state.get("plan_status") == "waiting_human":
+            return "output_review_gate"
+        return "END"
+
     g = StateGraph(AgentState)
-    g.add_node("planner",            planner_node)
-    g.add_node("parallel_executor",  parallel_executor_node)
-    g.add_node("human_review_gate",  human_review_gate_node)
-    g.add_node("final_answer",       final_answer_node)
+    g.add_node("planner",             planner_node)
+    g.add_node("input_review_gate",   input_review_gate_node)
+    g.add_node("parallel_executor",   parallel_executor_node)
+    g.add_node("human_review_gate",   human_review_gate_node)
+    g.add_node("final_answer",        final_answer_node)
+    g.add_node("output_review_gate",  output_review_gate_node)
 
     g.set_entry_point("planner")
 
     g.add_conditional_edges("planner", planner_route, {
-        "END":               END,
-        "parallel_executor": "parallel_executor",
+        "input_review_gate": "input_review_gate",
+        "END":                END,
+        "parallel_executor":  "parallel_executor",
+    })
+
+    g.add_conditional_edges("input_review_gate", input_gate_route, {
+        "planner":       "planner",
+        "final_answer":  "final_answer",
     })
 
     g.add_conditional_edges("parallel_executor", executor_route, {
@@ -3019,7 +3436,12 @@ def build_graph(checkpointer=None, store=None) -> Any:
         "final_answer":       "final_answer",
     })
 
-    g.add_edge("final_answer", END)
+    g.add_conditional_edges("final_answer", final_answer_route, {
+        "output_review_gate": "output_review_gate",
+        "END":                 END,
+    })
+
+    g.add_edge("output_review_gate", END)
 
     # CLI 模式：checkpointer=MemorySaver, store=InMemoryStore
     # webapp 模式：checkpointer=AsyncSqliteSaver, store=AsyncSqliteStore

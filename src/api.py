@@ -105,6 +105,7 @@ from pydantic import BaseModel, Field
 from langgraph.types import Command
 
 import langgraph_parallel_agent as agent_module
+import guardrail
 
 # ══════════════════════════════════════════════════════
 # 1. Pydantic 请求 / 响应模型
@@ -1282,6 +1283,103 @@ async def delete_memory(
     if not success:
         raise HTTPException(status_code=404, detail=f"记忆 '{key}' 不存在或删除失败（namespace={namespace}）")
     return {"success": True, "key": key, "namespace": namespace, "user_id": user_id}
+
+
+# ══════════════════════════════════════════════════════
+# 8.5 Guardrail：审计日志查询 + 规则开关
+# ══════════════════════════════════════════════════════
+#
+# 这一组接口是给「阶段二：前端」用的数据来源：
+#   GET  /guardrail/events        → 审计日志列表（支持按 user_id/thread_id/stage 过滤）
+#   GET  /guardrail/rules         → 规则类别 + 启用状态
+#   PUT  /guardrail/rules/{cat}   → 切换某条规则的启用/禁用（立即生效，无需重启）
+#
+# 拦截/放行/审批的“决策”本身走的仍是现有 HITL 接口
+# （GET .../state、POST .../resume），这里只负责“判定记录”和“规则配置”的可见性，
+# 不重复实现一套新的审批流。
+
+
+class GuardrailEvent(BaseModel):
+    id:          int
+    ts:          str
+    user_id:     str | None = None
+    thread_id:   str | None = None
+    task_id:     int | None = None
+    stage:       str = Field(..., description="input / exec / output / decision")
+    is_risk:     bool
+    risk_type:   str | None = None
+    rule_hits:   list = Field(default_factory=list)
+    llm_verdict: dict | None = None
+    action:      str = Field(..., description="gated / passed / logged_only / masked / approved / rejected")
+    description: str | None = None
+
+
+class GuardrailEventsResponse(BaseModel):
+    total: int
+    items: list[GuardrailEvent]
+
+
+class GuardrailRule(BaseModel):
+    category:   str
+    enabled:    bool
+    label:      str | None = None
+    updated_at: str | None = None
+
+
+@app.get(
+    "/guardrail/events",
+    response_model=GuardrailEventsResponse,
+    summary="查询 Guardrail 审计日志",
+    description=(
+        "返回 Guardrail 判定/审批事件流水（按时间倒序），每条事件记录一次"
+        "输入侧检测 / 执行侧风险判定 / 输出侧脱敏 / 人工审批决策。\n\n"
+        "stage 取值：input（用户消息进入前）、exec（工具调用前）、"
+        "output（返回给用户前）、decision（人工审批结果）。"
+    ),
+)
+async def list_guardrail_events(
+    user_id:   str | None = Query(None, description="按用户过滤"),
+    thread_id: str | None = Query(None, description="按会话过滤"),
+    stage:     str | None = Query(None, description="input / exec / output / decision"),
+    limit:     int        = Query(100, ge=1, le=500, description="最多返回条数"),
+) -> GuardrailEventsResponse:
+    raw = await guardrail.list_events(user_id=user_id, thread_id=thread_id, stage=stage, limit=limit)
+    items = []
+    for r in raw:
+        items.append(GuardrailEvent(
+            id=r["id"], ts=r["ts"], user_id=r["user_id"], thread_id=r["thread_id"],
+            task_id=r["task_id"], stage=r["stage"], is_risk=bool(r["is_risk"]),
+            risk_type=r["risk_type"],
+            rule_hits=json.loads(r["rule_hits"]) if r["rule_hits"] else [],
+            llm_verdict=json.loads(r["llm_verdict"]) if r["llm_verdict"] else None,
+            action=r["action"], description=r["description"],
+        ))
+    return GuardrailEventsResponse(total=len(items), items=items)
+
+
+@app.get(
+    "/guardrail/rules",
+    response_model=list[GuardrailRule],
+    summary="查询 Guardrail 规则配置",
+)
+async def list_guardrail_rules() -> list[GuardrailRule]:
+    rows = await guardrail.list_rules()
+    return [GuardrailRule(category=r["category"], enabled=bool(r["enabled"]),
+                           label=r["label"], updated_at=r["updated_at"]) for r in rows]
+
+
+@app.put(
+    "/guardrail/rules/{category}",
+    response_model=GuardrailRule,
+    summary="启用/禁用某条 Guardrail 规则",
+    description="立即生效（内存缓存 + SQLite 同步更新），无需重启服务。",
+)
+async def toggle_guardrail_rule(category: str, enabled: bool = Query(..., description="true=启用，false=禁用")) -> GuardrailRule:
+    try:
+        result = await guardrail.set_rule_enabled(category, enabled)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return GuardrailRule(category=result["category"], enabled=result["enabled"])
 
 
 # ══════════════════════════════════════════════════════
