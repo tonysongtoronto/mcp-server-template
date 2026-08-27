@@ -5,6 +5,10 @@
 # 忽略敏感的密钥文件
 *.pem
 *.key
+*.cert
+*.crt
+secrets.json
+secret*.json
 
 ### --- Python 核心 --- ###
 __pycache__/
@@ -28,36 +32,99 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
 
 ### --- 虚拟环境 --- ###
 .venv/
 venv/
 ENV/
 env/
+venv.bak/
 
-### --- 开发工具 (uv, pytest, mypy) --- ###
+### --- 开发工具 (uv, pytest, mypy, ruff) --- ###
 .uv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.coverage.*
+.hypothesis/
+.pyre/
 
 ### --- 编辑器与系统 --- ###
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
-!.vscode/launch.local.json     
-!.vscode/launch.docker.json    
+!.vscode/launch.local.json
+!.vscode/launch.docker.json
 !.vscode/extensions.json
 .idea/
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+### --- 数据库 - 重点修复 ecommerce.db --- ###
+# 默认忽略所有数据库文件
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.mdb
+*.rdb
+dump.rdb
+
+# 你的电商数据库，明确忽略，无论在哪一级目录
+ecommerce.db
+**/ecommerce.db
+**/ecommerce.db-shm
+**/ecommerce.db-wal
+**/ecommerce.db-journal
+
+# 如果 src/DB 整个目录都是本地生成的数据，取消下面这行的注释
+# src/DB/
+# data/
+# db.sqlite3
 
 ### --- LangGraph 状态与持久化 --- ###
 # 忽略所有 pickle 格式的检查点和存储文件
 *.pckl
-*.db
-*.db-shm
-*.db-wal
-# 如果你有特定的 langgraph 运行目录，也可以直接忽略整个目录
+*.pickle
+*.pkl
 .langgraph_api/
+.checkpoints/
+langgraph.db
+
+### --- 日志、临时文件与项目生成文件 --- ###
+*.log
+*.tmp
+*.temp
+logs/
+tmp/
+temp/
+out/
+# 你截图里出现的合并产物，按需保留
+project-all.txt
+ai_export/
+*_export.txt
+
+### --- Node / 其他 (万一有前端) --- ###
+node_modules/
+.npm/
+.eslintcache

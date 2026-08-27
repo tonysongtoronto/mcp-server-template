@@ -1296,6 +1296,56 @@ async def _update_summary(
     return _dump_summary_dict(merged)
 
 
+async def _maybe_update_summary(
+    msgs: list,
+    new_ai_msg: "AIMessage",
+    conv_summary: str,
+    last_summarized_idx: int,
+) -> tuple[str, int]:
+    """
+    每新增 4 条消息（约 2 轮对话）触发一次滚动摘要更新，返回
+    (new_summary, new_summary_turn_count)。
+
+    ★ 更严谨修复：这段逻辑原来只写在 final_answer_node 的"正常完成"
+      分支末尾——如果这一轮输出命中了 sensitive_content、被
+      output_review_gate_node 接管（人工 approve/reject 之后才真正生成
+      最终 AIMessage），final_answer_node 会在摘要逻辑之前就 return 掉，
+      output_review_gate_node 自己的 return 里也完全没有对
+      conversation_summary/summary_turn_count 做任何处理。
+
+      后果不是"内容丢失"（msgs 里的历史消息本身完整保留，下一次摘要
+      触发时依然能覆盖到这一轮），而是"这一轮的摘要节奏被跳过、
+      summary_turn_count 少更新一次，导致下一次触发时要一次性吃下比
+      正常情况更多的消息"——经过人工审核的轮次会让摘要机制持续慢半拍，
+      不是数据完整性问题，但值得抽成公共函数统一处理，而不是让两条
+      路径各自维护一份不同步的摘要节奏。
+
+    参数：
+      msgs                  - 本轮 AI 回复追加之前的完整消息历史
+                              （final_answer_node 是 state["messages"]，
+                              output_review_gate_node 同样直接读
+                              state["messages"]，语义完全一致：
+                              都是"最终 AIMessage 尚未追加时"的历史）
+      new_ai_msg             - 本轮即将追加进 messages 的最终 AIMessage
+                              （已经过人工审核决定 / 或本来就不需要审核）
+      conv_summary            - 当前的摘要 JSON 字符串
+      last_summarized_idx     - 上一次摘要覆盖到的消息条数索引
+                              （state["summary_turn_count"]）
+    """
+    full_msg_count = len(msgs) + 1
+    new_summary = conv_summary
+    new_summary_turn_count = last_summarized_idx
+
+    if full_msg_count - last_summarized_idx >= 4:
+        print(f"  🔄 [Summary] 触发摘要更新（总消息数={full_msg_count}，"
+              f"上次摘要位置={last_summarized_idx}）")
+        all_msgs_for_summary = list(msgs) + [new_ai_msg]
+        new_summary = await _update_summary(all_msgs_for_summary, conv_summary)
+        new_summary_turn_count = full_msg_count
+
+    return new_summary, new_summary_turn_count
+
+
 # ══════════════════════════════════════════════════════
 # 8. Planner
 # ══════════════════════════════════════════════════════
@@ -2656,34 +2706,65 @@ async def parallel_executor_node(state: AgentState, config: RunnableConfig = Non
                   f"暂停后续层，路由到 human_review_gate")
             break
 
-    # ★ 修复（第二层保险）：判断"是否完成"不能只看本轮新产生的 pending_gate_items，
-    #   还要检查 task_plan 里是否残留 needs_human/pending_approval 的孤儿任务——
-    #   例如 human_review_gate 收到未知 action 后把任务转回 needs_human，
-    #   但由于某种疏漏没能重新纳入 pending_gate_items（本次已在 gate 节点修复，
-    #   但这里的兜底能防止未来类似疏漏再次导致任务被静默吞掉、误判为 completed）。
+    # ★ 修复（第二层保险，v2）：判断"是否完成"不能只看本轮新产生的
+    #   pending_gate_items，还要检查 task_plan 里是否残留 needs_human/
+    #   pending_approval 的孤儿任务——例如 human_review_gate 收到未知
+    #   action 后把任务转回 needs_human、或人工只提交了本批待办中的一部分
+    #   决策（未提交的那些不会经过任何状态同步）。
+    #
+    #   v1 遗留 bug：用 `if orphaned and not pending_gate_items:` 作为触发
+    #   条件，隐含假设"孤儿只会在本轮完全没有新 gate_item 时出现"——但孤儿
+    #   任务和本轮新产生的 gate_item（比如另一批任务这轮刚好判定为高危/
+    #   执行失败）完全可以同时存在。一旦本轮恰好还有别的正常 gate_item，
+    #   这个条件就不成立，孤儿会被整体跳过、永远不会被重新纳入待办，
+    #   直到未来某一轮"恰好"没有新 gate_item 时才会被顺带捞回来——但那一轮
+    #   不一定会发生。
+    #
+    #   v2 改为：不依赖 pending_gate_items 是否为空，而是找出"状态为
+    #   needs_human/pending_approval，但尚未出现在本轮 pending_gate_items
+    #   里"的任务——不管本轮是否已经有别的正常 gate_item，都要把这些遗漏
+    #   的追加进去，和已有的 gate_item 一起交给人工，不会互相覆盖或吞掉。
+    _already_gated_ids = {item["task_id"] for item in pending_gate_items}
     orphaned = [
         t for t in task_plan
         if t.get("status") in ("needs_human", "pending_approval")
+        and t["task_id"] not in _already_gated_ids
     ]
-    if orphaned and not pending_gate_items:
+    if orphaned:
         print(f"\n⚠️ [ParallelExecutor] 发现 {len(orphaned)} 个孤儿任务"
               f"（状态为 needs_human/pending_approval 但本轮未产生对应 gate_item），"
               f"重新打包成待办事项，避免被误判为 completed：")
         for t in orphaned:
             print(f"   task_id={t['task_id']} status={t.get('status')}")
-            # ★ 安全修复：孤儿 pending_approval 任务如果原来命中的是高危类别，
+            # ★ 安全修复（v2）：孤儿任务如果原来（或历史上）命中过高危类别，
             #   重新打包成待办事项时必须把 requires_confirm_phrase 带回来——
             #   否则从这条兜底路径重新进入人工审核的高危任务，会退化成
             #   可以一键点过的普通 approve，等于给二次确认开了个后门。
             #   优先用 Step A 存下来的 guardrail_verdict 重算，兜底才退回
             #   t.get("agent")（跟原来的行为一致）。
+            #
+            #   v1 遗留 bug：is_hard_risk() 的判断加了 `t.get("status") ==
+            #   "pending_approval"` 这个前置条件，只在"当前状态还是
+            #   pending_approval"时才要求确认短语。但任务完全可能经历过
+            #   "判定为高危 pending_approval → 人工 retry/edit_and_retry →
+            #   重新执行又失败 → 转成 needs_human"这样的流转，task["status"]
+            #   变成了 needs_human，而 task["guardrail_verdict"] 里保留的
+            #   历史判定依然是高危——按 v1 的条件，这种任务重新打包时会被
+            #   直接判定"不需要确认短语"，等于让一个历史上命中过高危规则的
+            #   任务，绕开二次确认、只需要一次普通 approve 就能放行。
+            #
+            #   v2 去掉这个状态限制：只要 guardrail_verdict 本身判定是高危
+            #   （不管任务当前 status 是 pending_approval 还是 needs_human），
+            #   就要求确认短语；needs_human 且从未有过高危判定的任务，
+            #   guardrail_verdict 为空，is_hard_risk() 自然返回 False，
+            #   不受影响，行为和之前一致。
             _orphan_verdict = t.get("guardrail_verdict") or {}
             _orphan_risk_type = (
                 _orphan_verdict.get("risk_type")
                 or (t.get("agent") if t.get("status") == "pending_approval" else None)
             )
             _orphan_confirm_phrase = None
-            if t.get("status") == "pending_approval" and guardrail.is_hard_risk(
+            if guardrail.is_hard_risk(
                 _orphan_verdict.get("risk_type"), _orphan_verdict.get("rule_hits") or []
             ):
                 _orphan_confirm_phrase = f"确认执行-{_orphan_risk_type}-{t['task_id']}"
@@ -2896,14 +2977,24 @@ async def human_review_gate_node(state: AgentState, config: RunnableConfig = Non
             #   也不会把它重新纳入 pending_gate_items（它没有"刚失败"），
             #   如果本轮恰好没有别的新待办事项，plan_status 就会被误判为
             #   completed，图直接结束，这个任务永远得不到人工再次决策。
+            #
+            # ★ 安全修复（v2）：上一版这里是从零手写一个新 gate_item，把
+            #   risk_type/requires_confirm_phrase 硬编码成 None——如果这个
+            #   task_id 原本的 gate_item（_gate_items_by_id[tid]）是高危
+            #   pending_approval、带着 requires_confirm_phrase，一旦这一轮
+            #   提交的 action 是未识别的值，这里会直接把"需要确认短语"这个
+            #   要求覆盖掉，下一轮人工看到的会是一个"看起来普通、一键就能
+            #   approve"的任务，等于给二次确认开了个后门（和上面 approve
+            #   分支要防的是同一类问题）。改成跟上面 confirm phrase 校验
+            #   失败分支一样，用 {**_origin_gate_item, ...} 保留原始字段，
+            #   只覆盖 reason/error，不丢失 risk_type/requires_confirm_phrase。
+            _origin_gate_item = _gate_items_by_id.get(tid) or {}
             unresolved_gate_items.append({
+                **_origin_gate_item,
                 "task_id":            tid,
                 "reason":             "needs_human",
-                "description":        task.get("description", ""),
+                "description":        task.get("description", "") or _origin_gate_item.get("description", ""),
                 "error":              task.get("last_error", "") or f"未知的人工决策 action: {action}",
-                "risk_type":          None,
-                "downstream_blocked": [],
-                "requires_confirm_phrase": None,
             })
 
     if plan_status != "aborted":
@@ -3211,36 +3302,12 @@ async def final_answer_node(state: AgentState, config: RunnableConfig) -> AgentS
         new_ai_msg = AIMessage(content=masked_answer)
 
     # ── 触发摘要更新（每4条新消息更新一次，约每2轮）────────────────────
-    #
-    # ★ 修复（方案C）：原阈值 >= 10（约5轮）对短对话完全无效。
-    #   TEST 3 首次运行只有 3 轮 = 6 条消息，永远不触发摘要，
-    #   跨进程后只能依赖 recent_history，而 recent_history 在某些路径下
-    #   覆盖不全（如 Planner 只注入最后一条 AI 回复）。
-    #
-    #   新阈值 >= 4（约每2轮）：
-    #     第2轮结束（4条）→ 首次生成摘要，包含第1-2轮全部用户信息
-    #     第4轮结束（8条）→ 增量更新摘要
-    #     以此类推，无论对话多短，只要有2轮就有摘要兜底。
-    #
-    #   代价：每2轮多一次 LLM 调用（摘要生成），延迟略增约 1-2s。
-    #   收益：跨进程记忆完整性大幅提升，TEST 3 三项失败全部修复。
-    #
-    # ★ summary_turn_count 语义：已被摘要覆盖的消息总条数（非轮次数）。
-    #   注意：summary_turn_count 字段名保持不变（避免改 AgentState 定义），
-    #         只改语义：以前存"已摘要轮次"，现在存"已摘要到的消息总条数"。
-    full_msg_count = len(msgs) + 1         # 本轮 AI 消息追加后的总条数
-    last_summarized_idx = state.get("summary_turn_count", 0)  # 字段复用，存消息条数索引
-    new_summary = conv_summary
-    new_summary_turn_count = last_summarized_idx
-
-    # 每新增 4 条消息（约 2 轮对话）更新一次摘要
-    if full_msg_count - last_summarized_idx >= 4:
-        print(f"  🔄 [Summary] 触发摘要更新（总消息数={full_msg_count}，"
-              f"上次摘要位置={last_summarized_idx}）")
-        # 把本轮 AI 回复也加进去，摘要覆盖最新内容
-        all_msgs_for_summary = list(msgs) + [new_ai_msg]
-        new_summary = await _update_summary(all_msgs_for_summary, conv_summary)
-        new_summary_turn_count = full_msg_count  # 更新已摘要消息索引
+    # ★ 抽成共享函数 _maybe_update_summary（定义见文件靠前处，紧跟
+    #   _update_summary 之后），output_review_gate_node 的 approve/reject
+    #   两条路径也复用同一份逻辑，避免两条路径的摘要节奏各自维护、逐渐脱节。
+    new_summary, new_summary_turn_count = await _maybe_update_summary(
+        msgs, new_ai_msg, conv_summary, state.get("summary_turn_count", 0),
+    )
 
     # ★ 返回新增字段。add_messages reducer 只追加 new_ai_msg，不覆盖历史。
     # 不展开 **state：messages 用 add_messages reducer 追加，其他字段
@@ -3316,11 +3383,27 @@ async def output_review_gate_node(state: AgentState, config: RunnableConfig = No
             "如果你能换个角度重新描述问题，我很乐意再试一次。"
         )
 
+    new_ai_msg = AIMessage(content=final_text)
+
+    # ★ 更严谨修复：final_answer_node 走到这个 gate 就提前 return 了，
+    #   完全跳过了它自己那段摘要更新逻辑——如果这里不补上，经过人工
+    #   审核的轮次会永远不参与摘要节奏（summary_turn_count 不会推进），
+    #   下一次触发时要一次性吃下更多消息，长期跑下来会持续慢半拍。
+    #   这里复用跟 final_answer_node 完全相同的共享函数，传入
+    #   state["messages"]（此时还没追加 new_ai_msg，语义和
+    #   final_answer_node 里的 msgs 一致）。
+    new_summary, new_summary_turn_count = await _maybe_update_summary(
+        state.get("messages", []), new_ai_msg,
+        state.get("conversation_summary", ""), state.get("summary_turn_count", 0),
+    )
+
     return {
-        "messages":               [AIMessage(content=final_text)],
+        "messages":               [new_ai_msg],
         "plan_status":            "completed",
         "pending_gate_items":     [],
         "pending_output_answer":  "",
+        "conversation_summary":   new_summary,
+        "summary_turn_count":     new_summary_turn_count,
     }
 
 
